@@ -1,0 +1,53 @@
+# probe-rs 本地配置
+# 与「配置样例」tab（JSON5 注释版）内容一致
+
+# ===== 🔒 不可远端修改（身份与安全边界） =====
+server_id = "srv-01"
+secret = "change-me"
+worker_url = "https://monitor.example.com/report"
+net_static_path = "/var/lib/probe-rs/net_static.json"
+
+# ===== 本地或远端均可修改（本地热加载 ~3s；远端便车下发即时） =====
+# 月流量账期重置日 1-31；0 = 不重置（永久累计）
+reset_day = 1
+
+# 配置版本（机制维护，远端下发幂等用，勿手改）；人类可读的 UTC+8 时间戳字符串，不等才应用
+config_version = ""
+
+# 网卡白名单（glob，如 "eth*"）；空 = 所有非虚拟网卡
+interfaces = []
+# GPU 采集开关（nvidia-smi；macOS 用 ioreg）
+enable_gpu = false
+# 是否上报 errors 错误事件（关闭后 errors 数组恒为空）
+report_errors = true
+# 是否上报探针自身资源占用 kind:"self"（CPU/RSS）
+report_self = false
+
+# 注意：标量字段必须放在 [intervals] 段之前，否则会被解析进 intervals 表（agent 报错拒绝）
+# 各间隔完全独立，无任何关系约束；report < collect 时多余上报只是空数组心跳
+[intervals]
+# 采样间隔（秒）
+collect = 10
+# 上报间隔（秒）
+report = 60
+# 探测默认间隔（秒），[[pings]] 组未设 interval 时生效
+ping = 30
+# 慢变指标（磁盘/连接数/进程数）采集间隔（秒）
+slow = 60
+# GPU 采集间隔（秒）
+gpu = 60
+# 公网 IP 查询间隔（秒）
+ip = 600
+
+# ===== 探测目标组：name 为唯一键（远端下发时整体替换，name 不可重复） =====
+# target 以 http(s):// 开头 → HTTP 探测；否则 TCP（host[:port]，默认 80）
+# interval 可选（秒），缺省跟随 intervals.ping
+# [[pings]]
+# name = "ct"
+# target = "gd-ct-dualstack.ip.zstaticcdn.com:80"
+# interval = 30
+#
+# [[pings]]
+# name = "baidu"
+# target = "https://www.baidu.com"
+# interval = 60

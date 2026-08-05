@@ -1,0 +1,291 @@
+# probe-rs 设计书
+
+服务器监控探针。采集服务器指标，通过 HTTP POST 上报到中心服务端。
+参考项目：komari-agent（采集规则、netstatic 流量统计）、cfsm-agent（远端配置下发机制）。
+
+相关文档：[REPORT.md](REPORT.md)（上报协议完整字段定义）、[IMPL.md](IMPL.md)（Rust 实现方案）。
+
+## 1. 总体架构
+
+```
+┌─────────────────────────────────────────────────┐
+│ scheduler                                       │
+│  ├─ collect ticker (intervals.collect)          │
+│  │    └─ sync collectors → buffer.dynamic[]     │
+│  └─ report ticker (intervals.report)            │
+│       └─ drain buffer → reporter → POST         │
+├─────────────────────────────────────────────────┤
+│ async workers（各自独立节奏，只发布最新快照）      │
+│  ├─ ping worker      (每组 [[pings]] 独立间隔)  │
+│  ├─ slow worker      (intervals.slow)           │
+│  ├─ gpu worker       (intervals.gpu)            │
+│  ├─ public-ip worker (intervals.ip)      │
+│  └─ netstatic        (2s 采样 / 10min 落盘)      │
+├─────────────────────────────────────────────────┤
+│ reporter                                        │
+│  └─ POST /report ← 响应携带远端配置（便车下发）  │
+└─────────────────────────────────────────────────┘
+```
+
+核心原则：
+
+1. **采集分三类**：静态（低频变化）/ 动态-同步（高频变化、采集便宜）/ 动态-异步（采集贵或有网络依赖）。
+2. **采集与上报分离**：采集频率与上报频率完全解耦，二者没有任何关系约束——report 时把缓冲全部发出即可；report < collect 时多余的上报只是空数组心跳。
+3. **动态数据用数组**：每次采集追加一条带 `ts` 的记录，上报时整体携带并清空。
+4. **异步只发快照**：异步 worker 只保留最近一次测量（带真实测量 ts）；采集端按 ts 新鲜度摘取——快照 ts 变了才带入记录，同一份异步数据不会重复出现，失败表现为 ts 停滞。
+
+## 2. 指标分类
+
+### 2.1 静态（static）
+
+启动时全量上报一次，之后每 10 分钟周期刷新；服务端在字段缺失时保留旧值。
+
+| 字段 | 来源 | 备注 |
+|---|---|---|
+| `os` | /etc/os-release | |
+| `ts` | — | static 信息采集时刻，毫秒时间戳 |
+| `kernel` | uname -r | |
+| `arch` | 编译/运行时 | |
+| `cpu_name` | /proc/cpuinfo | |
+| `cpu_cores` | 逻辑核数 | |
+| `cpu_physical_cores` | 物理核数 | 可选 |
+| `mem_total` | /proc/meminfo | 字节 |
+| `swap_total` | /proc/meminfo | 字节 |
+| `disk_total` | statfs 去重求和 | 字节，扩容会变，靠周期刷新 |
+| `gpu_name` | nvidia-smi 等 | |
+| `virtualization` | systemd-detect-virt 等 | |
+| `boot_time` | /proc/stat btime | 毫秒时间戳 |
+| `ipv4` / `ipv6` | cloudflare trace | 公网 IP，会变，靠周期刷新 |
+| `agent_version` | 编译注入 | |
+| `config` | 当前生效配置 | static.config.*：intervals/reset_day/interfaces/enable_gpu/report_errors/report_self/pings，供服务端展示/核对，配置变更触发 static 重报 |
+
+### 2.2 动态-同步（dynamic，每个 collect tick 内联采集）
+
+全部是本地文件读取 / syscall，微秒级，无网络 IO。只含 fast 字段（ts = tick 时刻）；异步数据经快照新鲜度摘取后进入独立的 `async[]`。
+
+| 字段 | 来源 | 备注 |
+|---|---|---|
+| `cpu_usage` | /proc/stat 差值 | 百分比，0-100 |
+| `mem_used` | /proc/meminfo | 字节，total − MemAvailable |
+| `swap_used` | /proc/meminfo | 字节 |
+| `load` | /proc/loadavg | `[load1, load5, load15]` 数组 |
+| `net_rx` / `net_tx` | /proc/net/dev | 字节，开机起累计 |
+| `net_rx_speed` / `net_tx_speed` | 计数器差值 ÷ 时间差 | 字节/秒，主采集内计算，不经过 netstatic |
+| `net_rx_monthly` / `net_tx_monthly` | netstatic 现查 | 字节，账期累计，见 §5 |
+（异步数据不进 dynamic，见 §2.3 与 §3 的 `async[]`）
+
+网卡过滤：默认排除 `br/cni/docker/podman/flannel/lo/veth/virbr/vmbr/tap/fwbr/fwpr` 前缀的虚拟网卡；本地配置可用 glob 指定白名单（如 `eth*`）。
+
+磁盘口径：遍历挂载点 statfs，排除虚拟/网络文件系统（tmpfs/overlay/nfs 等）与 `/tmp`、`/var/lib/docker` 等路径前缀，按设备 ID 去重（ZFS 按 pool 名截断），跨设备求和。
+
+### 2.3 动态-异步（async worker，只发布最新快照）
+
+**两层分类：机制同类，语义分流。** 所有异步 worker 在机制上完全相同（独立 ticker → 采集 → 发快照 → 采集端按 ts 新鲜度摘取），它们的间隔统一归 `intervals` 管理；分流发生在数据出口，按"数据是什么"决定落点：
+
+| 数据 | 语义 | 存在性 | 故障域 | 落点 |
+|---|---|---|---|---|
+| disk / conn / procs | 系统状态指标（与 dynamic 的 cpu/mem 同族，只是变化慢、采集贵） | 每台机器必有 | 本机采集问题 | `kind:"slow"` |
+| gpu 利用率 | 可选硬件指标（多卡时每卡一条，形状不同） | 仅部分机器 | nvidia-smi/ioreg 不可用 | `kind:"gpu"` |
+| 公网 IP | 身份信息（"你是谁"，不是被测量的指标） | 依赖外网 | 外网不通 ≠ agent 坏 | **static**，不进 async[] |
+| ping rtt/loss | 主动探测指标（目标在配置里，多组各自节奏） | 看配置 | 目标不可达 | `kind:"ping"` |
+
+| worker | 节奏 | 采集内容 | 快照 |
+|---|---|---|---|
+| ping | 每组 `[[pings]]` 独立 interval（缺省 `intervals.ping`） | 每组 key + target + interval；target 以 http(s):// 开头 → HTTP，否则 TCP（host[:port]，默认 80）；一轮 4 次取中位数 + 丢包率 | `HashMap<key, PingRecord>` |
+| slow | `intervals.slow`（缺省 60s） | disk_used / tcp_conn / udp_conn / processes | `SlowBlock` |
+| gpu | `intervals.gpu`（缺省 60s） | GPU 名称 + 使用率（nvidia-smi；macOS 走 system_profiler + ioreg，可本地开关） | `Vec<GpuRecord>` |
+| public-ip | `intervals.ip`（缺省 600s） | 公网 IPv4/IPv6（cloudflare trace，强制 tcp4/tcp6 分流） | `(ipv4, ipv6)`，供 static |
+| netstatic | 2s 采样 / 10min 落盘 | 每网卡流量 delta 时序，见 §5 | 可查询时序 |
+
+**快照规则：只保留最近一次，ts 为真实测量时刻。**
+
+- 采集端为每个异步源记录"上次摘取的 ts"，快照 ts 更新才产生一条 `async[]` 记录（kind 标记来源）——同一份异步数据不会重复出现；
+- 一个 collect 周期内的多次异步更新只保留最新一次（粒度 = max(collect, 异步间隔)）；
+- 异步 worker 失败 → 快照不更新 → ts 停滞，服务端凭 ts 停滞识别"没采成功"；有记录但值相同 = 没变；
+- 主采集永不阻塞于异步 worker。
+
+ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最多 3 次；TCP 探测若重测降幅 >800ms，判定为 SYN 重传污染，本次记为失败。
+
+## 3. 上报模型
+
+完整协议定义（含全部字段类型/单位/来源）见 [REPORT.md](REPORT.md)，本节只讲规则。
+
+### 3.1 报文结构
+
+```json
+{
+  "server_id": "server-xxx",
+  "config_version": "2026-08-06T15:30:45.123+08:00",
+  "static": { "ts": 1754300050000, "os": "Debian 12", "...": "..." },
+  "dynamic": [
+    { "ts": 1754300060000, "cpu_usage": 12.3, "mem_used": 4294967296,
+      "net_rx_speed": 102400, "net_tx_speed": 51200, "...": "..." }
+  ],
+  "async": [
+    { "kind": "ping", "ts": 1754300058000, "name": "telecom", "rtt": 32, "loss": 0 },
+    { "kind": "slow", "ts": 1754300055000, "disk_used": 53687091200, "tcp_conn": 120, "processes": 230 },
+    { "kind": "gpu",  "ts": 1754300050000, "name": "NVIDIA A100", "usage": 42.5 }
+  ]
+}
+```
+
+认证：`secret` 通过 HTTP header `X-Secret` 携带，不出现在 body（避免日志/抓包泄露）。
+
+### 3.2 规则
+
+- **每个 report tick 必报**：`dynamic` 为空数组也照发，天然承担心跳职能，服务端按"最后收到时间"判离线。
+- **`static` 可省略**：未到期且无变化时不带，服务端保留旧值。
+- **`dynamic` 每条带 `ts`**：采集时刻时间戳，不是上报时刻。
+- **三段结构**：`static` obj + `dynamic[]`（fast，ts = tick 时刻）+ `async[]`（kind 区分来源，ts = 各自测量时刻）——两个数组的 ts 语义各自单一，异步频率互不迁就。
+- **异步按新鲜度产生**：异步记录仅当对应源快照 ts 更新时才进入 `async[]`（见 §2.3 规则）；worker 失败 = ts 停滞，有记录但值相同 = 没变。
+- **月流量/累计值**：放在 `dynamic` 记录中带当前值（上报时刻向 netstatic 现查）。
+- **上报失败有界保留**：失败的记录放回缓冲待下次重发，上限 10 条（只覆盖短暂抖动，长断网历史不补发）。
+- **数据陈旧判断交给服务端**：动态数据有 `ts`，静态数据本来不变，不报 `measured_at` 之类的额外字段。
+
+### 3.3 数据口径约定
+
+- 容量/流量一律**字节**，速率一律**字节/秒**，数值用 JSON number（不用字符串）。
+- 时间戳一律**毫秒**（含 netstatic 条目、boot_time、各数组的 ts）。
+- 百分比（cpu_usage、gpu usage、loss）为 0-100 的 number。
+- 单项采集失败：该字段置 null，不中断本轮采集与上报。
+
+### 3.4 命名规范
+
+| 规范 | 说明 |
+|---|---|
+| 方向词汇 | 一律 `rx`（下行/接收）/ `tx`（上行/发送），全文档与代码禁用 in/out、up/down |
+| 探测术语 | 一律 `ping`（worker、intervals.ping、ping[] 数组），禁用 probe 指代该子系统 |
+| 配置 key | snake_case；间隔类收敛到 `intervals.{collect, report, ping, slow, gpu, ip}` |
+| 使用率字段 | 后缀 `_usage`（`cpu_usage`、gpu 记录的 `usage`），与 `_name`/`_total`/`_used` 后缀风格一致 |
+| 时间字段 | 一律 `ts`（毫秒）；静态开机时间用 `boot_time` |
+| 账期字段 | 后缀 `_monthly` 表示账期累计（reset_day=0 时为永久累计） |
+
+术语表：
+
+| 术语 | 定义 |
+|---|---|
+| static | 静态信息，低频上报，服务端保留旧值 |
+| dynamic | 同步采集的动态指标数组，每个 collect tick 一条 |
+| ping | 网络探测子系统及其结果数组 |
+| collect tick | 采样周期触发点，间隔 `intervals.collect` |
+| report tick | 上报周期触发点，间隔 `intervals.report` |
+| 账期 | 以 `reset_day` 为起点的月流量统计周期 |
+| netstatic | 网卡流量 delta 时序模块（§5） |
+
+## 4. 远端动态配置
+
+### 4.1 可下发项（第一版仅这些）
+
+```json
+{
+  "config": {
+    "config_version": "2026-08-06T16:00:00.000+08:00",
+    "intervals": {
+      "collect": 10,
+      "report": 60,
+      "ping": 30,
+      "slow": 60,
+      "gpu": 60,
+      "ip": 600
+    },
+    "reset_day": 15
+  }
+}
+```
+
+| 项 | 约束 |
+|---|---|
+| `intervals.collect` | 采样间隔（秒），>= 1 |
+| `intervals.report` | 上报间隔（秒），>= 1；与 collect 无任何关系约束 |
+| `intervals.ping` | 探测默认间隔（秒），`[[pings]]` 组未设 interval 时生效，缺省 30 |
+| `intervals.slow` | 慢变指标采集间隔（秒），缺省 60 |
+| `intervals.gpu` | GPU 采集间隔（秒），缺省 60 |
+| `intervals.ip` | 公网 IP 查询间隔（秒），缺省 600 |
+| `reset_day` | 月流量账期重置日，1-31；0 = 不重置（永久累计） |
+| `config_version` | 配置版本（人类可读的 UTC+8 时间戳字符串），幂等机制，见下 |
+
+响应信封把配置收在 `config` 一级（全部字段可选，出现的才应用），另有 `next` 一级放对下一次上报的指令（如 `next.static`）。🔒 不允许远端修改：`server_id` / `secret` / `worker_url` / `net_static_path`（身份与安全边界）；其余字段（intervals/reset_day/interfaces/enable_gpu/pings）本地与远端双通道，均热生效（本地热加载 ~3s / 远端便车即时）。
+
+### 4.2 下发机制
+
+- 搭上报便车：POST /report 的响应体携带配置对象。
+- agent 上报时带当前 `config_version`；服务端比对，不一致才下发。
+- **幂等**：version 与本地一致则不应用。
+- **原子**：整个配置对象全部校验通过才应用 + 落盘本地配置文件；任何一项非法（零值间隔、reset_day 越界等）整体拒绝，agent 日志记录原因。
+- 应用后立即生效（重建 ticker、重算账期），无需重启。
+
+## 5. 流量统计（netstatic）
+
+移植 komari-agent 的 netstatic 设计：时序明细 + 查询式统计。
+
+**月流量完全由客户端计算**：netstatic 在 agent 本地维护，上报时现查后作为当前值放入 `dynamic`；服务端只存展示值，不参与流量统计与重置。
+
+### 5.1 数据模型（net_static.json）
+
+```json
+{
+  "interfaces": {
+    "eth0": [
+      {"ts": 1754300000000, "rx": 102400, "tx": 51200}
+    ]
+  }
+}
+```
+
+- 每条是**相邻两次采样的 delta**（非累计值），`ts` 为毫秒时间戳。
+- **按网卡分开存**：网卡白名单变更后可用历史明细重新求和，统计不出错。
+
+### 5.2 运行机制
+
+| 环节 | 参数 | 说明 |
+|---|---|---|
+| 采样 | 每 2 秒 | 读 /proc/net/dev 计数器算 delta，只写内存 |
+| 落盘 | 每 10 分钟 | 内存增量合并写入 JSON，崩溃最多丢 10 分钟 |
+| 保留 | 滚动 31 天 | 覆盖任何 reset_day 的账期 |
+| 查询 | `sum(period_start ≤ ts ≤ now)` | 月流量现查；reset_day / interfaces 变更后用历史重算，零误差 |
+
+### 5.3 增量正确性纪律（配置变更/重启不出错）
+
+1. **delta 按网卡分别算、分别存**：`interfaces` 白名单变更只影响查询时的求和集合，各网卡增量序列不受影响，杜绝"聚合计数器跳变导致 diff 出垃圾值"。
+2. **计数器回退 → 本轮 delta 记 0**：`current < prev`（重启/换卡）时不做减法，本轮记 0，宁可少记一轮，不出错误增量。
+3. **崩溃只产生空洞，不产生错误**：落盘窗口内未保存的 delta 丢失表现为数据缺失，绝不会产生错误增量。
+4. **reset_day 变更**：账期求和窗口改用新起点即可；31 天明细在手可精确重算（白送，非承诺），下一账期起自然全对。
+
+### 5.4 内存控制（实现时可选）
+
+2s × 31 天 ≈ 134 万条/网卡，全放内存约 30MB/网卡。可将条目按小时合并压缩（小时内 delta 求和），内存降至 ~1MB，月统计精度不受影响。机制不变，实现时定。
+
+## 6. 模块划分（Rust）
+
+| 模块 | 职责 |
+|---|---|
+| `config` | 本地配置加载/校验；远端配置应用、原子校验、落盘 |
+| `model` | 上报报文与配置的数据结构定义 |
+| `collector/sync` | 平台门面 + Linux /proc 实现 + sysinfo 跨平台实现 |
+| `collector/async` | 异步 worker 框架：独立 task + watch channel 快照 |
+| `collector/netstatic` | 流量时序：采样、落盘、滚动保留、区间查询 |
+| `scheduler` | collect/report 双层 ticker；整数倍校验 |
+| `buffer` | dynamic / async 双缓冲，report 时 drain，失败 restore（有界） |
+| `reporter` | HTTP POST；响应解析（远端配置）；必报/失败丢弃策略 |
+
+平台支持：Linux（手写 /proc 解析，零依赖）、macOS/Windows（sysinfo crate 实现，连接数解析 netstat）；`collector` 模块为平台门面，按 cfg 分流。
+
+## 7. 已明确的取舍（备忘）
+
+| 决策 | 结论 | 理由 |
+|---|---|---|
+| 空 dynamic 是否上报 | **报** | 承担心跳职能 |
+| 上报失败缓冲 | **有界保留（10 条，满丢最旧）** | 只覆盖短暂抖动；长断网历史不值得补发 |
+| 采集/上报频率关系 | **无约束**（仅要求 >= 1s） | report 时清空缓冲即可，采集节奏无需是上报的约数 |
+| 同步采集频率 | **slow 指标异步化** | slow worker 独立节奏直写 dynamic，带真实测量 ts；杜绝"缓存值贴新 ts" |
+| 异步数据模型 | **只发快照 + 新鲜度去重** | 异步只保留最近一次（带测量 ts）；采集端按 ts 变化摘取，天然去重 |
+| 数据 ts 语义 | **每条数据带自己的测量 ts** | fast/异步块/static 全部如此；展示归并是前端职责 |
+| 异步数据陈旧标记 | **不加** | 谁采集谁打 ts；失败即缺席，服务端凭空洞判断 |
+| 月流量计算位置 | **客户端自算，服务端只存展示值** | 统计与重置不依赖服务端 |
+| 流量统计底层 | **时序明细（非 KV 状态机）** | 按网卡存 delta，配置变更后新增增量始终正确；reset_day/interfaces 变更可重算 |
+| 实时网速来源 | **主采集计数器差值** | 比 netstatic 2s 粒度更贴合采集周期 |
+| 远端可下发项 | **intervals + reset_day** | 最小可用集，其余本地配置 |
+| 流量校正 | **服务端职责，agent 不做** | netstatic 报诚实累计值；重装跳变由服务端检测并加 offset，校正属展示/账务层 |
+| 自升级/远程命令 | **不做** | 安全边界 |
+| 单位/类型 | **字节 + JSON number** | komari 风格，不学 cfsm 全字符串 |
+| 方向/探测命名 | **rx/tx、ping** | 避免 in-out/up-down、ping-probe 混用 |

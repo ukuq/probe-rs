@@ -1,0 +1,19 @@
+# Rust 构建产物
+/target/
+
+# 本地配置（含 secret，切勿提交）
+config.toml
+*.local.toml
+
+# 运行期数据
+net_static.json
+*.log
+
+# 参考项目（仅对照用，不属于本项目）
+/cfsm-agent/
+/komari-agent/
+
+# 工具与环境
+/.claude/
+/.idea/
+.DS_Store
