@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::model::{RemoteConfig, Report};
+use crate::reporter_cf::{CfResponse, CfUpdate};
 
 const TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -78,5 +79,38 @@ impl Reporter {
             config: parsed.config,
             next_static: parsed.next.is_some_and(|n| n.r#static),
         })
+    }
+
+    /// CF 协议上报（POST /update）。config_md5 为当前已应用的 CF 配置 MD5（空 = none）。
+    /// 204 = 无变更；200 = 解析 URL-encoded 配置/校正
+    pub async fn send_cf(&self, update: &CfUpdate, config_md5: &str) -> Result<CfResponse> {
+        let md5 = if config_md5.is_empty() { "none" } else { config_md5 };
+        // CF 服务端 agent_version 取值优先用该头——带 probe-rs/ 前缀以区分官方探针
+        let agent_ver = format!("probe-rs_{}", self.agent_version);
+        let resp = self
+            .client
+            .post(&self.url)
+            .header("X-Agent-Version", &agent_ver)
+            .header("X-Agent-Config-Schema", "3")
+            .header("X-Agent-Config-Md5", md5)
+            .json(update)
+            .send()
+            .await
+            .context("上报请求失败")?;
+        let status = resp.status();
+        if status.as_u16() == 204 {
+            return Ok(CfResponse::default());
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("上报响应 HTTP {status}: {}", body.trim());
+        }
+        let resp_md5 = resp
+            .headers()
+            .get("x-agent-config-md5")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let body = resp.text().await.context("读取上报响应失败")?;
+        Ok(crate::reporter_cf::parse_response_body(&body, resp_md5.as_deref()))
     }
 }

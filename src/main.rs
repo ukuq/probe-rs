@@ -4,6 +4,7 @@ mod config;
 mod model;
 mod netstatic;
 mod reporter;
+mod reporter_cf;
 mod scheduler;
 mod worker;
 
@@ -30,6 +31,14 @@ async fn main() -> Result<()> {
     let config_path = parse_config_arg();
     let local = config::load(&config_path).context("配置加载失败")?;
     tracing::info!(path = %config_path.display(), server_id = %local.server_id, "配置已加载");
+    if local.protocol == "cf" {
+        tracing::info!(url = %local.worker_url, "CF 协议模式（POST /update）");
+        for p in &local.pings {
+            if !["ct", "cu", "cm", "bd", "bgp"].contains(&p.name.as_str()) {
+                tracing::warn!(name = %p.name, "CF 模式下该 ping 组无落点（仅 ct/cu/cm/bd 会被上报）");
+            }
+        }
+    }
 
     let net_static_path = PathBuf::from(&local.net_static_path);
     let reporter = Arc::new(
@@ -93,6 +102,7 @@ async fn main() -> Result<()> {
             ticker.tick().await; // 跳过立即触发的第一拍
             let mut applied_pings = shared.get().pings;
             let mut applied_gpu = shared.get().enable_gpu;
+            let applied_protocol = shared.get().protocol;
             loop {
                 tokio::select! {
                     // 本地文件变更 → 重载进 SharedConfig（会触发 config_tx → 走下方 reconcile）
@@ -104,6 +114,10 @@ async fn main() -> Result<()> {
                         last_mtime = m;
                         match config::load(&watch_path) {
                             Ok(cfg) => {
+                                if cfg.protocol != applied_protocol {
+                                    tracing::warn!(protocol = %cfg.protocol, "protocol 变更需重启 agent 才生效，已忽略");
+                                    continue;
+                                }
                                 if cfg != shared.get() {
                                     shared.update_local(cfg);
                                     tracing::info!("配置已热加载");

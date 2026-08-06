@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use crate::model::{Intervals, PingTarget, RemoteConfig};
+use crate::model::{ExtConfig, Intervals, PingTarget, RemoteConfig};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -13,10 +13,14 @@ pub struct LocalConfig {
     pub server_id: String,
     pub secret: String,
     pub worker_url: String,
+    /// 🔒 协议类型："probe"（默认）| "cf"；仅本地修改，重启生效，远端不可下发
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
     pub intervals: Intervals,
     #[serde(default = "default_reset_day")]
     pub reset_day: u8,
     /// 版本字符串（UTC+8 时间戳格式）；空串 = 从未下发过
+    /// CF 模式下复用为 CF 配置 MD5（服务端响应头给出，回显幂等）
     #[serde(default, deserialize_with = "crate::model::de_config_version")]
     pub config_version: String,
     #[serde(default)]
@@ -33,6 +37,13 @@ pub struct LocalConfig {
     /// 是否上报探针自身资源占用 kind:"self"（默认 false）
     #[serde(default)]
     pub report_self: bool,
+    /// 协议扩展配置（ext.*；须为结构体最后一个字段，保证 TOML 表格次序合法）
+    #[serde(default)]
+    pub ext: ExtConfig,
+}
+
+fn default_protocol() -> String {
+    "probe".into()
 }
 
 fn default_report_errors() -> bool {
@@ -58,6 +69,9 @@ impl LocalConfig {
         let url = self.worker_url.trim();
         if !url.starts_with("http://") && !url.starts_with("https://") {
             bail!("worker_url 必须是 http(s) URL");
+        }
+        if self.protocol != "probe" && self.protocol != "cf" {
+            bail!("protocol 必须是 \"probe\" 或 \"cf\"");
         }
         self.intervals.validate().map_err(anyhow::Error::msg)?;
         if self.reset_day > 31 {
@@ -176,6 +190,16 @@ impl SharedConfig {
         if let Some(report_self) = remote.report_self {
             next.report_self = report_self;
         }
+        if let Some(ext) = remote.ext {
+            if let Some(cf) = ext.cf {
+                if let Some(correction) = cf.correction {
+                    next.ext.cf.correction = correction;
+                }
+                if let Some(batch) = cf.batch {
+                    next.ext.cf.batch = batch;
+                }
+            }
+        }
         let version = remote.config_version;
         next.config_version = version.clone();
         persist(&self.path, &next).context("远端配置落盘失败")?;
@@ -266,6 +290,7 @@ mod tests {
             server_id: "s1".into(),
             secret: "sec".into(),
             worker_url: "https://example.com/report".into(),
+            protocol: "probe".into(),
             intervals: Intervals { collect: 10, report: 60, ping: 30, ..Default::default() },
             reset_day: 1,
             config_version: String::new(),
@@ -275,6 +300,7 @@ mod tests {
             pings: vec![],
             report_errors: true,
             report_self: false,
+            ext: Default::default(),
         }
     }
 
@@ -283,6 +309,19 @@ mod tests {
         let mut cfg = base_config();
         cfg.intervals.collect = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn toml_roundtrip_preserves_ext_and_pings() {
+        // TOML 布局陷阱防回归：[ext.cf] 与 [[pings]] 的表格次序必须往返无损
+        let mut cfg = base_config();
+        cfg.pings = vec![PingTarget { name: "ct".into(), target: "example.com:80".into(), interval: Some(5) }];
+        cfg.ext.cf.correction = false;
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: LocalConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back, cfg);
+        assert!(!back.ext.cf.correction);
+        assert_eq!(back.pings[0].name, "ct");
     }
 
     #[test]
@@ -331,6 +370,7 @@ reset_day = 15
                 pings: None,
                 report_errors: None,
                 report_self: None,
+                ext: None,
             })
             .unwrap();
         assert_eq!(shared.get().reset_day, 1);
@@ -346,6 +386,7 @@ reset_day = 15
                 pings: None,
                 report_errors: None,
                 report_self: None,
+                ext: None,
             })
             .is_err());
         assert_eq!(shared.get().config_version, "");
@@ -361,6 +402,7 @@ reset_day = 15
                 pings: None,
                 report_errors: None,
                 report_self: None,
+                ext: None,
             })
             .unwrap();
         let after = shared.get();

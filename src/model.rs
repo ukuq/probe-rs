@@ -156,7 +156,7 @@ pub struct PingTarget {
 }
 
 /// 服务端通过上报响应下发的远端配置（config 一级内，全部字段可选，
-/// 出现的字段才应用）。🔒 server_id/secret/worker_url/net_static_path 永不下发
+/// 出现的字段才应用）。🔒 server_id/secret/worker_url/net_static_path/protocol 永不下发
 #[derive(Debug, Clone, Deserialize)]
 pub struct RemoteConfig {
     /// 版本字符串；不等才应用（>= 语义对人类可读时间戳不可靠）
@@ -178,6 +178,57 @@ pub struct RemoteConfig {
     pub report_self: Option<bool>,
     #[serde(default)]
     pub pings: Option<Vec<PingTarget>>,
+    /// 协议扩展配置（ext.*；仅对应协议启用时生效）
+    #[serde(default)]
+    pub ext: Option<RemoteExt>,
+}
+
+/// 远端下发的协议扩展容器
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteExt {
+    #[serde(default)]
+    pub cf: Option<RemoteCfExt>,
+}
+
+/// 远端下发的 CF 扩展（全 Option，缺席保持现值）
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteCfExt {
+    #[serde(default)]
+    pub correction: Option<bool>,
+    #[serde(default)]
+    pub batch: Option<bool>,
+}
+
+/// 本地配置中的协议扩展容器（ext.*）
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtConfig {
+    #[serde(default)]
+    pub cf: CfExt,
+}
+
+/// CF 协议扩展（ext.cf.*）：仅 protocol="cf" 时生效
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CfExt {
+    /// 是否执行流量校正回路（应用 + 回传确认），缺省 true
+    #[serde(default = "default_cf_true")]
+    pub correction: bool,
+    /// 上报形状：true = samples[] 批量（带 ts）；false = 单条 metrics，缺省 true
+    #[serde(default = "default_cf_true")]
+    pub batch: bool,
+}
+
+impl Default for CfExt {
+    fn default() -> Self {
+        Self { correction: true, batch: true }
+    }
+}
+
+fn default_cf_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -6,6 +6,10 @@ server_id = "srv-01"
 secret = "change-me"
 worker_url = "https://monitor.example.com/report"
 net_static_path = "/var/lib/probe-rs/net_static.json"
+# 协议类型："probe"（默认，REPORT.md 协议）| "cf"（CF-Server-Monitor 的 POST /update）
+# 仅本地修改，重启生效。CF 模式下：server_id 填 CF 后台分配的 UUID，
+# secret 填 API_SECRET，worker_url 填 https://<worker>/update
+protocol = "probe"
 
 # ===== 本地或远端均可修改（本地热加载 ~3s；远端便车下发即时） =====
 # 月流量账期重置日 1-31；0 = 不重置（永久累计）
@@ -51,3 +55,11 @@ ip = 600
 # name = "baidu"
 # target = "https://www.baidu.com"
 # interval = 60
+
+# ===== 协议扩展（ext.*，本地或远端均可；注意必须放在文件最后，[[pings]] 之后） =====
+# CF 协议扩展：仅 protocol = "cf" 时生效
+[ext.cf]
+# 是否执行流量校正回路（应用 + 回传确认），缺省 true
+correction = true
+# 上报形状：true = samples[] 批量（带 ts，WS 回放用）；false = 单条 metrics（省 D1 写入），缺省 true
+batch = true

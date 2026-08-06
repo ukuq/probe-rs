@@ -189,6 +189,7 @@ mod tests {
             server_id: "test".into(),
             secret: String::new(),
             worker_url: String::new(),
+            protocol: "probe".into(),
             intervals: crate::model::Intervals::default(),
             reset_day: 1,
             config_version: String::new(),
@@ -198,6 +199,7 @@ mod tests {
             pings: vec![],
             report_errors: true,
             report_self: false,
+            ext: Default::default(),
         };
         let info = super::collect(None, None, None, "test", &cfg);
         assert!(!info.os.is_empty());

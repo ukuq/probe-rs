@@ -38,6 +38,8 @@ pub struct Scheduler {
     cpu: CpuMonitor,
     prev_net: Option<(net::NetBytes, Instant)>,
     last_static: Option<Instant>,
+    /// CF 模式：static 缓存（CF metrics 每次上报都带 static 字段）
+    static_cache: Option<crate::model::StaticInfo>,
     // 各异步源上次摘取的 ts：仅当快照 ts 更新才带入 dynamic 记录（新鲜度去重）
     last_ping_ts: std::collections::HashMap<String, i64>,
     last_gpu_ts: i64,
@@ -79,6 +81,7 @@ impl Scheduler {
             cpu: CpuMonitor::new(),
             prev_net: None,
             last_static: None,
+            static_cache: None,
             last_ping_ts: std::collections::HashMap::new(),
             last_gpu_ts: 0,
             last_slow_ts: 0,
@@ -150,7 +153,7 @@ impl Scheduler {
         self.prev_net = Some((net_now, Instant::now()));
 
         let period_start = period_start_ms(cfg.reset_day, chrono::Local::now());
-        let (net_rx_monthly, net_tx_monthly) = self.netstatic.query(&filter, period_start, now_ms);
+        let (net_rx_monthly, net_tx_monthly) = self.netstatic.query_monthly(&filter, period_start, now_ms);
 
         // fast 记录：只含快变字段，ts 即 tick 测量时刻
         self.buffers.push_dynamic(DynamicRecord {
@@ -212,6 +215,10 @@ impl Scheduler {
 
     async fn on_report(&mut self) {
         let cfg = self.cfg.get();
+        if cfg.protocol == "cf" {
+            self.on_report_cf(cfg).await;
+            return;
+        }
         let (dynamic, async_records, errors) = self.buffers.drain();
         // report_errors=false 时不上报错误事件（缓冲照常 drain，防积压）
         let errors = if cfg.report_errors { errors } else { Vec::new() };
@@ -261,6 +268,71 @@ impl Scheduler {
                 let crate::model::Report { dynamic, async_records, errors, .. } = report;
                 self.buffers.restore(dynamic, async_records, errors);
                 self.buffers.push_error("reporter", e.to_string());
+                tracing::warn!(error = %e, "上报失败，数据已保留待重发");
+            }
+        }
+    }
+
+    /// CF 协议上报：metrics 每次全量（static 走缓存），dynamic[] → samples[]。
+    /// errors/self 无落点直接丢弃；ping/slow/gpu 从快照直读最新值
+    async fn on_report_cf(&mut self, cfg: crate::config::LocalConfig) {
+        let (dynamic, _async, _errors) = self.buffers.drain();
+
+        if self.last_static.is_none_or(|t| t.elapsed() >= STATIC_REFRESH) || self.static_cache.is_none() {
+            self.last_static = Some(Instant::now());
+            let (ipv4, ipv6) = self.ip_rx.borrow().clone();
+            let gpu_name = self.gpu_name_rx.borrow().clone();
+            self.static_cache =
+                Some(collector::static_info(ipv4, ipv6, gpu_name, &self.agent_version, &cfg));
+        }
+        let st = self.static_cache.clone().expect("static_cache 上面刚填充");
+
+        let metrics = {
+            let slow = self.slow_rx.borrow();
+            let gpus = self.gpu_rx.borrow();
+            let pings = self.ping_rx.borrow();
+            crate::reporter_cf::build_metrics(&st, dynamic.last(), slow.as_ref(), &gpus, &pings)
+        };
+        let samples = if cfg.ext.cf.batch {
+            dynamic.iter().map(crate::reporter_cf::build_sample).collect()
+        } else {
+            Vec::new()
+        };
+        let confirm = self.netstatic.confirm_pending();
+        let update = crate::reporter_cf::CfUpdate {
+            id: cfg.server_id.clone(),
+            secret: cfg.secret.clone(),
+            metrics,
+            samples,
+            rx_correction: confirm.map(|c| c.0),
+            tx_correction: confirm.map(|c| c.1),
+        };
+
+        match self.reporter.send_cf(&update, &cfg.config_version).await {
+            Ok(resp) => {
+                if let Some(push) = resp.push {
+                    let remote = crate::reporter_cf::synthesize_remote(&push, &cfg.intervals);
+                    match self.cfg.apply_remote(remote) {
+                        // 配置变了 → 刷新 static 缓存（下个 report 重建）
+                        Ok(()) => self.last_static = None,
+                        Err(e) => tracing::warn!(error = %e, "CF 配置被拒绝"),
+                    }
+                }
+                // 校正回路用最新配置（push 可能刚改了 reset_day/interfaces）
+                let cur = self.cfg.get();
+                match resp.correction {
+                    Some((rx_gb, tx_gb)) if cur.ext.cf.correction => {
+                        let filter = net::IfaceFilter::new(&cur.interfaces);
+                        let period_start = period_start_ms(cur.reset_day, chrono::Local::now());
+                        let raw = self.netstatic.query(&filter, period_start, crate::model::now_millis());
+                        self.netstatic.apply_correction(period_start, raw, rx_gb, tx_gb);
+                    }
+                    // 响应不再带校正字段 = 服务端已确认清空，停止回传
+                    _ => self.netstatic.clear_confirm(),
+                }
+            }
+            Err(e) => {
+                self.buffers.restore(dynamic, vec![], vec![]);
                 tracing::warn!(error = %e, "上报失败，数据已保留待重发");
             }
         }

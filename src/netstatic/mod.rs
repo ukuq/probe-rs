@@ -25,9 +25,26 @@ struct Entry {
     tx: u64,
 }
 
+/// 流量校正（CF 协议）：覆盖语义——当月累计 = 原始累计 + offset。
+/// 账期翻页（period_start 不匹配）自动失效；confirm_pending 控制确认回传
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Correction {
+    /// 所属账期起点（毫秒）
+    pub period_start: i64,
+    pub rx_offset: i64,
+    pub tx_offset: i64,
+    /// 收到的原始 GB 值（回传确认用，不换算）
+    pub rx_gb: f64,
+    pub tx_gb: f64,
+    /// 是否还需向服务端回传确认（服务端清空待修正后置 false）
+    pub confirm_pending: bool,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct StoreFile {
     interfaces: BTreeMap<String, VecDeque<Entry>>,
+    #[serde(default)]
+    correction: Option<Correction>,
 }
 
 struct Inner {
@@ -93,7 +110,7 @@ impl NetStatic {
         }
     }
 
-    /// 查询 [start_ms, now_ms] 窗口内白名单网卡的 (rx, tx) 合计
+    /// 查询 [start_ms, now_ms] 窗口内白名单网卡的 (rx, tx) 合计（原始值，不含校正）
     pub fn query(&self, filter: &IfaceFilter, start_ms: i64, now_ms: i64) -> (u64, u64) {
         let inner = self.inner.lock().expect("netstatic lock poisoned");
         let mut rx = 0u64;
@@ -110,6 +127,75 @@ impl NetStatic {
             }
         }
         (rx, tx)
+    }
+
+    /// 月累计查询：原始值 + 校正偏移（偏移仅当属于当前账期时生效）
+    pub fn query_monthly(&self, filter: &IfaceFilter, period_start: i64, now_ms: i64) -> (u64, u64) {
+        let (raw_rx, raw_tx) = self.query(filter, period_start, now_ms);
+        let inner = self.inner.lock().expect("netstatic lock poisoned");
+        match inner.store.correction {
+            Some(c) if c.period_start == period_start => (
+                (raw_rx as i64 + c.rx_offset).max(0) as u64,
+                (raw_tx as i64 + c.tx_offset).max(0) as u64,
+            ),
+            _ => (raw_rx, raw_tx),
+        }
+    }
+
+    /// 应用流量校正（覆盖语义）：offset = 校正字节数 − 当前原始月累计。
+    /// GB 值原样保存供回传确认；立即落盘（重启不丢）
+    pub fn apply_correction(
+        &self,
+        period_start: i64,
+        raw_monthly: (u64, u64),
+        rx_gb: f64,
+        tx_gb: f64,
+    ) {
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        let rx_bytes = (rx_gb * GIB).round() as i64;
+        let tx_bytes = (tx_gb * GIB).round() as i64;
+        {
+            let mut inner = self.inner.lock().expect("netstatic lock poisoned");
+            inner.store.correction = Some(Correction {
+                period_start,
+                rx_offset: rx_bytes - raw_monthly.0 as i64,
+                tx_offset: tx_bytes - raw_monthly.1 as i64,
+                rx_gb,
+                tx_gb,
+                confirm_pending: true,
+            });
+            inner.dirty = true;
+        }
+        self.flush();
+        tracing::info!(rx_gb, tx_gb, "流量校正已应用");
+    }
+
+    /// 待回传的校正确认值（GB 原值）
+    pub fn confirm_pending(&self) -> Option<(f64, f64)> {
+        let inner = self.inner.lock().expect("netstatic lock poisoned");
+        inner
+            .store
+            .correction
+            .filter(|c| c.confirm_pending)
+            .map(|c| (c.rx_gb, c.tx_gb))
+    }
+
+    /// 服务端已清空待修正（响应不再带校正字段）：停止回传；偏移保留到账期结束
+    pub fn clear_confirm(&self) {
+        let need = {
+            let mut inner = self.inner.lock().expect("netstatic lock poisoned");
+            match &mut inner.store.correction {
+                Some(c) if c.confirm_pending => {
+                    c.confirm_pending = false;
+                    inner.dirty = true;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if need {
+            self.flush();
+        }
     }
 
     /// 到点（10min）或退出时落盘；tmp + rename 原子写
@@ -240,5 +326,53 @@ mod tests {
     #[test]
     fn period_zero_means_forever() {
         assert_eq!(period_start_ms(0, at(2026, 8, 5)), 0);
+    }
+
+    fn tmp_ns(tag: &str) -> (NetStatic, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("probe-rs-ns-{tag}-{}", std::process::id()));
+        let path = dir.join("net.json");
+        (NetStatic::load(&path), path)
+    }
+
+    #[test]
+    fn correction_overrides_monthly() {
+        let (ns, path) = tmp_ns("corr");
+        let filter = IfaceFilter::new(&[]);
+        let period = period_start_ms(1, Local::now());
+        let now = crate::model::now_millis();
+        // 原始月累计 2 GB：直接注入时序条目
+        {
+            let mut inner = ns.inner.lock().unwrap();
+            inner.store.interfaces.entry("eth0".into()).or_default().push_back(Entry {
+                ts: now,
+                rx: 2 * 1024 * 1024 * 1024,
+                tx: 1024 * 1024 * 1024,
+            });
+        }
+        // 校正为 rx=10GB tx=5GB（覆盖语义）
+        ns.apply_correction(period, (2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024), 10.0, 5.0);
+        let (rx, tx) = ns.query_monthly(&filter, period, now);
+        assert_eq!(rx, 10 * 1024 * 1024 * 1024);
+        assert_eq!(tx, 5 * 1024 * 1024 * 1024);
+        assert_eq!(ns.confirm_pending(), Some((10.0, 5.0)));
+
+        // 落盘恢复：偏移与确认状态都在
+        let ns2 = NetStatic::load(path.as_path());
+        let (rx2, tx2) = ns2.query_monthly(&filter, period, now);
+        assert_eq!((rx2, tx2), (rx, tx));
+        assert_eq!(ns2.confirm_pending(), Some((10.0, 5.0)));
+
+        // 服务端清空后停止回传，但偏移保留
+        ns2.clear_confirm();
+        assert_eq!(ns2.confirm_pending(), None);
+        let (rx3, _) = ns2.query_monthly(&filter, period, now);
+        assert_eq!(rx3, rx);
+
+        // 账期翻页：偏移失效，回到原始累计
+        let next_period = period + 32i64 * 24 * 3600 * 1000;
+        let (rx4, tx4) = ns2.query_monthly(&filter, next_period, now);
+        assert_eq!((rx4, tx4), (0, 0));
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }
