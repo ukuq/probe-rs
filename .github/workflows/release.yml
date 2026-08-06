@@ -1,5 +1,5 @@
 # 自动构建并发版：tag 取自 Cargo.toml 的 version（v<version>）
-# 该 tag 已存在 → 跳过（幂等）；不存在 → 构建并发版
+# release 同时具有两个架构产物才算完成；缺少任一产物时可安全重试。
 # 产物命名与 deploy/cf-install.sh 的下载地址对应：probe-rs-linux-<arch>
 name: release
 
@@ -16,33 +16,52 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  tag:
+  metadata:
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.t.outputs.tag }}
-      skip: ${{ steps.t.outputs.skip }}
+      tag: ${{ steps.meta.outputs.tag }}
+      ref: ${{ steps.meta.outputs.ref }}
+      skip: ${{ steps.meta.outputs.skip }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - id: t
+      - id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
           ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           [ -n "$ver" ] || { echo "Cargo.toml 未找到 version" >&2; exit 1; }
           tag="v$ver"
+
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-            echo "tag $tag 已存在，跳过发版"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+            build_ref="$tag"
           else
-            echo "将发版 $tag"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            build_ref="$GITHUB_SHA"
           fi
+
+          assets=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' 2>/dev/null || true)
+          complete=true
+          for name in probe-rs-linux-x86_64 probe-rs-linux-aarch64; do
+            if ! grep -Fxq "$name" <<<"$assets"; then
+              complete=false
+            fi
+          done
+
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ref=$build_ref" >> "$GITHUB_OUTPUT"
+          echo "skip=$complete" >> "$GITHUB_OUTPUT"
+          if [ "$complete" = true ]; then
+            echo "$tag 的两个架构产物均已存在，跳过发版"
+          else
+            echo "$tag 产物不完整，将从 $build_ref 构建并发版"
+          fi
 
   build:
-    needs: tag
-    if: needs.tag.outputs.skip == 'false'
+    needs: metadata
+    if: needs.metadata.outputs.skip == 'false'
     strategy:
       fail-fast: false
       matrix:
@@ -55,6 +74,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -67,11 +88,33 @@ jobs:
         run: |
           cargo build --release --target "${{ matrix.target }}"
           cp "target/${{ matrix.target }}/release/probe-rs" "${{ matrix.name }}"
-      - name: 发版
+      - name: 保存构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+          if-no-files-found: error
+
+  release:
+    needs: [metadata, build]
+    if: needs.metadata.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载全部架构产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: probe-rs-linux-*
+          path: dist
+          merge-multiple: true
+      - name: 一次性发布全部架构产物
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.tag.outputs.tag }}
-          name: ${{ needs.tag.outputs.tag }}
+          tag_name: ${{ needs.metadata.outputs.tag }}
+          target_commitish: ${{ needs.metadata.outputs.ref }}
+          name: ${{ needs.metadata.outputs.tag }}
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: ${{ matrix.name }}
+          overwrite_files: true
+          files: |
+            dist/probe-rs-linux-x86_64
+            dist/probe-rs-linux-aarch64

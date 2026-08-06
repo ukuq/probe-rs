@@ -98,7 +98,12 @@ case "$REPORT" in ''|*[!0-9]*) REPORT=60 ;; esac
 [ "$REPORT" -lt 1 ] && REPORT=60
 
 # ---- 二进制 ----
-TMP_BIN=/tmp/probe-rs.bin
+TMP_BIN=$(mktemp /tmp/probe-rs.bin.XXXXXX) || die "无法创建临时文件"
+cleanup() {
+    rm -f -- "$TMP_BIN"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 if [ -z "$BIN" ]; then
     arch=$(uname -m)
     case "$arch" in
@@ -115,7 +120,8 @@ else
     curl -fSL --connect-timeout 10 -o "$TMP_BIN" "$BIN" || die "二进制下载失败（可用 -bin= 指定本地路径）"
 fi
 install -m 0755 "$TMP_BIN" "$BIN_DST"
-rm -f "$TMP_BIN"
+cleanup
+trap - EXIT HUP INT TERM
 
 # ---- 配置 ----
 install -d -m 0755 "$DATA_DIR"

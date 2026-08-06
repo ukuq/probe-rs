@@ -12,7 +12,9 @@ use tokio::time::{interval, interval_at, Interval};
 use crate::buffer::Buffers;
 use crate::collector::{self, net, CpuMonitor};
 use crate::config::SharedConfig;
-use crate::model::{AsyncRecord, DynamicRecord, GpuRecord, Intervals, PingRecord, Report, SelfRecord, SlowBlock};
+use crate::model::{
+    AsyncRecord, DynamicRecord, GpuRecord, Intervals, PingRecord, Report, SelfRecord, SlowBlock,
+};
 use crate::netstatic::{period_start_ms, NetStatic};
 use crate::reporter::Reporter;
 use crate::worker::ping::PingSnapshot;
@@ -153,7 +155,10 @@ impl Scheduler {
         self.prev_net = Some((net_now, Instant::now()));
 
         let period_start = period_start_ms(cfg.reset_day, chrono::Local::now());
-        let (net_rx_monthly, net_tx_monthly) = self.netstatic.query_monthly(&filter, period_start, now_ms);
+        let correction_enabled = cfg.protocol == "cf" && cfg.ext.cf.correction;
+        let (net_rx_monthly, net_tx_monthly) =
+            self.netstatic
+                .query_monthly(&filter, period_start, now_ms, correction_enabled);
 
         // fast 记录：只含快变字段，ts 即 tick 测量时刻
         self.buffers.push_dynamic(DynamicRecord {
@@ -221,7 +226,11 @@ impl Scheduler {
         }
         let (dynamic, async_records, errors) = self.buffers.drain();
         // report_errors=false 时不上报错误事件（缓冲照常 drain，防积压）
-        let errors = if cfg.report_errors { errors } else { Vec::new() };
+        let errors = if cfg.report_errors {
+            errors
+        } else {
+            Vec::new()
+        };
 
         let due = self
             .last_static
@@ -230,7 +239,13 @@ impl Scheduler {
             self.last_static = Some(Instant::now());
             let (ipv4, ipv6) = self.ip_rx.borrow().clone();
             let gpu_name = self.gpu_name_rx.borrow().clone();
-            Some(collector::static_info(ipv4, ipv6, gpu_name, &self.agent_version, &cfg))
+            Some(collector::static_info(
+                ipv4,
+                ipv6,
+                gpu_name,
+                &self.agent_version,
+                &cfg,
+            ))
         } else {
             None
         };
@@ -265,7 +280,12 @@ impl Scheduler {
             }
             Err(e) => {
                 // 数据保留待重发（有界，满 1000 条丢最旧）；上报失败本身也记为错误事件
-                let crate::model::Report { dynamic, async_records, errors, .. } = report;
+                let crate::model::Report {
+                    dynamic,
+                    async_records,
+                    errors,
+                    ..
+                } = report;
                 self.buffers.restore(dynamic, async_records, errors);
                 self.buffers.push_error("reporter", e.to_string());
                 tracing::warn!(error = %e, "上报失败，数据已保留待重发");
@@ -276,14 +296,43 @@ impl Scheduler {
     /// CF 协议上报：metrics 每次全量（static 走缓存），dynamic[] → samples[]。
     /// errors/self 无落点直接丢弃；ping/slow/gpu 从快照直读最新值
     async fn on_report_cf(&mut self, cfg: crate::config::LocalConfig) {
+        // CF 服务端收到校正字段后会提前返回，必须先用独立请求确认，不能夹带待上报指标。
+        if cfg.ext.cf.correction {
+            if let Some((rx_correction, tx_correction)) = self.netstatic.confirm_pending() {
+                let ack = crate::reporter_cf::CfCorrectionAck {
+                    id: cfg.server_id.clone(),
+                    secret: cfg.secret.clone(),
+                    rx_correction,
+                    tx_correction,
+                };
+                match self
+                    .reporter
+                    .send_cf_correction_ack(&ack, &cfg.config_version)
+                    .await
+                {
+                    Ok(()) => self.netstatic.clear_confirm(),
+                    Err(e) => tracing::warn!(error = %e, "CF 流量校正确认失败，将在下次上报前重试"),
+                }
+            }
+        }
+
         let (dynamic, _async, _errors) = self.buffers.drain();
 
-        if self.last_static.is_none_or(|t| t.elapsed() >= STATIC_REFRESH) || self.static_cache.is_none() {
+        if self
+            .last_static
+            .is_none_or(|t| t.elapsed() >= STATIC_REFRESH)
+            || self.static_cache.is_none()
+        {
             self.last_static = Some(Instant::now());
             let (ipv4, ipv6) = self.ip_rx.borrow().clone();
             let gpu_name = self.gpu_name_rx.borrow().clone();
-            self.static_cache =
-                Some(collector::static_info(ipv4, ipv6, gpu_name, &self.agent_version, &cfg));
+            self.static_cache = Some(collector::static_info(
+                ipv4,
+                ipv6,
+                gpu_name,
+                &self.agent_version,
+                &cfg,
+            ));
         }
         let st = self.static_cache.clone().expect("static_cache 上面刚填充");
 
@@ -294,18 +343,18 @@ impl Scheduler {
             crate::reporter_cf::build_metrics(&st, dynamic.last(), slow.as_ref(), &gpus, &pings)
         };
         let samples = if cfg.ext.cf.batch {
-            dynamic.iter().map(crate::reporter_cf::build_sample).collect()
+            dynamic
+                .iter()
+                .map(|record| crate::reporter_cf::build_sample(&metrics, record))
+                .collect()
         } else {
             Vec::new()
         };
-        let confirm = self.netstatic.confirm_pending();
         let update = crate::reporter_cf::CfUpdate {
             id: cfg.server_id.clone(),
             secret: cfg.secret.clone(),
             metrics,
             samples,
-            rx_correction: confirm.map(|c| c.0),
-            tx_correction: confirm.map(|c| c.1),
         };
 
         match self.reporter.send_cf(&update, &cfg.config_version).await {
@@ -320,15 +369,16 @@ impl Scheduler {
                 }
                 // 校正回路用最新配置（push 可能刚改了 reset_day/interfaces）
                 let cur = self.cfg.get();
-                match resp.correction {
-                    Some((rx_gb, tx_gb)) if cur.ext.cf.correction => {
+                if let Some((rx_gb, tx_gb)) = resp.correction {
+                    if cur.ext.cf.correction {
                         let filter = net::IfaceFilter::new(&cur.interfaces);
                         let period_start = period_start_ms(cur.reset_day, chrono::Local::now());
-                        let raw = self.netstatic.query(&filter, period_start, crate::model::now_millis());
-                        self.netstatic.apply_correction(period_start, raw, rx_gb, tx_gb);
+                        let raw =
+                            self.netstatic
+                                .query(&filter, period_start, crate::model::now_millis());
+                        self.netstatic
+                            .apply_correction(period_start, raw, rx_gb, tx_gb);
                     }
-                    // 响应不再带校正字段 = 服务端已确认清空，停止回传
-                    _ => self.netstatic.clear_confirm(),
                 }
             }
             Err(e) => {

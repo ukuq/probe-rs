@@ -24,13 +24,18 @@ pub struct CfUpdate {
     pub metrics: CfMetrics,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub samples: Vec<CfSample>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rx_correction: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_correction: Option<f64>,
 }
 
-#[derive(Debug, Default, Serialize)]
+/// 流量校正确认必须单独发送；CF 服务端收到该形状后会提前返回，不处理指标。
+#[derive(Debug, Serialize)]
+pub struct CfCorrectionAck {
+    pub id: String,
+    pub secret: String,
+    pub rx_correction: f64,
+    pub tx_correction: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct CfMetrics {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<f64>,
@@ -75,10 +80,10 @@ pub struct CfMetrics {
     pub tcp_conn: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub udp_conn: Option<u64>,
-    /// 公网 IPv4；数值 0 = 不可达（字符串 "0" 会被 CF 当成 truthy 存成 1，必须用数值）
-    pub ip_v4: serde_json::Value,
-    /// 公网 IPv6；数值 0 = 不可达
-    pub ip_v6: serde_json::Value,
+    /// 公网 IPv4 可达标记；CF 协议只接受数值 1/0，不接受地址字符串。
+    pub ip_v4: u8,
+    /// 公网 IPv6 可达标记；CF 协议只接受数值 1/0。
+    pub ip_v6: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ping_ct: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,42 +102,19 @@ pub struct CfMetrics {
     pub loss_bd: Option<u32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CfGpu {
     pub id: String,
     pub name: String,
     pub info: f64,
 }
 
-/// samples[] 元素：{ts, metrics:{动态字段}}
+/// samples[] 元素。CF 服务端在 samples 非空时只读取这里的 metrics，
+/// 所以每个样本都必须携带完整指标，不能只发送动态字段。
 #[derive(Debug, Serialize)]
 pub struct CfSample {
     pub ts: i64,
-    pub metrics: CfDynMetrics,
-}
-
-#[derive(Debug, Default, Serialize)]
-pub struct CfDynMetrics {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ram_used: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub swap_used: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub load_avg: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub net_rx: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub net_tx: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub net_in_speed: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub net_out_speed: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub net_rx_monthly: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub net_tx_monthly: Option<u64>,
+    pub metrics: CfMetrics,
 }
 
 const MIB: u64 = 1024 * 1024;
@@ -158,9 +140,14 @@ pub fn build_metrics(
     pings: &HashMap<String, PingRecord>,
 ) -> CfMetrics {
     let ping = |names: &[&str]| -> Option<&PingRecord> {
-        names.iter().find_map(|n| pings.get(*n)).filter(|r| r.rtt >= 0)
+        names
+            .iter()
+            .find_map(|n| pings.get(*n))
+            .filter(|r| r.rtt >= 0)
     };
-    let ping_loss = |names: &[&str]| -> Option<u32> { names.iter().find_map(|n| pings.get(*n)).map(|r| r.loss) };
+    let ping_loss = |names: &[&str]| -> Option<u32> {
+        names.iter().find_map(|n| pings.get(*n)).map(|r| r.loss)
+    };
     let gpu_info = if gpus.is_empty() {
         None
     } else {
@@ -202,8 +189,8 @@ pub fn build_metrics(
         processes: slow.and_then(|s| s.processes),
         tcp_conn: slow.and_then(|s| s.tcp_conn),
         udp_conn: slow.and_then(|s| s.udp_conn),
-        ip_v4: st.ipv4.clone().map(serde_json::Value::String).unwrap_or_else(|| 0.into()),
-        ip_v6: st.ipv6.clone().map(serde_json::Value::String).unwrap_or_else(|| 0.into()),
+        ip_v4: u8::from(st.ipv4.is_some()),
+        ip_v6: u8::from(st.ipv6.is_some()),
         ping_ct: ping(&["ct"]).map(|r| r.rtt),
         ping_cu: ping(&["cu"]).map(|r| r.rtt),
         ping_cm: ping(&["cm"]).map(|r| r.rtt),
@@ -215,23 +202,21 @@ pub fn build_metrics(
     }
 }
 
-/// dynamic 记录 → samples[] 元素
-pub fn build_sample(d: &DynamicRecord) -> CfSample {
-    CfSample {
-        ts: d.ts,
-        metrics: CfDynMetrics {
-            cpu: d.cpu_usage.map(round2),
-            ram_used: d.mem_used.map(mb),
-            swap_used: d.swap_used.map(mb),
-            load_avg: d.load.map(load_str),
-            net_rx: d.net_rx,
-            net_tx: d.net_tx,
-            net_in_speed: d.net_rx_speed,
-            net_out_speed: d.net_tx_speed,
-            net_rx_monthly: d.net_rx_monthly,
-            net_tx_monthly: d.net_tx_monthly,
-        },
-    }
+/// 完整指标基底 + 一条 dynamic 记录 → samples[] 元素。
+pub fn build_sample(base: &CfMetrics, d: &DynamicRecord) -> CfSample {
+    let mut metrics = base.clone();
+    metrics.cpu = d.cpu_usage.map(round2);
+    metrics.ram_used = d.mem_used.map(mb);
+    metrics.swap_used = d.swap_used.map(mb);
+    metrics.load_avg = d.load.map(load_str);
+    metrics.net_rx = d.net_rx;
+    metrics.net_tx = d.net_tx;
+    metrics.net_in_speed = d.net_rx_speed;
+    metrics.net_out_speed = d.net_tx_speed;
+    metrics.net_rx_monthly = d.net_rx_monthly;
+    metrics.net_tx_monthly = d.net_tx_monthly;
+    metrics.timestamp = d.ts;
+    CfSample { ts: d.ts, metrics }
 }
 
 /// CF 配置推送（解析自 URL-encoded body）
@@ -249,15 +234,19 @@ pub struct CfPush {
 
 /// 把 CF 推送合成为通用 RemoteConfig（走 apply_remote 同一条热应用管线）。
 /// cur = 当前生效 intervals（CF 只下发 collect/report，其余四项保持现值）
-pub fn synthesize_remote(push: &CfPush, cur: &crate::model::Intervals) -> crate::model::RemoteConfig {
-    let intervals = (push.collect.is_some() || push.report.is_some()).then(|| crate::model::Intervals {
-        collect: push.collect.unwrap_or(cur.collect),
-        report: push.report.unwrap_or(cur.report),
-        ping: cur.ping,
-        slow: cur.slow,
-        gpu: cur.gpu,
-        ip: cur.ip,
-    });
+pub fn synthesize_remote(
+    push: &CfPush,
+    cur: &crate::model::Intervals,
+) -> crate::model::RemoteConfig {
+    let intervals =
+        (push.collect.is_some() || push.report.is_some()).then(|| crate::model::Intervals {
+            collect: push.collect.unwrap_or(cur.collect),
+            report: push.report.unwrap_or(cur.report),
+            ping: cur.ping,
+            slow: cur.slow,
+            gpu: cur.gpu,
+            ip: cur.ip,
+        });
     let pings = push.custom.iter().any(Option::is_some).then(|| {
         ["ct", "cu", "cm", "bd"]
             .iter()
@@ -268,7 +257,11 @@ pub fn synthesize_remote(push: &CfPush, cur: &crate::model::Intervals) -> crate:
                 if target.is_empty() {
                     return None;
                 }
-                Some(crate::model::PingTarget { name: (*name).to_string(), target: target.clone(), interval: None })
+                Some(crate::model::PingTarget {
+                    name: (*name).to_string(),
+                    target: target.clone(),
+                    interval: None,
+                })
             })
             .collect()
     });
@@ -276,7 +269,10 @@ pub fn synthesize_remote(push: &CfPush, cur: &crate::model::Intervals) -> crate:
         config_version: push.version.clone(),
         reset_day: push.reset_day,
         intervals,
-        interfaces: push.interface.clone().map(|s| if s.is_empty() { vec![] } else { vec![s] }),
+        interfaces: push
+            .interface
+            .clone()
+            .map(|s| if s.is_empty() { vec![] } else { vec![s] }),
         enable_gpu: None,
         report_errors: None,
         report_self: None,
@@ -307,7 +303,10 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
         return CfResponse::default();
     }
     let mut push = CfPush {
-        version: md5_header.filter(|s| !s.is_empty()).unwrap_or(body).to_string(),
+        version: md5_header
+            .filter(|s| !s.is_empty())
+            .unwrap_or(body)
+            .to_string(),
         collect: None,
         report: None,
         reset_day: None,
@@ -361,7 +360,10 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
     if let (Some(rx), Some(tx)) = (rx_gb, tx_gb) {
         correction = Some((rx, tx));
     }
-    CfResponse { push: has_config.then_some(push), correction }
+    CfResponse {
+        push: has_config.then_some(push),
+        correction,
+    }
 }
 
 #[cfg(test)]
@@ -415,11 +417,41 @@ mod tests {
             net_rx_monthly: Some(594_000),
             net_tx_monthly: Some(467_000),
         };
-        let slow = SlowBlock { ts: 999, disk_used: Some(5_000_000_000), tcp_conn: Some(1), udp_conn: Some(6), processes: Some(14) };
+        let slow = SlowBlock {
+            ts: 999,
+            disk_used: Some(5_000_000_000),
+            tcp_conn: Some(1),
+            udp_conn: Some(6),
+            processes: Some(14),
+        };
         let mut pings = HashMap::new();
-        pings.insert("ct".to_string(), PingRecord { ts: 999, name: "ct".into(), rtt: 42, loss: 0 });
-        pings.insert("bgp".to_string(), PingRecord { ts: 999, name: "bgp".into(), rtt: 6, loss: 25 });
-        pings.insert("cu".to_string(), PingRecord { ts: 999, name: "cu".into(), rtt: -1, loss: 100 });
+        pings.insert(
+            "ct".to_string(),
+            PingRecord {
+                ts: 999,
+                name: "ct".into(),
+                rtt: 42,
+                loss: 0,
+            },
+        );
+        pings.insert(
+            "bgp".to_string(),
+            PingRecord {
+                ts: 999,
+                name: "bgp".into(),
+                rtt: 6,
+                loss: 25,
+            },
+        );
+        pings.insert(
+            "cu".to_string(),
+            PingRecord {
+                ts: 999,
+                name: "cu".into(),
+                rtt: -1,
+                loss: 100,
+            },
+        );
         let m = build_metrics(&st, Some(&d), Some(&slow), &[], &pings);
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["cpu"], 12.35);
@@ -428,8 +460,8 @@ mod tests {
         assert_eq!(v["ram_total"], 12884); // 13510758768 / 2^20（向下取整）
         assert_eq!(v["ram_used"], 925);
         assert_eq!(v["load_avg"], "0.10 0.20 0.30");
-        assert_eq!(v["ip_v4"], "38.147.161.207");
-        assert_eq!(v["ip_v6"], 0); // None → 数值 0（字符串 "0" 会被 CF 存成 1）
+        assert_eq!(v["ip_v4"], 1);
+        assert_eq!(v["ip_v6"], 0);
         assert_eq!(v["ping_ct"], 42);
         assert_eq!(v["ping_bd"], 6); // bgp → bd
         assert_eq!(v["loss_bd"], 25);
@@ -437,10 +469,46 @@ mod tests {
         assert_eq!(v["loss_cu"], 100); // loss 仍上报
         assert_eq!(v["tcp_conn"], 1);
         assert!(v.get("gpu_info").is_none()); // 无 GPU → 缺席
-        let s = build_sample(&d);
+        let mut historical = d.clone();
+        historical.ts = 900;
+        historical.cpu_usage = Some(8.765);
+        historical.net_rx_speed = Some(9_999);
+        let s = build_sample(&m, &historical);
         let sv = serde_json::to_value(&s).unwrap();
-        assert_eq!(sv["ts"], 1000);
-        assert_eq!(sv["metrics"]["net_in_speed"], 11_200);
+        assert_eq!(sv["ts"], 900);
+        assert_eq!(sv["metrics"]["timestamp"], 900);
+        assert_eq!(sv["metrics"]["cpu"], 8.77);
+        assert_eq!(sv["metrics"]["net_in_speed"], 9_999);
+        // samples 非空时 CF 不回退顶层 metrics；静态、慢指标与探测结果必须逐样本保留。
+        assert_eq!(sv["metrics"]["ram_total"], 12884);
+        assert_eq!(sv["metrics"]["disk_total"], 76687);
+        assert_eq!(sv["metrics"]["os"], "Debian 13");
+        assert_eq!(sv["metrics"]["tcp_conn"], 1);
+        assert_eq!(sv["metrics"]["ping_ct"], 42);
+    }
+
+    #[test]
+    fn correction_ack_has_no_metrics_payload() {
+        let ack = CfCorrectionAck {
+            id: "server-id".into(),
+            secret: "secret".into(),
+            rx_correction: 10.0,
+            tx_correction: 2.5,
+        };
+        let value = serde_json::to_value(ack).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 4);
+        assert!(value.get("metrics").is_none());
+        assert!(value.get("samples").is_none());
+
+        let update = CfUpdate {
+            id: "server-id".into(),
+            secret: "secret".into(),
+            metrics: CfMetrics::default(),
+            samples: Vec::new(),
+        };
+        let value = serde_json::to_value(update).unwrap();
+        assert!(value.get("rx_correction").is_none());
+        assert!(value.get("tx_correction").is_none());
     }
 
     #[test]
@@ -454,7 +522,10 @@ mod tests {
         assert_eq!(p.collect, Some(1)); // 0 钳到 1
         assert_eq!(p.report, Some(60));
         assert_eq!(p.reset_day, Some(15));
-        assert_eq!(p.custom[0].as_deref(), Some("gd-ct-dualstack.ip.zstaticcdn.com"));
+        assert_eq!(
+            p.custom[0].as_deref(),
+            Some("gd-ct-dualstack.ip.zstaticcdn.com")
+        );
         assert_eq!(p.custom[1].as_deref(), Some("")); // 空值保留语义：该组清空
         assert_eq!(p.interface.as_deref(), Some("eth0"));
         assert!(r.correction.is_none());
@@ -462,10 +533,16 @@ mod tests {
 
     #[test]
     fn parse_correction_and_ok() {
-        let r = parse_response_body("collect_interval=5&report_interval=60&rx_correction=10&tx_correction=2.5", None);
+        let r = parse_response_body(
+            "collect_interval=5&report_interval=60&rx_correction=10&tx_correction=2.5",
+            None,
+        );
         assert_eq!(r.correction, Some((10.0, 2.5)));
         // MD5 头缺失时 version 取原始串
-        assert_eq!(r.push.unwrap().version, "collect_interval=5&report_interval=60&rx_correction=10&tx_correction=2.5");
+        assert_eq!(
+            r.push.unwrap().version,
+            "collect_interval=5&report_interval=60&rx_correction=10&tx_correction=2.5"
+        );
         assert!(parse_response_body("OK", None).push.is_none());
         assert!(parse_response_body("", None).correction.is_none());
         // 非法校正值：忽略

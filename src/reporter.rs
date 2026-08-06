@@ -6,9 +6,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::model::{RemoteConfig, Report};
-use crate::reporter_cf::{CfResponse, CfUpdate};
+use crate::reporter_cf::{CfCorrectionAck, CfResponse, CfUpdate};
 
 const TIMEOUT: Duration = Duration::from_secs(8);
+// 与 CF-Server-Monitor src/utils/agentConfig.js 的 AGENT_CONFIG_SCHEMA_VERSION 保持一致。
+const CF_CONFIG_SCHEMA: &str = "3";
 
 /// 响应信封：config 缺席 = 无配置变更；next.static = true 时下次上报强制带 static
 #[derive(serde::Deserialize)]
@@ -72,7 +74,10 @@ impl Reporter {
         let body = resp.text().await.context("读取上报响应失败")?;
         let body = body.trim();
         if body.is_empty() || body == "{}" {
-            return Ok(ResponseAction { config: None, next_static: false });
+            return Ok(ResponseAction {
+                config: None,
+                next_static: false,
+            });
         }
         let parsed: ReportResponse = serde_json::from_str(body).context("解析上报响应失败")?;
         Ok(ResponseAction {
@@ -81,19 +86,49 @@ impl Reporter {
         })
     }
 
+    fn cf_request<T: serde::Serialize + ?Sized>(
+        &self,
+        payload: &T,
+        config_md5: &str,
+    ) -> reqwest::RequestBuilder {
+        let md5 = if config_md5.is_empty() {
+            "none"
+        } else {
+            config_md5
+        };
+        let agent_ver = format!("probe-rs_{}", self.agent_version);
+        self.client
+            .post(&self.url)
+            .header("X-Agent-Version", agent_ver)
+            .header("X-Agent-Config-Schema", CF_CONFIG_SCHEMA)
+            .header("X-Agent-Config-Md5", md5)
+            .json(payload)
+    }
+
+    /// 单独确认已应用的 CF 流量校正。服务端会对该请求提前返回，因此请求体不能夹带指标。
+    pub async fn send_cf_correction_ack(
+        &self,
+        ack: &CfCorrectionAck,
+        config_md5: &str,
+    ) -> Result<()> {
+        let resp = self
+            .cf_request(ack, config_md5)
+            .send()
+            .await
+            .context("发送 CF 流量校正确认失败")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("CF 流量校正确认响应 HTTP {status}: {}", body.trim());
+        }
+        Ok(())
+    }
+
     /// CF 协议上报（POST /update）。config_md5 为当前已应用的 CF 配置 MD5（空 = none）。
     /// 204 = 无变更；200 = 解析 URL-encoded 配置/校正
     pub async fn send_cf(&self, update: &CfUpdate, config_md5: &str) -> Result<CfResponse> {
-        let md5 = if config_md5.is_empty() { "none" } else { config_md5 };
-        // CF 服务端 agent_version 取值优先用该头——带 probe-rs/ 前缀以区分官方探针
-        let agent_ver = format!("probe-rs_{}", self.agent_version);
         let resp = self
-            .client
-            .post(&self.url)
-            .header("X-Agent-Version", &agent_ver)
-            .header("X-Agent-Config-Schema", "3")
-            .header("X-Agent-Config-Md5", md5)
-            .json(update)
+            .cf_request(update, config_md5)
             .send()
             .await
             .context("上报请求失败")?;
@@ -111,6 +146,9 @@ impl Reporter {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         let body = resp.text().await.context("读取上报响应失败")?;
-        Ok(crate::reporter_cf::parse_response_body(&body, resp_md5.as_deref()))
+        Ok(crate::reporter_cf::parse_response_body(
+            &body,
+            resp_md5.as_deref(),
+        ))
     }
 }
