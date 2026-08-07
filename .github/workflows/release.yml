@@ -80,7 +80,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: 验证 Rust 编译目标
-        run: rustup target list --installed | grep -Fx "${{ matrix.target }}"
+        run: rustup target list --toolchain stable --installed | grep -Fx "${{ matrix.target }}"
       - name: 安装交叉链接器（aarch64）
         if: matrix.linker
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
@@ -88,7 +88,7 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
         run: |
-          cargo build --release --target "${{ matrix.target }}"
+          cargo +stable build --release --target "${{ matrix.target }}"
           cp "target/${{ matrix.target }}/release/probe-rs" "${{ matrix.name }}"
       - name: 保存构建产物
         uses: actions/upload-artifact@v4
