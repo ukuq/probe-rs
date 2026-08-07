@@ -60,6 +60,8 @@ pub struct StaticConfig {
     pub report_errors: bool,
     pub report_self: bool,
     pub pings: Vec<PingTarget>,
+    /// 协议扩展（ext.*）
+    pub ext: ExtConfig,
 }
 
 /// 一条 = 一次 collect tick，只含 fast 字段，ts 即 tick 测量时刻
@@ -223,7 +225,10 @@ pub struct CfExt {
 
 impl Default for CfExt {
     fn default() -> Self {
-        Self { correction: true, batch: true }
+        Self {
+            correction: true,
+            batch: true,
+        }
     }
 }
 
@@ -329,14 +334,29 @@ mod tests {
 
     #[test]
     fn intervals_validation() {
-        let ok = Intervals { collect: 10, report: 60, ping: 30, ..Default::default() };
+        let ok = Intervals {
+            collect: 10,
+            report: 60,
+            ping: 30,
+            ..Default::default()
+        };
         assert!(ok.validate().is_ok());
 
         // report < collect 也合法：多余的上报只是空数组心跳
-        let heartbeat = Intervals { collect: 60, report: 10, ping: 30, ..Default::default() };
+        let heartbeat = Intervals {
+            collect: 60,
+            report: 10,
+            ping: 30,
+            ..Default::default()
+        };
         assert!(heartbeat.validate().is_ok());
 
-        let zero = Intervals { collect: 0, report: 60, ping: 30, ..Default::default() };
+        let zero = Intervals {
+            collect: 0,
+            report: 60,
+            ping: 30,
+            ..Default::default()
+        };
         assert!(zero.validate().is_err());
     }
 }

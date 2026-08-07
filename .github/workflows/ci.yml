@@ -1,0 +1,35 @@
+# CI：格式化与测试门禁（所有分支 push / 所有 PR）
+# 发版见 release.yml
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# 同一分支/PR 重复触发（push + synchronize）时只保留最新一次
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 版本钉死：避免工具链升级导致 fmt 门禁漂移
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo test
+
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.7.11
+      - run: deno fmt --check server-demo/
+      - run: deno check server-demo/server.ts

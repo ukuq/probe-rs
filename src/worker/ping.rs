@@ -41,7 +41,14 @@ impl PingWorker {
     ) -> Self {
         let handles = targets
             .into_iter()
-            .map(|t| tokio::spawn(target_loop(t, tx.clone(), buffers.clone(), intervals_rx.clone())))
+            .map(|t| {
+                tokio::spawn(target_loop(
+                    t,
+                    tx.clone(),
+                    buffers.clone(),
+                    intervals_rx.clone(),
+                ))
+            })
             .collect();
         Self { handles }
     }
@@ -167,12 +174,34 @@ async fn measure(target: &str, kind: PingKind) -> Result<i64> {
 }
 
 fn split_host_port(target: &str) -> Result<(String, u16)> {
-    let target = target.trim().trim_matches(['[', ']']);
+    let target = target.trim();
     if target.is_empty() {
         bail!("empty target");
     }
+    // [v6]:port 标准写法
+    if let Some(rest) = target.strip_prefix('[') {
+        if let Some((host, port)) = rest.split_once("]:") {
+            let port = port.parse::<u16>().ok().filter(|p| *p >= 1);
+            return match (host.is_empty(), port) {
+                (false, Some(port)) => Ok((host.to_string(), port)),
+                _ => bail!("非法 target: {target}"),
+            };
+        }
+        // [v6] 无端口
+        if let Some(host) = rest.strip_suffix(']') {
+            if host.is_empty() {
+                bail!("非法 target: {target}");
+            }
+            return Ok((host.to_string(), DEFAULT_TCP_PORT));
+        }
+        bail!("非法 target: {target}");
+    }
     if let Some((host, port)) = target.rsplit_once(':') {
-        if !host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
+        if !host.is_empty()
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        {
             if let Ok(port) = port.parse::<u16>() {
                 if port >= 1 {
                     return Ok((host.to_string(), port));
@@ -229,9 +258,29 @@ mod tests {
 
     #[test]
     fn host_port_split() {
-        assert_eq!(split_host_port("1.2.3.4").unwrap(), ("1.2.3.4".to_string(), 80));
-        assert_eq!(split_host_port("1.2.3.4:8080").unwrap(), ("1.2.3.4".to_string(), 8080));
-        assert_eq!(split_host_port("example.com:443").unwrap(), ("example.com".to_string(), 443));
+        assert_eq!(
+            split_host_port("1.2.3.4").unwrap(),
+            ("1.2.3.4".to_string(), 80)
+        );
+        assert_eq!(
+            split_host_port("1.2.3.4:8080").unwrap(),
+            ("1.2.3.4".to_string(), 8080)
+        );
+        assert_eq!(
+            split_host_port("example.com:443").unwrap(),
+            ("example.com".to_string(), 443)
+        );
+        // IPv6 标准写法
+        assert_eq!(
+            split_host_port("[::1]:8080").unwrap(),
+            ("::1".to_string(), 8080)
+        );
+        assert_eq!(
+            split_host_port("[2001:db8::1]").unwrap(),
+            ("2001:db8::1".to_string(), 80)
+        );
+        assert!(split_host_port("[::1]").is_ok());
+        assert!(split_host_port("[::1]:abc").is_err());
     }
 
     #[test]

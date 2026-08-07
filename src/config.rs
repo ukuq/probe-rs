@@ -107,7 +107,11 @@ impl SharedConfig {
     pub fn new(
         cfg: LocalConfig,
         path: PathBuf,
-    ) -> (Arc<Self>, watch::Receiver<Intervals>, watch::Receiver<LocalConfig>) {
+    ) -> (
+        Arc<Self>,
+        watch::Receiver<Intervals>,
+        watch::Receiver<LocalConfig>,
+    ) {
         let (tx, rx) = watch::channel(cfg.intervals);
         let (config_tx, config_rx) = watch::channel(cfg.clone());
         (
@@ -230,7 +234,8 @@ fn validate_remote(remote: &RemoteConfig) -> Result<()> {
             if p.is_empty() || p.len() > 64 {
                 bail!("远端 interfaces 参数非法: {pattern:?}");
             }
-            globset::Glob::new(p).map_err(|e| anyhow::anyhow!("远端 interfaces glob 非法 {pattern:?}: {e}"))?;
+            globset::Glob::new(p)
+                .map_err(|e| anyhow::anyhow!("远端 interfaces glob 非法 {pattern:?}: {e}"))?;
         }
     }
     if let Some(pings) = &remote.pings {
@@ -291,7 +296,12 @@ mod tests {
             secret: "sec".into(),
             worker_url: "https://example.com/report".into(),
             protocol: "probe".into(),
-            intervals: Intervals { collect: 10, report: 60, ping: 30, ..Default::default() },
+            intervals: Intervals {
+                collect: 10,
+                report: 60,
+                ping: 30,
+                ..Default::default()
+            },
             reset_day: 1,
             config_version: String::new(),
             interfaces: vec![],
@@ -315,7 +325,11 @@ mod tests {
     fn toml_roundtrip_preserves_ext_and_pings() {
         // TOML 布局陷阱防回归：[ext.cf] 与 [[pings]] 的表格次序必须往返无损
         let mut cfg = base_config();
-        cfg.pings = vec![PingTarget { name: "ct".into(), target: "example.com:80".into(), interval: Some(5) }];
+        cfg.pings = vec![PingTarget {
+            name: "ct".into(),
+            target: "example.com:80".into(),
+            interval: Some(5),
+        }];
         cfg.ext.cf.correction = false;
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: LocalConfig = toml::from_str(&text).unwrap();
@@ -327,8 +341,9 @@ mod tests {
     #[test]
     fn example_config_parses() {
         // 防回归：config.example.toml 本身必须能解析（TOML 布局陷阱曾让示例文件失效）
-        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml"))
-            .unwrap();
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml"))
+                .unwrap();
         let cfg: LocalConfig = toml::from_str(&text).unwrap();
         cfg.validate().unwrap();
     }
@@ -363,7 +378,12 @@ reset_day = 15
         shared
             .apply_remote(RemoteConfig {
                 config_version: String::new(),
-                intervals: Some(Intervals { collect: 1, report: 1, ping: 1, ..Default::default() }),
+                intervals: Some(Intervals {
+                    collect: 1,
+                    report: 1,
+                    ping: 1,
+                    ..Default::default()
+                }),
                 reset_day: Some(5),
                 interfaces: None,
                 enable_gpu: None,
@@ -379,7 +399,12 @@ reset_day = 15
         assert!(shared
             .apply_remote(RemoteConfig {
                 config_version: "2026-08-06T15:00:00+08:00".into(),
-                intervals: Some(Intervals { collect: 0, report: 20, ping: 30, ..Default::default() }),
+                intervals: Some(Intervals {
+                    collect: 0,
+                    report: 20,
+                    ping: 30,
+                    ..Default::default()
+                }),
                 reset_day: Some(5),
                 interfaces: None,
                 enable_gpu: None,
@@ -395,7 +420,12 @@ reset_day = 15
         shared
             .apply_remote(RemoteConfig {
                 config_version: "2026-08-06T15:00:00+08:00".into(),
-                intervals: Some(Intervals { collect: 5, report: 20, ping: 15, ..Default::default() }),
+                intervals: Some(Intervals {
+                    collect: 5,
+                    report: 20,
+                    ping: 15,
+                    ..Default::default()
+                }),
                 reset_day: Some(15),
                 interfaces: None,
                 enable_gpu: None,

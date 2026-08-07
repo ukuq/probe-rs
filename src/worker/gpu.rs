@@ -48,7 +48,11 @@ pub fn start(
     })
 }
 
-async fn run_once(name_tx: &watch::Sender<Option<String>>, gpu_tx: &watch::Sender<Vec<GpuRecord>>, buffers: &Buffers) {
+async fn run_once(
+    name_tx: &watch::Sender<Option<String>>,
+    gpu_tx: &watch::Sender<Vec<GpuRecord>>,
+    buffers: &Buffers,
+) {
     match query_gpu().await {
         Ok(gpus) if !gpus.is_empty() => {
             let ts = crate::model::now_millis();
@@ -62,8 +66,7 @@ async fn run_once(name_tx: &watch::Sender<Option<String>>, gpu_tx: &watch::Sende
                 }
             });
             gpu_tx.send_replace(
-                gpus
-                    .into_iter()
+                gpus.into_iter()
                     .map(|g| GpuRecord {
                         ts,
                         name: g.name,
@@ -166,7 +169,11 @@ async fn gpu_names_macos() -> Vec<String> {
     };
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter_map(|l| l.trim().strip_prefix("Chipset Model:").map(|s| s.trim().to_string()))
+        .filter_map(|l| {
+            l.trim()
+                .strip_prefix("Chipset Model:")
+                .map(|s| s.trim().to_string())
+        })
         .collect()
 }
 
@@ -210,7 +217,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn parses_ioreg_values() {
         let out = r#""Device Utilization %"=42 "Device Utilization %"=7"#;
-        assert_eq!(super::parse_ioreg_numbers(out, "Device Utilization %"), vec![42.0, 7.0]);
+        assert_eq!(
+            super::parse_ioreg_numbers(out, "Device Utilization %"),
+            vec![42.0, 7.0]
+        );
     }
 
     #[test]

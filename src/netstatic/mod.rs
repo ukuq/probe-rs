@@ -102,7 +102,11 @@ impl NetStatic {
                 continue;
             }
             let entries = inner.store.interfaces.entry(name).or_default();
-            entries.push_back(Entry { ts: now, rx: rx_delta, tx: tx_delta });
+            entries.push_back(Entry {
+                ts: now,
+                rx: rx_delta,
+                tx: tx_delta,
+            });
             while entries.front().is_some_and(|e| e.ts < cutoff) {
                 entries.pop_front();
             }
@@ -130,7 +134,12 @@ impl NetStatic {
     }
 
     /// 月累计查询：原始值 + 校正偏移（偏移仅当属于当前账期时生效）
-    pub fn query_monthly(&self, filter: &IfaceFilter, period_start: i64, now_ms: i64) -> (u64, u64) {
+    pub fn query_monthly(
+        &self,
+        filter: &IfaceFilter,
+        period_start: i64,
+        now_ms: i64,
+    ) -> (u64, u64) {
         let (raw_rx, raw_tx) = self.query(filter, period_start, now_ms);
         let inner = self.inner.lock().expect("netstatic lock poisoned");
         match inner.store.correction {
@@ -274,15 +283,26 @@ fn actual_reset_date<Tz: TimeZone>(year: i32, month: u32, reset_day: u8, tz: Tz)
     if u32::from(reset_day) <= last_day {
         tz.with_ymd_and_hms(year, month, reset_day.into(), 0, 0, 0)
             .single()
-            .unwrap_or_else(|| tz.with_ymd_and_hms(year, month, reset_day.into(), 3, 0, 0).unwrap())
+            .unwrap_or_else(|| {
+                tz.with_ymd_and_hms(year, month, reset_day.into(), 3, 0, 0)
+                    .unwrap()
+            })
     } else {
-        let (y, m) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+        let (y, m) = if month == 12 {
+            (year + 1, 1)
+        } else {
+            (year, month + 1)
+        };
         tz.with_ymd_and_hms(y, m, 1, 0, 0, 0).unwrap()
     }
 }
 
 fn last_day_of_month(year: i32, month: u32) -> u32 {
-    let (y, m) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let (y, m) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
     let first_next = chrono::NaiveDate::from_ymd_opt(y, m, 1).unwrap();
     first_next.pred_opt().unwrap().day()
 }
@@ -343,14 +363,24 @@ mod tests {
         // 原始月累计 2 GB：直接注入时序条目
         {
             let mut inner = ns.inner.lock().unwrap();
-            inner.store.interfaces.entry("eth0".into()).or_default().push_back(Entry {
-                ts: now,
-                rx: 2 * 1024 * 1024 * 1024,
-                tx: 1024 * 1024 * 1024,
-            });
+            inner
+                .store
+                .interfaces
+                .entry("eth0".into())
+                .or_default()
+                .push_back(Entry {
+                    ts: now,
+                    rx: 2 * 1024 * 1024 * 1024,
+                    tx: 1024 * 1024 * 1024,
+                });
         }
         // 校正为 rx=10GB tx=5GB（覆盖语义）
-        ns.apply_correction(period, (2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024), 10.0, 5.0);
+        ns.apply_correction(
+            period,
+            (2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024),
+            10.0,
+            5.0,
+        );
         let (rx, tx) = ns.query_monthly(&filter, period, now);
         assert_eq!(rx, 10 * 1024 * 1024 * 1024);
         assert_eq!(tx, 5 * 1024 * 1024 * 1024);

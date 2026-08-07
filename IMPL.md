@@ -140,6 +140,17 @@ probe-rs/
 | 磁盘去重 | 同设备多挂载点只计一次；ZFS pool 截断；虚拟 FS 排除 |
 | 远端配置 | version 不变不应用；非法字段整体拒绝；应用后 TOML 落盘内容正确 |
 
+## 本地构建
+
+```bash
+make fmt     # cargo fmt + deno fmt（提交前跑）
+make check   # CI 同款：fmt --check + deno check + cargo test
+make build   # cargo build --release（strip + lto）
+make demo    # 本地演示服务端（8080）
+```
+
+CI：`.github/workflows/ci.yml` 对所有 push/PR 跑 `make check` 同款门禁（rust 1.91.1 / deno 2.7.11 钉版）；`release.yml` 在 push master 时按 Cargo.toml version 发版（tag 已存在则跳过）。
+
 ## 部署（Linux + systemd）
 
 ```bash
@@ -162,4 +173,4 @@ agent 可切换为 CF-Server-Monitor 的 `POST /update` 协议（适配官方服
 
 **配置下发**：请求头 `X-Agent-Config-Schema: 3` + `X-Agent-Config-Md5`（复用 `config_version` 字段存 MD5，空 = `none`）。响应 204 = 无变更；200 + URL-encoded body → 解析 collect_interval/report_interval/reset_day/custom_ct/cu/cm/bd/interface，合成 `RemoteConfig`（config_version 取响应头 MD5）走 `apply_remote` 同一条热应用管线。CF 未覆盖的字段（ping/slow/gpu/ip 子间隔、enable_gpu、report_*、ext.*）保持现值，仅本地可改。
 
-**流量校正**：响应尾部 `rx_correction/tx_correction`（GB，覆盖当月累计）。netstatic 记账期偏移（offset = 校正字节 − 原始月累计，period_start 匹配才生效，翻页自动失效），立即落盘；下次 /update 顶层回传原始 GB 值，服务端清空后停止回传。`ext.cf.correction = false` 时整个回路忽略。`update=1`（自升级）永远忽略。
+**流量校正**：响应尾部 `rx_correction/tx_correction`（GB，覆盖当月累计）。netstatic 记账期偏移（offset = 校正字节 − 原始月累计，period_start 匹配才生效，翻页自动失效），立即落盘；校正确认用**独立请求**回传（CF 服务端见到 correction 字段会把整个请求当确认、丢弃 metrics），服务端清空后停止。`ext.cf.correction = false` 时整个回路忽略。`update=1`（自升级）永远忽略。

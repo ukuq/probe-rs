@@ -43,7 +43,8 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
       "enable_gpu": true,
       "report_errors": true,
       "report_self": false,
-      "pings": [ { "name": "ct", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 } ]
+      "pings": [ { "name": "ct", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 } ],
+      "ext": { "cf": { "correction": true, "batch": true } }
     }
   },
 
@@ -120,6 +121,7 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
 | `report_errors` | boolean | 是否上报 errors 错误事件 |
 | `report_self` | boolean | 是否上报探针自身占用 kind:"self" |
 | `pings` | array | 探测目标组：`[{name, target, interval?}]` |
+| `ext` | object | 协议扩展 `{cf: {correction, batch}}`（仅 cf 协议生效） |
 
 ## dynamic 记录字段（每条 = 一次 collect tick）
 
@@ -205,6 +207,7 @@ kind 按数据语义划分（DESIGN.md §2.3"机制同类、语义分流"）：s
 | `report_errors` | 可选；是否上报 errors 错误事件（布尔，缺省 true） |
 | `report_self` | 可选；是否上报探针自身资源占用 kind:"self"（布尔，缺省 false） |
 | `pings` | 可选；探测目标组数组，整体替换：`[{name, target, interval?}]`，name 唯一键不可重复 |
+| `ext` | 可选；协议扩展 `{cf: {correction?, batch?}}`，仅对应协议启用时生效 |
 
 `config` 内全部字段可选：出现的才应用，缺席的保持现值。pings/interfaces/enable_gpu 应用后由配置 supervisor 重建对应 worker（即时）。
 

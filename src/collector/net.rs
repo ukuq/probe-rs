@@ -40,7 +40,11 @@ impl IfaceFilter {
             }
         }
         Self {
-            whitelist: if any { Some(builder.build().expect("non-empty globset")) } else { None },
+            whitelist: if any {
+                Some(builder.build().expect("non-empty globset"))
+            } else {
+                None
+            },
         }
     }
 

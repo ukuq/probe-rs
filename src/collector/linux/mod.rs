@@ -27,9 +27,7 @@ impl CpuMonitor {
 
     pub fn sample(&mut self) -> Option<f64> {
         let current = cpu::read_cpu_times()?;
-        let usage = self
-            .prev
-            .and_then(|prev| cpu::usage_percent(prev, current));
+        let usage = self.prev.and_then(|prev| cpu::usage_percent(prev, current));
         self.prev = Some(current);
         usage
     }

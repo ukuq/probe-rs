@@ -40,6 +40,7 @@ pub fn collect(
             report_errors: cfg.report_errors,
             report_self: cfg.report_self,
             pings: cfg.pings.clone(),
+            ext: cfg.ext.clone(),
         },
     }
 }

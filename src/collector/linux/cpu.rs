@@ -50,16 +50,28 @@ mod tests {
 
     #[test]
     fn usage_calc() {
-        let prev = CpuTimes { total: 1000, idle: 500 };
-        let cur = CpuTimes { total: 2000, idle: 750 };
+        let prev = CpuTimes {
+            total: 1000,
+            idle: 500,
+        };
+        let cur = CpuTimes {
+            total: 2000,
+            idle: 750,
+        };
         let usage = usage_percent(prev, cur).unwrap();
         assert!((usage - 75.0).abs() < 0.001);
     }
 
     #[test]
     fn counter_regression() {
-        let prev = CpuTimes { total: 2000, idle: 750 };
-        let cur = CpuTimes { total: 100, idle: 50 };
+        let prev = CpuTimes {
+            total: 2000,
+            idle: 750,
+        };
+        let cur = CpuTimes {
+            total: 100,
+            idle: 50,
+        };
         assert!(usage_percent(prev, cur).is_none());
     }
 }

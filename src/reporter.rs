@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::model::{RemoteConfig, Report};
-use crate::reporter_cf::{CfResponse, CfUpdate};
+use crate::reporter_cf::{CfConfirm, CfResponse, CfUpdate};
 
 const TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -72,7 +72,10 @@ impl Reporter {
         let body = resp.text().await.context("读取上报响应失败")?;
         let body = body.trim();
         if body.is_empty() || body == "{}" {
-            return Ok(ResponseAction { config: None, next_static: false });
+            return Ok(ResponseAction {
+                config: None,
+                next_static: false,
+            });
         }
         let parsed: ReportResponse = serde_json::from_str(body).context("解析上报响应失败")?;
         Ok(ResponseAction {
@@ -81,22 +84,38 @@ impl Reporter {
         })
     }
 
+    /// CF 协议公共 POST：统一 agent_version 头与错误包装
+    async fn post_cf(
+        &self,
+        body: &impl serde::Serialize,
+        extra: &[(&str, &str)],
+    ) -> Result<reqwest::Response> {
+        // CF 服务端 agent_version 取值优先用该头——带官方兼容版本前缀以区分探针实现
+        let agent_ver = crate::reporter_cf::cf_agent_version(&self.agent_version);
+        let mut req = self
+            .client
+            .post(&self.url)
+            .header("X-Agent-Version", &agent_ver);
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
+        req.json(body).send().await.context("CF 请求失败")
+    }
+
     /// CF 协议上报（POST /update）。config_md5 为当前已应用的 CF 配置 MD5（空 = none）。
     /// 204 = 无变更；200 = 解析 URL-encoded 配置/校正
     pub async fn send_cf(&self, update: &CfUpdate, config_md5: &str) -> Result<CfResponse> {
-        let md5 = if config_md5.is_empty() { "none" } else { config_md5 };
-        // CF 服务端 agent_version 取值优先用该头——带 probe-rs/ 前缀以区分官方探针
-        let agent_ver = format!("probe-rs_{}", self.agent_version);
+        let md5 = if config_md5.is_empty() {
+            "none"
+        } else {
+            config_md5
+        };
         let resp = self
-            .client
-            .post(&self.url)
-            .header("X-Agent-Version", &agent_ver)
-            .header("X-Agent-Config-Schema", "3")
-            .header("X-Agent-Config-Md5", md5)
-            .json(update)
-            .send()
-            .await
-            .context("上报请求失败")?;
+            .post_cf(
+                update,
+                &[("X-Agent-Config-Schema", "3"), ("X-Agent-Config-Md5", md5)],
+            )
+            .await?;
         let status = resp.status();
         if status.as_u16() == 204 {
             return Ok(CfResponse::default());
@@ -111,6 +130,18 @@ impl Reporter {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         let body = resp.text().await.context("读取上报响应失败")?;
-        Ok(crate::reporter_cf::parse_response_body(&body, resp_md5.as_deref()))
+        Ok(crate::reporter_cf::parse_response_body(
+            &body,
+            resp_md5.as_deref(),
+        ))
+    }
+
+    /// CF 校正确认（独立请求，不带 metrics）：成功 200 纯文本 OK
+    pub async fn send_cf_confirm(&self, confirm: &CfConfirm) -> Result<()> {
+        let resp = self.post_cf(confirm, &[]).await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("校正确认响应 HTTP {}", resp.status());
+        }
+        Ok(())
     }
 }

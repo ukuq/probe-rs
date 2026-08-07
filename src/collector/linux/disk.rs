@@ -137,9 +137,19 @@ mod tests {
         assert!(include_mount("/dev/sda1", "/", "ext4", "rw"));
         assert!(include_mount("/dev/sdb1", "/data", "xfs", "rw"));
         assert!(!include_mount("tmpfs", "/tmp", "tmpfs", "rw"));
-        assert!(!include_mount("overlay", "/var/lib/docker/overlay2/x", "overlay", "rw"));
+        assert!(!include_mount(
+            "overlay",
+            "/var/lib/docker/overlay2/x",
+            "overlay",
+            "rw"
+        ));
         assert!(!include_mount("//nas/share", "/mnt/nas", "nfs", "rw"));
-        assert!(!include_mount("/dev/loop0", "/snap/core/123", "squashfs", "ro"));
+        assert!(!include_mount(
+            "/dev/loop0",
+            "/snap/core/123",
+            "squashfs",
+            "ro"
+        ));
         assert!(include_mount("/dev/sdc1", "/mnt/ntfs", "fuseblk", "rw"));
     }
 

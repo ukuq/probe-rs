@@ -8,7 +8,9 @@
 //! - errors / self / virtualization / cpu_physical_cores：CF 无落点，CF 模式下不产生
 //! - 配置下发：响应头 X-Agent-Config-Md5 + URL-encoded body → 合成 RemoteConfig
 //!   （config_version 直接取 MD5 头，缺失时取原始配置串，== 幂等语义不变）
-//! - 流量校正：body 尾部 rx_correction/tx_correction（GB，覆盖当月），不参与 MD5
+//! - 流量校正：body 尾部 rx_correction/tx_correction（GB，覆盖当月），不参与 MD5；
+//!   确认必须用**独立请求**回传（CfConfirm）——CF 服务端见到 correction 字段会把
+//!   整个请求当确认处理并丢弃其中的 metrics（handlers/update.js）
 
 use std::collections::HashMap;
 
@@ -24,10 +26,16 @@ pub struct CfUpdate {
     pub metrics: CfMetrics,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub samples: Vec<CfSample>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rx_correction: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_correction: Option<f64>,
+}
+
+/// 校正确认请求（必须独立发送：CF 服务端见到 rx/tx_correction 字段
+/// 会把整个请求当确认处理、丢弃其中的 metrics）
+#[derive(Debug, Serialize)]
+pub struct CfConfirm {
+    pub id: String,
+    pub secret: String,
+    pub rx_correction: f64,
+    pub tx_correction: f64,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -63,7 +71,7 @@ pub struct CfMetrics {
     pub kernel_version: String,
     pub cpu_info: String,
     pub cpu_cores: u32,
-    /// 探针标识（CF 存库展示；形如 probe-rs/0.1.0，可与官方探针区分）
+    /// 探针标识（CF 存库展示；形如 1.3.8_probe-rs_0.1.0，可与官方探针区分）
     pub agent_version: String,
     /// 上报时刻（毫秒），CF 映射为 last_updated
     pub timestamp: i64,
@@ -137,6 +145,15 @@ pub struct CfDynMetrics {
 
 const MIB: u64 = 1024 * 1024;
 
+/// 对应的 CF 官方探针版本（CF-Server-Monitor src/utils/settings.js AGENT_VERSION）。
+/// 上报标识 = "{CF_COMPAT_VERSION}_probe-rs_{本版本}"（CF 允许的字符集：0-9A-Za-z.+_-）
+pub const CF_COMPAT_VERSION: &str = "1.3.8";
+
+/// CF 探针标识：头部与 body 的 agent_version 统一用它
+pub fn cf_agent_version(our_version: &str) -> String {
+    format!("{CF_COMPAT_VERSION}_probe-rs_{our_version}")
+}
+
 fn mb(bytes: u64) -> u64 {
     bytes / MIB
 }
@@ -158,9 +175,14 @@ pub fn build_metrics(
     pings: &HashMap<String, PingRecord>,
 ) -> CfMetrics {
     let ping = |names: &[&str]| -> Option<&PingRecord> {
-        names.iter().find_map(|n| pings.get(*n)).filter(|r| r.rtt >= 0)
+        names
+            .iter()
+            .find_map(|n| pings.get(*n))
+            .filter(|r| r.rtt >= 0)
     };
-    let ping_loss = |names: &[&str]| -> Option<u32> { names.iter().find_map(|n| pings.get(*n)).map(|r| r.loss) };
+    let ping_loss = |names: &[&str]| -> Option<u32> {
+        names.iter().find_map(|n| pings.get(*n)).map(|r| r.loss)
+    };
     let gpu_info = if gpus.is_empty() {
         None
     } else {
@@ -196,14 +218,22 @@ pub fn build_metrics(
         kernel_version: st.kernel.clone(),
         cpu_info: st.cpu_name.clone(),
         cpu_cores: st.cpu_cores,
-        agent_version: format!("probe-rs_{}", st.agent_version),
+        agent_version: cf_agent_version(&st.agent_version),
         timestamp: crate::model::now_millis(),
         gpu_info,
         processes: slow.and_then(|s| s.processes),
         tcp_conn: slow.and_then(|s| s.tcp_conn),
         udp_conn: slow.and_then(|s| s.udp_conn),
-        ip_v4: st.ipv4.clone().map(serde_json::Value::String).unwrap_or_else(|| 0.into()),
-        ip_v6: st.ipv6.clone().map(serde_json::Value::String).unwrap_or_else(|| 0.into()),
+        ip_v4: st
+            .ipv4
+            .clone()
+            .map(serde_json::Value::String)
+            .unwrap_or_else(|| 0.into()),
+        ip_v6: st
+            .ipv6
+            .clone()
+            .map(serde_json::Value::String)
+            .unwrap_or_else(|| 0.into()),
         ping_ct: ping(&["ct"]).map(|r| r.rtt),
         ping_cu: ping(&["cu"]).map(|r| r.rtt),
         ping_cm: ping(&["cm"]).map(|r| r.rtt),
@@ -249,15 +279,19 @@ pub struct CfPush {
 
 /// 把 CF 推送合成为通用 RemoteConfig（走 apply_remote 同一条热应用管线）。
 /// cur = 当前生效 intervals（CF 只下发 collect/report，其余四项保持现值）
-pub fn synthesize_remote(push: &CfPush, cur: &crate::model::Intervals) -> crate::model::RemoteConfig {
-    let intervals = (push.collect.is_some() || push.report.is_some()).then(|| crate::model::Intervals {
-        collect: push.collect.unwrap_or(cur.collect),
-        report: push.report.unwrap_or(cur.report),
-        ping: cur.ping,
-        slow: cur.slow,
-        gpu: cur.gpu,
-        ip: cur.ip,
-    });
+pub fn synthesize_remote(
+    push: &CfPush,
+    cur: &crate::model::Intervals,
+) -> crate::model::RemoteConfig {
+    let intervals =
+        (push.collect.is_some() || push.report.is_some()).then(|| crate::model::Intervals {
+            collect: push.collect.unwrap_or(cur.collect),
+            report: push.report.unwrap_or(cur.report),
+            ping: cur.ping,
+            slow: cur.slow,
+            gpu: cur.gpu,
+            ip: cur.ip,
+        });
     let pings = push.custom.iter().any(Option::is_some).then(|| {
         ["ct", "cu", "cm", "bd"]
             .iter()
@@ -268,7 +302,11 @@ pub fn synthesize_remote(push: &CfPush, cur: &crate::model::Intervals) -> crate:
                 if target.is_empty() {
                     return None;
                 }
-                Some(crate::model::PingTarget { name: (*name).to_string(), target: target.clone(), interval: None })
+                Some(crate::model::PingTarget {
+                    name: (*name).to_string(),
+                    target: target.clone(),
+                    interval: None,
+                })
             })
             .collect()
     });
@@ -276,7 +314,10 @@ pub fn synthesize_remote(push: &CfPush, cur: &crate::model::Intervals) -> crate:
         config_version: push.version.clone(),
         reset_day: push.reset_day,
         intervals,
-        interfaces: push.interface.clone().map(|s| if s.is_empty() { vec![] } else { vec![s] }),
+        interfaces: push
+            .interface
+            .clone()
+            .map(|s| if s.is_empty() { vec![] } else { vec![s] }),
         enable_gpu: None,
         report_errors: None,
         report_self: None,
@@ -307,7 +348,7 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
         return CfResponse::default();
     }
     let mut push = CfPush {
-        version: md5_header.filter(|s| !s.is_empty()).unwrap_or(body).to_string(),
+        version: String::new(), // 解析完后统一计算
         collect: None,
         report: None,
         reset_day: None,
@@ -361,7 +402,28 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
     if let (Some(rx), Some(tx)) = (rx_gb, tx_gb) {
         correction = Some((rx, tx));
     }
-    CfResponse { push: has_config.then_some(push), correction }
+    if has_config {
+        push.version = match md5_header.filter(|s| !s.is_empty()) {
+            Some(h) => h.to_string(),
+            // 缺 MD5 头（非官方服务端）：从配置字段重建版本串。
+            // 不能用原始 body——校正/update 字段的出现或消失会造成版本空转
+            None => format!(
+                "ci={:?}&ri={:?}&rd={:?}&ct={:?}&cu={:?}&cm={:?}&bd={:?}&if={:?}",
+                push.collect,
+                push.report,
+                push.reset_day,
+                push.custom[0],
+                push.custom[1],
+                push.custom[2],
+                push.custom[3],
+                push.interface
+            ),
+        };
+    }
+    CfResponse {
+        push: has_config.then_some(push),
+        correction,
+    }
 }
 
 #[cfg(test)]
@@ -395,6 +457,7 @@ mod tests {
                 report_errors: true,
                 report_self: true,
                 pings: vec![],
+                ext: Default::default(),
             },
         }
     }
@@ -415,15 +478,45 @@ mod tests {
             net_rx_monthly: Some(594_000),
             net_tx_monthly: Some(467_000),
         };
-        let slow = SlowBlock { ts: 999, disk_used: Some(5_000_000_000), tcp_conn: Some(1), udp_conn: Some(6), processes: Some(14) };
+        let slow = SlowBlock {
+            ts: 999,
+            disk_used: Some(5_000_000_000),
+            tcp_conn: Some(1),
+            udp_conn: Some(6),
+            processes: Some(14),
+        };
         let mut pings = HashMap::new();
-        pings.insert("ct".to_string(), PingRecord { ts: 999, name: "ct".into(), rtt: 42, loss: 0 });
-        pings.insert("bgp".to_string(), PingRecord { ts: 999, name: "bgp".into(), rtt: 6, loss: 25 });
-        pings.insert("cu".to_string(), PingRecord { ts: 999, name: "cu".into(), rtt: -1, loss: 100 });
+        pings.insert(
+            "ct".to_string(),
+            PingRecord {
+                ts: 999,
+                name: "ct".into(),
+                rtt: 42,
+                loss: 0,
+            },
+        );
+        pings.insert(
+            "bgp".to_string(),
+            PingRecord {
+                ts: 999,
+                name: "bgp".into(),
+                rtt: 6,
+                loss: 25,
+            },
+        );
+        pings.insert(
+            "cu".to_string(),
+            PingRecord {
+                ts: 999,
+                name: "cu".into(),
+                rtt: -1,
+                loss: 100,
+            },
+        );
         let m = build_metrics(&st, Some(&d), Some(&slow), &[], &pings);
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["cpu"], 12.35);
-        assert_eq!(v["agent_version"], "probe-rs_0.1.0");
+        assert_eq!(v["agent_version"], "1.3.8_probe-rs_0.1.0");
         assert!(v["timestamp"].as_i64().unwrap() > 0);
         assert_eq!(v["ram_total"], 12884); // 13510758768 / 2^20（向下取整）
         assert_eq!(v["ram_used"], 925);
@@ -454,7 +547,10 @@ mod tests {
         assert_eq!(p.collect, Some(1)); // 0 钳到 1
         assert_eq!(p.report, Some(60));
         assert_eq!(p.reset_day, Some(15));
-        assert_eq!(p.custom[0].as_deref(), Some("gd-ct-dualstack.ip.zstaticcdn.com"));
+        assert_eq!(
+            p.custom[0].as_deref(),
+            Some("gd-ct-dualstack.ip.zstaticcdn.com")
+        );
         assert_eq!(p.custom[1].as_deref(), Some("")); // 空值保留语义：该组清空
         assert_eq!(p.interface.as_deref(), Some("eth0"));
         assert!(r.correction.is_none());
@@ -462,10 +558,15 @@ mod tests {
 
     #[test]
     fn parse_correction_and_ok() {
-        let r = parse_response_body("collect_interval=5&report_interval=60&rx_correction=10&tx_correction=2.5", None);
+        let r = parse_response_body(
+            "collect_interval=5&report_interval=60&rx_correction=10&tx_correction=2.5",
+            None,
+        );
         assert_eq!(r.correction, Some((10.0, 2.5)));
-        // MD5 头缺失时 version 取原始串
-        assert_eq!(r.push.unwrap().version, "collect_interval=5&report_interval=60&rx_correction=10&tx_correction=2.5");
+        // MD5 头缺失时 version 从配置字段重建（不含校正字段，避免空转）
+        let v = r.push.unwrap().version;
+        assert!(v.starts_with("ci=Some(5)&ri=Some(60)"), "got: {v}");
+        assert!(!v.contains("correction"), "got: {v}");
         assert!(parse_response_body("OK", None).push.is_none());
         assert!(parse_response_body("", None).correction.is_none());
         // 非法校正值：忽略

@@ -37,7 +37,11 @@ impl SelfMonitor {
         self.sampled_once = true;
         let p = self.system.process(self.pid);
         SelfStats {
-            cpu_usage: if first { None } else { p.map(|p| p.cpu_usage() as f64) },
+            cpu_usage: if first {
+                None
+            } else {
+                p.map(|p| p.cpu_usage() as f64)
+            },
             mem_rss: p.map(|p| p.memory()),
         }
     }
@@ -199,7 +203,11 @@ pub fn static_info(
         kernel: System::kernel_version().unwrap_or_default(),
         arch: {
             let a = System::cpu_arch();
-            if a.is_empty() { std::env::consts::ARCH.to_string() } else { a }
+            if a.is_empty() {
+                std::env::consts::ARCH.to_string()
+            } else {
+                a
+            }
         },
         cpu_name: s
             .cpus()
@@ -227,6 +235,7 @@ pub fn static_info(
             report_errors: cfg.report_errors,
             report_self: cfg.report_self,
             pings: cfg.pings.clone(),
+            ext: cfg.ext.clone(),
         },
     }
 }

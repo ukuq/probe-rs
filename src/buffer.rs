@@ -70,16 +70,28 @@ impl Buffers {
     }
 
     pub fn push_async(&self, r: AsyncRecord) {
-        self.async_records.lock().expect("buffer lock poisoned").push(r);
+        self.async_records
+            .lock()
+            .expect("buffer lock poisoned")
+            .push(r);
     }
 
     /// 换出全部缓冲内容；调用后缓冲为空
     pub fn drain(&self) -> (Vec<DynamicRecord>, Vec<AsyncRecord>, Vec<ErrorRecord>) {
-        (drain(&self.dynamic), drain(&self.async_records), drain(&self.errors))
+        (
+            drain(&self.dynamic),
+            drain(&self.async_records),
+            drain(&self.errors),
+        )
     }
 
     /// 上报失败：数据放回缓冲头部（保持时间顺序），超上限丢最旧
-    pub fn restore(&self, dynamic: Vec<DynamicRecord>, async_records: Vec<AsyncRecord>, errors: Vec<ErrorRecord>) {
+    pub fn restore(
+        &self,
+        dynamic: Vec<DynamicRecord>,
+        async_records: Vec<AsyncRecord>,
+        errors: Vec<ErrorRecord>,
+    ) {
         prepend_bounded(&self.dynamic, dynamic);
         prepend_bounded(&self.async_records, async_records);
         prepend_bounded(&self.errors, errors);

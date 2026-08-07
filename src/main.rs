@@ -74,14 +74,25 @@ async fn main() -> Result<()> {
     let (gpu_name_tx, gpu_name_rx) = tokio::sync::watch::channel::<Option<String>>(None);
     let (gpu_tx, gpu_rx) = tokio::sync::watch::channel::<Vec<model::GpuRecord>>(Vec::new());
     let (_ip_handle, ip_rx) = worker::public_ip::spawn(Arc::clone(&buffers), intervals_rx.clone());
-    let (_slow_handle, slow_rx, self_rx) = worker::slow::spawn(Arc::clone(&shared), intervals_rx.clone());
+    let (_slow_handle, slow_rx, self_rx) =
+        worker::slow::spawn(Arc::clone(&shared), intervals_rx.clone());
 
     let init_cfg = shared.get();
     let mut ping_worker = (!init_cfg.pings.is_empty()).then(|| {
-        worker::ping::PingWorker::start(init_cfg.pings.clone(), ping_tx.clone(), Arc::clone(&buffers), intervals_rx.clone())
+        worker::ping::PingWorker::start(
+            init_cfg.pings.clone(),
+            ping_tx.clone(),
+            Arc::clone(&buffers),
+            intervals_rx.clone(),
+        )
     });
     let mut gpu_handle = init_cfg.enable_gpu.then(|| {
-        worker::gpu::start(gpu_name_tx.clone(), gpu_tx.clone(), Arc::clone(&buffers), intervals_rx.clone())
+        worker::gpu::start(
+            gpu_name_tx.clone(),
+            gpu_tx.clone(),
+            Arc::clone(&buffers),
+            intervals_rx.clone(),
+        )
     });
 
     // 配置 supervisor：3s 轮询配置文件（本地热加载）+ 监听配置变更（远端下发），

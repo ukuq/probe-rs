@@ -67,6 +67,8 @@ interface StaticInfo {
     report_errors: boolean;
     report_self: boolean;
     pings: PingTarget[];
+    /** 协议扩展（ext.cf：correction/batch） */
+    ext?: { cf?: { correction?: boolean; batch?: boolean } };
   };
 }
 
@@ -91,7 +93,7 @@ interface GpuRecord {
   usage: number | null;
   mem_total: number | null; // 字节；macOS 为 null（统一内存）
   mem_used: number | null;
-  temp: number | null;      // ℃；macOS 为 null（需 root）
+  temp: number | null; // ℃；macOS 为 null（需 root）
 }
 
 interface DynamicRecord {
@@ -112,7 +114,7 @@ interface DynamicRecord {
 interface SelfRecord {
   ts: number;
   cpu_usage: number | null; // 自身 CPU（单核 %）
-  mem_rss: number | null;   // 自身常驻内存，字节
+  mem_rss: number | null; // 自身常驻内存，字节
 }
 
 type AsyncRecord =
@@ -182,7 +184,14 @@ function broadcast(): void {
 function getServer(id: string): ServerState {
   let s = servers.get(id);
   if (!s) {
-    s = { staticInfo: null, dynamic: [], asyncs: [], errors: [], lastSeen: 0, configVersion: "" };
+    s = {
+      staticInfo: null,
+      dynamic: [],
+      asyncs: [],
+      errors: [],
+      lastSeen: 0,
+      configVersion: "",
+    };
     servers.set(id, s);
   }
   return s;
@@ -193,10 +202,19 @@ function getServer(id: string): ServerState {
 function handleReport(req: Request, report: Report): Response {
   const id = report.server_id;
   if (!id) return json({ error: "missing server_id" }, 400);
-  if (req.headers.get("x-secret") !== SECRET) return json({ error: "bad secret" }, 401);
+  if (req.headers.get("x-secret") !== SECRET) {
+    return json({ error: "bad secret" }, 401);
+  }
 
-  rawReports.push({ seq: ++reportSeq, received_at: Date.now(), server_id: id, report });
-  if (rawReports.length > KEEP_REPORTS) rawReports.splice(0, rawReports.length - KEEP_REPORTS);
+  rawReports.push({
+    seq: ++reportSeq,
+    received_at: Date.now(),
+    server_id: id,
+    report,
+  });
+  if (rawReports.length > KEEP_REPORTS) {
+    rawReports.splice(0, rawReports.length - KEEP_REPORTS);
+  }
 
   const s = getServer(id);
   s.lastSeen = Date.now();
@@ -204,15 +222,21 @@ function handleReport(req: Request, report: Report): Response {
   if (report.static) s.staticInfo = report.static;
   if (Array.isArray(report.dynamic)) {
     s.dynamic.push(...report.dynamic);
-    if (s.dynamic.length > KEEP_DYNAMIC) s.dynamic = s.dynamic.slice(-KEEP_DYNAMIC);
+    if (s.dynamic.length > KEEP_DYNAMIC) {
+      s.dynamic = s.dynamic.slice(-KEEP_DYNAMIC);
+    }
   }
   if (Array.isArray(report.async)) {
     s.asyncs.push(...report.async);
-    if (s.asyncs.length > KEEP_DYNAMIC) s.asyncs = s.asyncs.slice(-KEEP_DYNAMIC);
+    if (s.asyncs.length > KEEP_DYNAMIC) {
+      s.asyncs = s.asyncs.slice(-KEEP_DYNAMIC);
+    }
   }
   if (Array.isArray(report.errors)) {
     s.errors.push(...report.errors);
-    if (s.errors.length > KEEP_DYNAMIC) s.errors = s.errors.slice(-KEEP_DYNAMIC);
+    if (s.errors.length > KEEP_DYNAMIC) {
+      s.errors = s.errors.slice(-KEEP_DYNAMIC);
+    }
   }
 
   broadcast();
@@ -223,7 +247,12 @@ function handleReport(req: Request, report: Report): Response {
   if (pending && pending.config_version !== s.configVersion) {
     pendingConfig.delete(id);
     resp.config = pending;
-    console.log(`[config] 下发到 ${id}: ${s.configVersion || "(无版本)"} -> ${pending.config_version}`, pending);
+    console.log(
+      `[config] 下发到 ${id}: ${
+        s.configVersion || "(无版本)"
+      } -> ${pending.config_version}`,
+      pending,
+    );
   }
   if (needStatic.delete(id)) {
     resp.next = { static: true };
@@ -236,14 +265,32 @@ function handleReport(req: Request, report: Report): Response {
 function newConfigVersion(): string {
   const d = new Date(Date.now() + 8 * 3600_000);
   const p = (n: number, w = 2) => String(n).padStart(w, "0");
-  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}` +
-    `T${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}.${p(d.getUTCMilliseconds(), 3)}+08:00`;
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${
+    p(d.getUTCDate())
+  }` +
+    `T${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}.${
+      p(d.getUTCMilliseconds(), 3)
+    }+08:00`;
 }
 
 function handleSetConfig(id: string, cfg: Record<string, unknown>): Response {
-  const { collect, report, ping, slow, gpu, ip, reset_day, interfaces, enable_gpu, pings, report_errors, report_self } = cfg;
+  const {
+    collect,
+    report,
+    ping,
+    slow,
+    gpu,
+    ip,
+    reset_day,
+    interfaces,
+    enable_gpu,
+    pings,
+    report_errors,
+    report_self,
+  } = cfg;
   // intervals：提供了就必须三项齐全；slow/gpu/ip 可选
-  const hasAnyInterval = collect !== undefined || report !== undefined || ping !== undefined;
+  const hasAnyInterval = collect !== undefined || report !== undefined ||
+    ping !== undefined;
   const next: Partial<RemoteConfig> = {};
   if (hasAnyInterval) {
     for (const [k, v] of Object.entries({ collect, report, ping })) {
@@ -266,44 +313,73 @@ function handleSetConfig(id: string, cfg: Record<string, unknown>): Response {
     };
   }
   if (reset_day !== undefined) {
-    if (!Number.isInteger(reset_day) || (reset_day as number) < 0 || (reset_day as number) > 31) {
+    if (
+      !Number.isInteger(reset_day) || (reset_day as number) < 0 ||
+      (reset_day as number) > 31
+    ) {
       return json({ error: "reset_day 必须在 0-31" }, 400);
     }
     next.reset_day = reset_day as number;
   }
   if (interfaces !== undefined) {
-    if (!Array.isArray(interfaces) || !interfaces.every((x) => typeof x === "string" && x.length > 0 && x.length <= 64)) {
-      return json({ error: "interfaces 必须为非空字符串数组（单个 <= 64 字符）" }, 400);
+    if (
+      !Array.isArray(interfaces) ||
+      !interfaces.every((x) =>
+        typeof x === "string" && x.length > 0 && x.length <= 64
+      )
+    ) {
+      return json({
+        error: "interfaces 必须为非空字符串数组（单个 <= 64 字符）",
+      }, 400);
     }
     next.interfaces = interfaces as string[];
   }
   if (enable_gpu !== undefined) {
-    if (typeof enable_gpu !== "boolean") return json({ error: "enable_gpu 必须为布尔值" }, 400);
+    if (typeof enable_gpu !== "boolean") {
+      return json({ error: "enable_gpu 必须为布尔值" }, 400);
+    }
     next.enable_gpu = enable_gpu;
   }
   if (report_errors !== undefined) {
-    if (typeof report_errors !== "boolean") return json({ error: "report_errors 必须为布尔值" }, 400);
+    if (typeof report_errors !== "boolean") {
+      return json({ error: "report_errors 必须为布尔值" }, 400);
+    }
     next.report_errors = report_errors;
   }
   if (report_self !== undefined) {
-    if (typeof report_self !== "boolean") return json({ error: "report_self 必须为布尔值" }, 400);
+    if (typeof report_self !== "boolean") {
+      return json({ error: "report_self 必须为布尔值" }, 400);
+    }
     next.report_self = report_self;
   }
   if (pings !== undefined) {
     if (!Array.isArray(pings)) return json({ error: "pings 必须为数组" }, 400);
     const names = new Set<string>();
     for (const p of pings as PingTarget[]) {
-      if (!p || typeof p.name !== "string" || !p.name.trim()) return json({ error: "pings 存在空 name" }, 400);
-      if (typeof p.target !== "string" || !p.target.trim()) return json({ error: `pings ${p.name} 的 target 为空` }, 400);
-      if (names.has(p.name)) return json({ error: `pings name 重复: ${p.name}` }, 400);
+      if (!p || typeof p.name !== "string" || !p.name.trim()) {
+        return json({ error: "pings 存在空 name" }, 400);
+      }
+      if (typeof p.target !== "string" || !p.target.trim()) {
+        return json({ error: `pings ${p.name} 的 target 为空` }, 400);
+      }
+      if (names.has(p.name)) {
+        return json({ error: `pings name 重复: ${p.name}` }, 400);
+      }
       names.add(p.name);
-      if (p.interval !== undefined && (!Number.isInteger(p.interval) || p.interval < 1)) {
+      if (
+        p.interval !== undefined &&
+        (!Number.isInteger(p.interval) || p.interval < 1)
+      ) {
         return json({ error: `pings ${p.name} 的 interval 必须 >= 1` }, 400);
       }
     }
     next.pings = pings as PingTarget[];
   }
-  if (!hasAnyInterval && reset_day === undefined && interfaces === undefined && enable_gpu === undefined && pings === undefined && report_errors === undefined && report_self === undefined) {
+  if (
+    !hasAnyInterval && reset_day === undefined && interfaces === undefined &&
+    enable_gpu === undefined && pings === undefined &&
+    report_errors === undefined && report_self === undefined
+  ) {
     return json({ error: "没有可下发的字段" }, 400);
   }
   const pending: Partial<RemoteConfig> = pendingConfig.get(id) ?? {};
@@ -381,7 +457,10 @@ Deno.serve({ port: PORT }, async (req) => {
   const nsMatch = url.pathname.match(/^\/api\/need-static\/([^/]+)$/);
   if (req.method === "POST" && nsMatch) {
     needStatic.add(nsMatch[1]);
-    return json({ ok: true, note: "下次该 agent 上报时响应将带 next.static=true" });
+    return json({
+      ok: true,
+      note: "下次该 agent 上报时响应将带 next.static=true",
+    });
   }
   const cfgMatch = url.pathname.match(/^\/api\/config\/([^/]+)$/);
   if (req.method === "POST" && cfgMatch) {
@@ -391,8 +470,12 @@ Deno.serve({ port: PORT }, async (req) => {
       return json({ error: "invalid json" }, 400);
     }
   }
-  if (req.method === "GET" && url.pathname === "/api/servers") return json(serversView());
-  if (req.method === "GET" && url.pathname === "/api/reports") return json(reportsView());
+  if (req.method === "GET" && url.pathname === "/api/servers") {
+    return json(serversView());
+  }
+  if (req.method === "GET" && url.pathname === "/api/reports") {
+    return json(reportsView());
+  }
   if (req.method === "GET" && url.pathname === "/ws") {
     const { socket, response } = Deno.upgradeWebSocket(req);
     socket.onopen = () => socket.send(JSON.stringify(serversView()));
@@ -404,7 +487,10 @@ Deno.serve({ port: PORT }, async (req) => {
   if (req.method === "GET" && url.pathname === "/") {
     // 面板是内联脚本单页：禁止缓存，避免改了 server.ts 后浏览器还跑旧 JS
     return new Response(PAGE, {
-      headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+      },
     });
   }
   return json({ error: "not found" }, 404);
@@ -456,6 +542,7 @@ const PAGE = `<!doctype html>
     font: inherit; font-size: 14px; cursor: pointer; padding: 2px 6px; border-radius: 6px;
     margin-left: auto; }
   .theme-btn:hover { background: var(--fill); }
+  .theme-btn.on { color: var(--blue); background: var(--fill); font-weight: 600; }
   .conn { font-size: 11.5px; color: var(--text2); display: flex; align-items: center; gap: 6px; }
   .conn::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--text3); }
   .conn.on::before { background: var(--green); }
@@ -605,6 +692,7 @@ const PAGE = `<!doctype html>
       <button data-view="dash" class="on">监控</button>
       <button data-view="reports">上报记录</button>
       <button data-view="config">配置</button>
+      <button data-view="cfview">CF 预览</button>
       <button data-view="example">上报样例</button>
       <button data-view="cfgex">配置样例</button>
     </div>
@@ -641,6 +729,114 @@ function setTheme(t) {
 document.getElementById('theme-btn').onclick = function () {
   setTheme(document.body.classList.contains('light') ? 'dark' : 'light');
 };
+
+/* ---- CF 协议换算（对齐 agent 端 reporter_cf.rs；CF 预览 tab 用） ----
+   注意：这是 agent 线协议映射的 JS 镜像，改 reporter_cf.rs 时需同步 */
+var CF_COMPAT_VERSION = '1.3.8'; // 同步 reporter_cf.rs 的 CF_COMPAT_VERSION
+var serverStatics = {};   // server_id -> 最新 static
+var serverLatest = {};    // server_id -> serversView 条目（异步快照兜底用）
+function cfMb(b) { return b == null ? null : Math.floor(b / 1048576); }
+function cfRound2(v) { return v == null ? null : Math.round(v * 100) / 100; }
+function cfLoad(l) { return l ? l.map(function (x) { return x.toFixed(2); }).join(' ') : null; }
+function cfBody(r) {
+  var rep = r.report || {};
+  var st = rep.static || serverStatics[r.server_id] || {};
+  var view = serverLatest[r.server_id] || {};
+  var dyn = rep.dynamic || [];
+  var last = dyn.length ? dyn[dyn.length - 1] : {};
+  var slow = null, gpus = [], pings = {};
+  (rep.async || []).forEach(function (a) {
+    if (a.kind === 'slow') slow = a;
+    else if (a.kind === 'gpu') gpus.push(a);
+    else if (a.kind === 'ping') pings[a.name] = a;
+  });
+  /* 与 agent 一致：异步字段读最新快照而非仅本条报文（async[] 有新鲜度去重，
+     大多数报文不含 ping/slow/gpu 记录） */
+  if (!slow && view.slow_latest) slow = view.slow_latest;
+  if (!gpus.length && view.gpu_latest) gpus = [view.gpu_latest];
+  (view.ping_list || []).forEach(function (p) { if (!pings[p.name]) pings[p.name] = p; });
+  function pingOf(names) {
+    for (var i = 0; i < names.length; i++) {
+      var p = pings[names[i]];
+      if (p && p.rtt >= 0) return p;
+    }
+    return null;
+  }
+  function lossOf(names) {
+    for (var i = 0; i < names.length; i++) if (pings[names[i]]) return pings[names[i]].loss;
+    return undefined;
+  }
+  var m = {};
+  function set(k, v) { if (v !== null && v !== undefined) m[k] = v; }
+  set('cpu', cfRound2(last.cpu_usage));
+  m.ram_total = cfMb(st.mem_total) || 0;
+  set('ram_used', cfMb(last.mem_used));
+  m.swap_total = cfMb(st.swap_total) || 0;
+  set('swap_used', cfMb(last.swap_used));
+  m.disk_total = cfMb(st.disk_total) || 0;
+  set('disk_used', cfMb(slow && slow.disk_used));
+  set('load_avg', cfLoad(last.load));
+  m.boot_time = st.boot_time || 0;
+  set('net_rx', last.net_rx); set('net_tx', last.net_tx);
+  set('net_rx_monthly', last.net_rx_monthly); set('net_tx_monthly', last.net_tx_monthly);
+  set('net_in_speed', last.net_rx_speed); set('net_out_speed', last.net_tx_speed);
+  m.os = st.os || ''; m.arch = st.arch || ''; m.kernel_version = st.kernel || '';
+  m.cpu_info = st.cpu_name || ''; m.cpu_cores = st.cpu_cores || 0;
+  m.agent_version = CF_COMPAT_VERSION + '_probe-rs_' + (st.agent_version || '?');
+  m.timestamp = r.received_at;
+  if (gpus.length) {
+    m.gpu_info = gpus.map(function (g, i) {
+      return { id: String(i), name: g.name, info: cfRound2(g.usage) || 0 };
+    });
+  }
+  set('processes', slow && slow.processes);
+  set('tcp_conn', slow && slow.tcp_conn);
+  set('udp_conn', slow && slow.udp_conn);
+  m.ip_v4 = st.ipv4 || 0; m.ip_v6 = st.ipv6 || 0;
+  var groups = [['ct', ['ct']], ['cu', ['cu']], ['cm', ['cm']], ['bd', ['bd', 'bgp']]];
+  groups.forEach(function (g) {
+    var p = pingOf(g[1]);
+    if (p) m['ping_' + g[0]] = p.rtt;
+    var l = lossOf(g[1]);
+    if (l !== undefined) m['loss_' + g[0]] = l;
+  });
+  var samples = [];
+  /* ext.cf.batch=false 时 agent 不发送 samples 字段（skip_serializing_if） */
+  var cfExt = (st.config && st.config.ext && st.config.ext.cf) || {};
+  if (cfExt.batch !== false) {
+    samples = dyn.map(function (d) {
+      var sm = {};
+      function sset(k, v) { if (v !== null && v !== undefined) sm[k] = v; }
+      sset('cpu', cfRound2(d.cpu_usage));
+      sset('ram_used', cfMb(d.mem_used));
+      sset('swap_used', cfMb(d.swap_used));
+      sset('load_avg', cfLoad(d.load));
+      sset('net_rx', d.net_rx); sset('net_tx', d.net_tx);
+      sset('net_in_speed', d.net_rx_speed); sset('net_out_speed', d.net_tx_speed);
+      sset('net_rx_monthly', d.net_rx_monthly); sset('net_tx_monthly', d.net_tx_monthly);
+      return { ts: d.ts, metrics: sm };
+    });
+  }
+  var out = { id: r.server_id, secret: '<API_SECRET>', metrics: m };
+  if (samples.length) out.samples = samples;
+  return out;
+}
+
+/* CF 配置下发串预览（对齐 CF 服务端 buildAgentConfig 的输出格式） */
+function cfConfigString(cf) {
+  var pings = {};
+  (cf.pings || []).forEach(function (p) { pings[p.name] = p.target; });
+  var iv = cf.intervals || {};
+  return 'collect_interval=' + (iv.collect ?? 0)
+    + '&report_interval=' + (iv.report ?? 60)
+    + '&reset_day=' + (cf.reset_day ?? 1)
+    + '&schema_version=3'
+    + '&custom_ct=' + (pings.ct || '')
+    + '&custom_cu=' + (pings.cu || '')
+    + '&custom_cm=' + (pings.cm || '')
+    + '&custom_bd=' + (pings.bd || pings.bgp || '')
+    + '&interface=' + ((cf.interfaces || [])[0] || '');
+}
 function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
 function fmtB(n) { if (n == null) return '–';
   if (n >= 1e12) return (n/1e12).toFixed(2)+' TB'; if (n >= 1e9) return (n/1e9).toFixed(2)+' GB';
@@ -952,10 +1148,9 @@ function selectReport(seq) {
   detail.textContent = '';
   var r = rptData[seq];
   if (!r) return;
-  var pre = el('pre', 'code', JSON.stringify(r.report, null, 2));
   detail.append(
     el('div', 'd-head', '#' + seq + ' · ' + r.server_id + ' · ' + new Date(r.received_at).toLocaleString('zh-CN')),
-    pre);
+    el('pre', 'code', JSON.stringify(r.report, null, 2)));
 }
 
 function renderReports(list) {
@@ -1268,6 +1463,61 @@ function renderConfig(data) {
   });
 }
 
+/* ---- CF 预览视图：每台机器展示换算后的 CF 请求体 + 配置下发串 ----
+   servers 可传 WS 推送的最新视图（避免每次推送重复拉取） */
+function renderCfView(servers) {
+  var reportsP = fetch('/api/reports').then(function (r) { return r.json(); });
+  var serversP = servers
+    ? Promise.resolve(servers)
+    : fetch('/api/servers').then(function (r) { return r.json(); });
+  Promise.all([serversP, reportsP]).then(function (res) {
+    var servers = res[0], reports = res[1];
+    var app = document.getElementById('app');
+    app.textContent = '';
+    document.getElementById('summary').textContent = 'CF 协议视角（由 probe 报文实时换算）';
+    servers.forEach(function (s) {
+      if (s.static) serverStatics[s.server_id] = s.static;
+      serverLatest[s.server_id] = s;
+      var card = el('div', 'card' + (s.online ? '' : ' offline'));
+      var head = el('div', 'card-head');
+      head.append(
+        el('span', 'dot ' + (s.online ? 'on' : 'off')),
+        el('span', 'name', s.server_id),
+        el('span', 'meta', 'POST /update 预览'));
+      card.append(head);
+
+      /* 请求体：取该机器最近一条上报换算 */
+      var latest = reports.find(function (r) { return r.server_id === s.server_id; });
+      var g1 = el('div', 'cfg-groups');
+      var b1 = el('div', 'cfg-group');
+      b1.append(el('h3', null, '请求体（最近一条上报换算' + (latest ? '，#' + latest.seq : '') + '）'));
+      b1.append(el('pre', 'code', latest
+        ? JSON.stringify(cfBody(latest), null, 2)
+        : '（暂无上报记录）'));
+      g1.append(b1);
+
+      /* 配置下发：当前生效配置 → CF URL-encoded 响应 */
+      var body = cfConfigString((s.static || {}).config || {});
+      var g2 = el('div', 'cfg-groups');
+      var b2 = el('div', 'cfg-group');
+      b2.append(el('h3', null, '配置下发（CF 响应格式）'));
+      b2.append(el('pre', 'code',
+        'HTTP 200（配置 MD5 不一致时；一致则 204 No Content）' + String.fromCharCode(10)
+        + 'X-Agent-Config-Schema: 3' + String.fromCharCode(10)
+        + 'X-Agent-Config-Md5: <md5(下方配置串)>' + String.fromCharCode(10)
+        + 'Content-Type: application/x-www-form-urlencoded' + String.fromCharCode(10)
+        + String.fromCharCode(10)
+        + body));
+      b2.append(el('div', 'note', '流量校正在配置串尾部追加 rx_correction/tx_correction（不参与 MD5），确认由 agent 独立请求回传。'));
+      g2.append(b2);
+
+      card.append(g1, g2);
+      app.append(card);
+    });
+    if (!servers.length) app.append(el('div', 'empty', '暂无服务器数据'));
+  }).catch(function () {});
+}
+
 var EXAMPLE_JSON5 = \`{
   "server_id": "srv-01",                    // 服务器 ID（本地配置，远端不可改）
   "config_version": "2026-08-06T15:30:45.123+08:00",   // 当前配置版本（UTC+8 可读时间戳字符串），服务端按「不等」判断是否下发新配置
@@ -1301,7 +1551,8 @@ var EXAMPLE_JSON5 = \`{
       "report_self": false,                 // 是否上报探针自身占用 kind:"self"
       "pings": [                            // 探测目标组
         { "name": "ct", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 }
-      ]
+      ],
+      "ext": { "cf": { "correction": true, "batch": true } }   // 协议扩展（仅 cf 协议生效）
     }
   },
 
@@ -1444,6 +1695,10 @@ function renderConfigExample() {
 }
 
 function loadReports() {
+  // 同时拉 servers（CF 视角换算需要各机最新 static）
+  fetch('/api/servers').then(function (r) { return r.json(); }).then(function (data) {
+    data.forEach(function (s) { if (s.static) serverStatics[s.server_id] = s.static; });
+  }).catch(function () {});
   fetch('/api/reports').then(function (r) { return r.json(); }).then(renderReports).catch(function () {});
 }
 
@@ -1457,6 +1712,7 @@ function switchView(v) {
   });
   if (v === 'example') { renderExample(); return; }
   if (v === 'cfgex') { renderConfigExample(); return; }
+  if (v === 'cfview') { renderCfView(); return; }
   if (v === 'reports') { loadReports(); return; }
   fetch('/api/servers').then(function (r) { return r.json(); }).then(function (data) {
     v === 'config' ? renderConfig(data) : render(data);
@@ -1467,6 +1723,7 @@ Array.prototype.forEach.call(document.querySelectorAll('#seg button'), function 
 });
 if (location.hash === '#reports') switchView('reports');
 else if (location.hash === '#config') switchView('config');
+else if (location.hash === '#cf') switchView('cfview');
 else if (location.hash === '#example') switchView('example');
 else if (location.hash === '#config-example') switchView('cfgex');
 
@@ -1480,6 +1737,7 @@ function connect() {
     if (view === 'dash') render(data);
     else if (view === 'config') { if (!cfgFormActive) renderConfig(data); }
     else if (view === 'reports') loadReports();
+    else if (view === 'cfview') renderCfView(data);
   };
   ws.onclose = function () {
     conn.textContent = '重连中…'; conn.classList.remove('on');
