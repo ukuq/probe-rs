@@ -16,8 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # 版本钉死：避免工具链升级导致 fmt 门禁漂移
-      - uses: dtolnay/rust-toolchain@1.97.1
+      # 与 release 使用同一 stable 工具链
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2

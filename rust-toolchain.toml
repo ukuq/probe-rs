@@ -1,5 +1,0 @@
-# 钉住本地与 CI 的 rust 工具链（fmt 规则不随 stable 漂移）
-# CI（.github/workflows/ci.yml）与该文件保持一致
-[toolchain]
-channel = "1.97.1"
-components = ["rustfmt"]
