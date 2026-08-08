@@ -102,9 +102,28 @@ pub struct SelfRecord {
     pub mem_rss: Option<u64>,
 }
 
+/// 磁盘 IO：由 diskio worker 测量，ts 为真实测量时刻。
+/// 速率/等待为相邻两次采样的差值比（首轮无前值为 null）；
+/// macOS 无"io 进行中总时长"计数器，usage 恒 null（单项不可得置 null 语义）
+#[derive(Debug, Clone, Serialize)]
+pub struct DiskIoRecord {
+    pub ts: i64,
+    /// 读速率，字节/秒
+    pub read_bps: Option<f64>,
+    /// 写速率，字节/秒
+    pub write_bps: Option<f64>,
+    pub read_iops: Option<f64>,
+    pub write_iops: Option<f64>,
+    /// 平均等待，毫秒
+    pub await_ms: Option<f64>,
+    /// IO 利用率 %（0-100，各盘取最大）；macOS 为 null
+    pub usage: Option<f64>,
+}
+
 /// 异步记录：kind 区分来源，每条 ts 为各自真实测量时刻。
 /// kind 按数据语义划分（DESIGN.md §2.3）：slow = 每台机器必有的系统慢指标；
-/// gpu = 仅部分机器有的可选硬件指标；ping = 主动探测结果；self = 探针自身占用。
+/// gpu = 仅部分机器有的可选硬件指标；ping = 主动探测结果；self = 探针自身占用；
+/// diskio = 磁盘 IO 速率（各平台节奏不同：Linux 便宜可高频，macOS 走子进程降频）。
 /// （公网 IP 是身份信息，在 static 里，不在此列。）
 /// 新增异步源只需加一个 kind，协议不变
 #[derive(Debug, Clone, Serialize)]
@@ -113,6 +132,7 @@ pub enum AsyncRecord {
     Ping(PingRecord),
     Slow(SlowBlock),
     Gpu(GpuRecord),
+    DiskIo(DiskIoRecord),
     #[serde(rename = "self")]
     Self_(SelfRecord),
 }
@@ -249,6 +269,8 @@ pub struct Intervals {
     pub gpu: u64,
     #[serde(default = "default_ip_interval")]
     pub ip: u64,
+    #[serde(default = "default_diskio_interval")]
+    pub diskio: u64,
 }
 
 fn default_ping_interval() -> u64 {
@@ -263,6 +285,9 @@ fn default_gpu_interval() -> u64 {
 fn default_ip_interval() -> u64 {
     600
 }
+fn default_diskio_interval() -> u64 {
+    10
+}
 
 impl Default for Intervals {
     fn default() -> Self {
@@ -273,6 +298,7 @@ impl Default for Intervals {
             slow: default_slow_interval(),
             gpu: default_gpu_interval(),
             ip: default_ip_interval(),
+            diskio: default_diskio_interval(),
         }
     }
 }
@@ -288,6 +314,7 @@ impl Intervals {
             ("slow", self.slow),
             ("gpu", self.gpu),
             ("ip", self.ip),
+            ("diskio", self.diskio),
         ] {
             if v == 0 {
                 return Err(format!("intervals.{k} 必须 >= 1 秒"));

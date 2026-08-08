@@ -34,6 +34,7 @@ pub struct Scheduler {
     gpu_rx: watch::Receiver<Vec<GpuRecord>>,
     slow_rx: watch::Receiver<Option<SlowBlock>>,
     self_rx: watch::Receiver<Option<SelfRecord>>,
+    diskio_rx: watch::Receiver<Option<crate::model::DiskIoRecord>>,
     shutdown: Arc<Notify>,
     agent_version: String,
 
@@ -47,6 +48,7 @@ pub struct Scheduler {
     last_gpu_ts: i64,
     last_slow_ts: i64,
     last_self_ts: i64,
+    last_diskio_ts: i64,
 }
 
 impl Scheduler {
@@ -63,6 +65,7 @@ impl Scheduler {
         gpu_rx: watch::Receiver<Vec<GpuRecord>>,
         slow_rx: watch::Receiver<Option<SlowBlock>>,
         self_rx: watch::Receiver<Option<SelfRecord>>,
+        diskio_rx: watch::Receiver<Option<crate::model::DiskIoRecord>>,
         shutdown: Arc<Notify>,
         agent_version: String,
     ) -> Self {
@@ -78,6 +81,7 @@ impl Scheduler {
             gpu_rx,
             slow_rx,
             self_rx,
+            diskio_rx,
             shutdown,
             agent_version,
             cpu: CpuMonitor::new(),
@@ -88,6 +92,7 @@ impl Scheduler {
             last_gpu_ts: 0,
             last_slow_ts: 0,
             last_self_ts: 0,
+            last_diskio_ts: 0,
         }
     }
 
@@ -214,6 +219,15 @@ impl Scheduler {
                 }
             }
         }
+        {
+            let snap = self.diskio_rx.borrow().clone();
+            if let Some(r) = snap {
+                if r.ts > self.last_diskio_ts {
+                    self.last_diskio_ts = r.ts;
+                    self.buffers.push_async(AsyncRecord::DiskIo(r));
+                }
+            }
+        }
     }
 
     async fn on_report(&mut self) {
@@ -318,7 +332,15 @@ impl Scheduler {
             let slow = self.slow_rx.borrow();
             let gpus = self.gpu_rx.borrow();
             let pings = self.ping_rx.borrow();
-            crate::reporter_cf::build_metrics(&st, dynamic.last(), slow.as_ref(), &gpus, &pings)
+            let diskio = self.diskio_rx.borrow();
+            crate::reporter_cf::build_metrics(
+                &st,
+                dynamic.last(),
+                slow.as_ref(),
+                &gpus,
+                &pings,
+                diskio.as_ref(),
+            )
         };
         let samples = if cfg.ext.cf.batch {
             dynamic

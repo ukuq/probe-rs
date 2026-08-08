@@ -20,6 +20,7 @@
 │  ├─ slow worker      (intervals.slow)           │
 │  ├─ gpu worker       (intervals.gpu)            │
 │  ├─ public-ip worker (intervals.ip)      │
+│  ├─ diskio worker    (intervals.diskio)  │
 │  └─ netstatic        (2s 采样 / 10min 落盘)      │
 ├─────────────────────────────────────────────────┤
 │ reporter                                        │
@@ -88,12 +89,14 @@
 | gpu 利用率 | 可选硬件指标（多卡时每卡一条，形状不同） | 仅部分机器 | nvidia-smi/ioreg 不可用 | `kind:"gpu"` |
 | 公网 IP | 身份信息（"你是谁"，不是被测量的指标） | 依赖外网 | 外网不通 ≠ agent 坏 | **static**，不进 async[] |
 | ping rtt/loss | 主动探测指标（目标在配置里，多组各自节奏） | 看配置 | 目标不可达 | `kind:"ping"` |
+| 磁盘 IO 速率 | 系统指标但各平台采集成本悬殊（Linux 免费 / macOS 子进程） | 必有硬盘 | 本机采集问题 | `kind:"diskio"` |
 
 | worker | 节奏 | 采集内容 | 快照 |
 |---|---|---|---|
 | ping | 每组 `[[pings]]` 独立 interval（缺省 `intervals.ping`） | 每组 key + target + interval；target 以 http(s):// 开头 → HTTP，否则 TCP（host[:port]，默认 80）；一轮 4 次取中位数 + 丢包率 | `HashMap<key, PingRecord>` |
 | slow | `intervals.slow`（缺省 60s） | disk_used / tcp_conn / udp_conn / processes | `SlowBlock` |
 | gpu | `intervals.gpu`（缺省 60s） | GPU 名称 + 使用率（nvidia-smi；macOS 走 system_profiler + ioreg，可本地开关） | `Vec<GpuRecord>` |
+| diskio | `intervals.diskio`（缺省 10s） | 整盘 IO 速率/iops/await/util（Linux /proc/diskstats；macOS ioreg，无 util） | `DiskIoRecord` |
 | public-ip | `intervals.ip`（缺省 600s） | 公网 IPv4/IPv6（cloudflare trace，强制 tcp4/tcp6 分流） | `(ipv4, ipv6)`，供 static |
 | netstatic | 2s 采样 / 10min 落盘 | 每网卡流量 delta 时序，见 §5 | 可查询时序 |
 
@@ -155,7 +158,7 @@ ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最
 |---|---|
 | 方向词汇 | 一律 `rx`（下行/接收）/ `tx`（上行/发送），全文档与代码禁用 in/out、up/down |
 | 探测术语 | 一律 `ping`（worker、intervals.ping、ping[] 数组），禁用 probe 指代该子系统 |
-| 配置 key | snake_case；间隔类收敛到 `intervals.{collect, report, ping, slow, gpu, ip}` |
+| 配置 key | snake_case；间隔类收敛到 `intervals.{collect, report, ping, slow, gpu, ip, diskio}` |
 | 使用率字段 | 后缀 `_usage`（`cpu_usage`、gpu 记录的 `usage`），与 `_name`/`_total`/`_used` 后缀风格一致 |
 | 时间字段 | 一律 `ts`（毫秒）；静态开机时间用 `boot_time` |
 | 账期字段 | 后缀 `_monthly` 表示账期累计（reset_day=0 时为永久累计） |
@@ -186,7 +189,8 @@ ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最
       "ping": 30,
       "slow": 60,
       "gpu": 60,
-      "ip": 600
+      "ip": 600,
+      "diskio": 10
     },
     "reset_day": 15
   }
@@ -201,6 +205,7 @@ ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最
 | `intervals.slow` | 慢变指标采集间隔（秒），缺省 60 |
 | `intervals.gpu` | GPU 采集间隔（秒），缺省 60 |
 | `intervals.ip` | 公网 IP 查询间隔（秒），缺省 600 |
+| `intervals.diskio` | 磁盘 IO 采集间隔（秒），缺省 10 |
 | `reset_day` | 月流量账期重置日，1-31；0 = 不重置（永久累计） |
 | `config_version` | 配置版本（人类可读的 UTC+8 时间戳字符串），幂等机制，见下 |
 

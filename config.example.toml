@@ -42,6 +42,8 @@ slow = 60
 gpu = 60
 # 公网 IP 查询间隔（秒）
 ip = 600
+# 磁盘 IO 采集间隔（秒）：Linux 读 /proc/diskstats 可高频；macOS 走 ioreg 子进程建议 >= 10
+diskio = 10
 
 # ===== 探测目标组：name 为唯一键（远端下发时整体替换，name 不可重复） =====
 # target 以 http(s):// 开头 → HTTP 探测；否则 TCP（host[:port]，默认 80）

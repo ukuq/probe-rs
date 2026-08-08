@@ -7,6 +7,7 @@
 //!   gpu = 仅部分机器有的可选硬件指标（kind:"gpu"）；
 //!   公网 IP = 身份信息，喂 static，不进 async[]。
 
+pub mod diskio;
 pub mod gpu;
 pub mod ping;
 pub mod public_ip;

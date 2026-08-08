@@ -38,7 +38,7 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
     "agent_version": "0.1.0",
     "config": {
       "reset_day": 1,
-      "intervals": { "collect": 10, "report": 60, "ping": 30, "slow": 60, "gpu": 60, "ip": 600 },
+      "intervals": { "collect": 10, "report": 60, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
       "interfaces": ["eth*"],
       "enable_gpu": true,
       "report_errors": true,
@@ -67,7 +67,8 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
   "async": [
     { "kind": "ping", "ts": 1754300058000, "name": "telecom", "rtt": 32, "loss": 0 },
     { "kind": "slow", "ts": 1754300055000, "disk_used": 53687091200, "tcp_conn": 120, "udp_conn": 8, "processes": 230 },
-    { "kind": "gpu",  "ts": 1754300050000, "name": "NVIDIA A100 80GB", "usage": 42.5 }
+    { "kind": "gpu",  "ts": 1754300050000, "name": "NVIDIA A100 80GB", "usage": 42.5 },
+    { "kind": "diskio", "ts": 1754300056000, "read_bps": 1048576, "write_bps": 524288, "read_iops": 40, "write_iops": 18, "await_ms": 1.8, "util": 3.2 }
   ],
 
   "errors": [
@@ -115,7 +116,7 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `reset_day` | number | 0-31 |
-| `intervals` | object | {collect, report, ping, slow, gpu, ip}（秒） |
+| `intervals` | object | {collect, report, ping, slow, gpu, ip, diskio}（秒） |
 | `interfaces` | string[] | 网卡白名单（glob）；空 = 所有非虚拟网卡 |
 | `enable_gpu` | boolean | GPU 采集开关 |
 | `report_errors` | boolean | 是否上报 errors 错误事件 |
@@ -150,6 +151,7 @@ kind 按数据语义划分（DESIGN.md §2.3"机制同类、语义分流"）：s
 | `slow` | `disk_used`, `tcp_conn`, `udp_conn`, `processes` | 慢变指标（disk_used 与 disk_total 同口径；TCP 全状态计数） |
 | `gpu` | `name`, `usage`, `mem_total`, `mem_used`, `temp` | GPU 型号、利用率（0-100）、显存（字节）、温度（℃）；多卡时每卡一条；mem/temp 仅 nvidia 路径有，macOS 为 null |
 | `self` | `cpu_usage`, `mem_rss` | 探针自身 CPU（单核 %）与常驻内存（字节）；`report_self=true` 才产生（默认 false） |
+| `diskio` | `read_bps`, `write_bps`, `read_iops`, `write_iops`, `await_ms`, `util` | 磁盘 IO（整盘合计）：bps 字节/秒、await 毫秒、util %；首轮差值无前值为 null；macOS 无 util（恒 null） |
 
 约定：
 - 异步记录**仅当对应源的快照 ts 更新时才产生**（同一份异步数据不会重复出现）；worker 失败 = 快照 ts 停滞；
@@ -186,7 +188,8 @@ kind 按数据语义划分（DESIGN.md §2.3"机制同类、语义分流"）：s
       "ping": 30,
       "slow": 60,
       "gpu": 60,
-      "ip": 600
+      "ip": 600,
+      "diskio": 10
     }
   }
 }
@@ -202,6 +205,7 @@ kind 按数据语义划分（DESIGN.md §2.3"机制同类、语义分流"）：s
 | `intervals.slow` | 慢变指标采集间隔（秒），>= 1，缺省 60 |
 | `intervals.gpu` | GPU 采集间隔（秒），>= 1，缺省 60 |
 | `intervals.ip` | 公网 IP 查询间隔（秒），>= 1，缺省 600 |
+| `intervals.diskio` | 磁盘 IO 采集间隔（秒），>= 1，缺省 10 |
 | `interfaces` | 可选；网卡白名单（glob 数组） |
 | `enable_gpu` | 可选；GPU 采集开关（布尔） |
 | `report_errors` | 可选；是否上报 errors 错误事件（布尔，缺省 true） |

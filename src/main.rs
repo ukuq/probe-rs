@@ -76,6 +76,8 @@ async fn main() -> Result<()> {
     let (_ip_handle, ip_rx) = worker::public_ip::spawn(Arc::clone(&buffers), intervals_rx.clone());
     let (_slow_handle, slow_rx, self_rx) =
         worker::slow::spawn(Arc::clone(&shared), intervals_rx.clone());
+    let (_diskio_handle, diskio_rx) =
+        worker::diskio::spawn(intervals_rx.clone(), Arc::clone(&buffers));
 
     let init_cfg = shared.get();
     let mut ping_worker = (!init_cfg.pings.is_empty()).then(|| {
@@ -180,6 +182,7 @@ async fn main() -> Result<()> {
         gpu_rx,
         slow_rx,
         self_rx,
+        diskio_rx,
         Arc::clone(&shutdown),
         AGENT_VERSION.to_string(),
     );

@@ -239,3 +239,69 @@ pub fn static_info(
         },
     }
 }
+
+/// macOS：ioreg 读 IOBlockStorageDriver 的 Statistics 合计（异步 + 超时）；
+/// Windows 一期不支持
+#[cfg(target_os = "macos")]
+pub async fn read_disk_io_counters() -> Option<super::DiskIoCounters> {
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new("ioreg")
+            .args(["-rc", "IOBlockStorageDriver", "-d", "1"])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(parse_ioreg_statistics(&text))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub async fn read_disk_io_counters() -> Option<super::DiskIoCounters> {
+    None // Windows：PDH 计数器一期不做
+}
+
+#[cfg(target_os = "macos")]
+fn parse_ioreg_statistics(text: &str) -> super::DiskIoCounters {
+    fn sum_key(text: &str, key: &str) -> u64 {
+        let needle = format!("\"{key}\"=");
+        let mut sum = 0u64;
+        let mut rest = text;
+        while let Some(i) = rest.find(&needle) {
+            rest = &rest[i + needle.len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            sum += digits.parse::<u64>().unwrap_or(0);
+        }
+        sum
+    }
+    // Total Time 单位是纳秒，换算成 ms
+    let total_ns = sum_key(text, "Total Time (Read)") + sum_key(text, "Total Time (Write)");
+    super::DiskIoCounters {
+        read_bytes: sum_key(text, "Bytes (Read)"),
+        write_bytes: sum_key(text, "Bytes (Write)"),
+        read_ops: sum_key(text, "Operations (Read)"),
+        write_ops: sum_key(text, "Operations (Write)"),
+        total_time_ms: total_ns / 1_000_000,
+        io_ms_per_dev: Default::default(), // macOS 无 io 进行中时长计数器，usage 不可得
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod diskio_tests {
+    #[test]
+    fn parses_ioreg_statistics() {
+        let text = r#""Statistics" = {"Operations (Write)"=10,"Bytes (Read)"=2048,"Total Time (Read)"=5000000,"Total Time (Write)"=3000000,"Bytes (Write)"=1024,"Operations (Read)"=20}
+    "Statistics" = {"Operations (Write)"=5,"Bytes (Read)"=512,"Total Time (Read)"=1000000,"Total Time (Write)"=0,"Bytes (Write)"=256,"Operations (Read)"=7}"#;
+        let c = super::parse_ioreg_statistics(text);
+        assert_eq!(c.read_bytes, 2560);
+        assert_eq!(c.write_bytes, 1280);
+        assert_eq!(c.read_ops, 27);
+        assert_eq!(c.write_ops, 15);
+        assert_eq!(c.total_time_ms, 9);
+        assert!(c.io_ms_per_dev.is_empty());
+    }
+}

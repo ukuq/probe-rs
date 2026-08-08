@@ -3,6 +3,7 @@
 pub mod conn;
 pub mod cpu;
 pub mod disk;
+pub mod diskio;
 pub mod load;
 pub mod mem;
 pub mod process;
@@ -15,6 +16,11 @@ use crate::collector::net::{IfaceFilter, NetBytes};
 use crate::model::StaticInfo;
 
 pub use selfproc::{SelfMonitor, SelfStats};
+
+/// Linux：读 /proc/diskstats（同步快读，包成 async 对齐门面签名）
+pub async fn read_disk_io_counters() -> Option<super::DiskIoCounters> {
+    diskio::read_counters()
+}
 
 pub struct CpuMonitor {
     prev: Option<cpu::CpuTimes>,

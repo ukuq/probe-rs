@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::model::{DynamicRecord, GpuRecord, PingRecord, SlowBlock, StaticInfo};
+use crate::model::{DiskIoRecord, DynamicRecord, GpuRecord, PingRecord, SlowBlock, StaticInfo};
 
 /// 一次 /update 请求体
 #[derive(Debug, Serialize)]
@@ -51,6 +51,9 @@ pub struct CfMetrics {
     pub disk_total: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_used: Option<u64>,
+    /// 磁盘 IO（diskio 快照；首轮/不支持平台整个字段缺席）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk: Option<CfDisk>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load_avg: Option<String>,
     pub boot_time: i64,
@@ -110,6 +113,23 @@ pub struct CfGpu {
     pub id: String,
     pub name: String,
     pub info: f64,
+}
+
+/// CF 磁盘 IO 对象（CF 侧全 0/缺失时不展示，故全 None 则不产出该字段）
+#[derive(Debug, Serialize)]
+pub struct CfDisk {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_bps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_bps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_iops: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_iops: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub await_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub util: Option<f64>,
 }
 
 /// samples[] 元素：{ts, metrics:{动态字段}}
@@ -173,7 +193,19 @@ pub fn build_metrics(
     slow: Option<&SlowBlock>,
     gpus: &[GpuRecord],
     pings: &HashMap<String, PingRecord>,
+    diskio: Option<&DiskIoRecord>,
 ) -> CfMetrics {
+    let disk = diskio.and_then(|d| {
+        let any = d.read_bps.is_some() || d.write_bps.is_some() || d.read_iops.is_some();
+        any.then(|| CfDisk {
+            read_bps: d.read_bps.map(round2),
+            write_bps: d.write_bps.map(round2),
+            read_iops: d.read_iops.map(round2),
+            write_iops: d.write_iops.map(round2),
+            await_ms: d.await_ms.map(round2),
+            util: d.usage.map(round2),
+        })
+    });
     let ping = |names: &[&str]| -> Option<&PingRecord> {
         names
             .iter()
@@ -205,6 +237,7 @@ pub fn build_metrics(
         swap_used: dyn_latest.and_then(|d| d.swap_used).map(mb),
         disk_total: mb(st.disk_total),
         disk_used: slow.and_then(|s| s.disk_used).map(mb),
+        disk,
         load_avg: dyn_latest.and_then(|d| d.load).map(load_str),
         boot_time: st.boot_time,
         net_rx: dyn_latest.and_then(|d| d.net_rx),
@@ -291,6 +324,7 @@ pub fn synthesize_remote(
             slow: cur.slow,
             gpu: cur.gpu,
             ip: cur.ip,
+            diskio: cur.diskio,
         });
     let pings = push.custom.iter().any(Option::is_some).then(|| {
         ["ct", "cu", "cm", "bd"]
@@ -513,7 +547,7 @@ mod tests {
                 loss: 100,
             },
         );
-        let m = build_metrics(&st, Some(&d), Some(&slow), &[], &pings);
+        let m = build_metrics(&st, Some(&d), Some(&slow), &[], &pings, None);
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["cpu"], 12.35);
         assert_eq!(v["agent_version"], "1.3.8_probe-rs_0.1.0");

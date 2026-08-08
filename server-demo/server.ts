@@ -22,6 +22,7 @@ interface Intervals {
   slow?: number;
   gpu?: number;
   ip?: number;
+  diskio?: number;
 }
 
 interface PingTarget {
@@ -117,10 +118,21 @@ interface SelfRecord {
   mem_rss: number | null; // 自身常驻内存，字节
 }
 
+interface DiskIoRecord {
+  ts: number;
+  read_bps: number | null; // 字节/秒
+  write_bps: number | null;
+  read_iops: number | null;
+  write_iops: number | null;
+  await_ms: number | null; // 平均等待 ms
+  usage: number | null; // IO 利用率 %（各盘取最大）；macOS 为 null
+}
+
 type AsyncRecord =
   | ({ kind: "ping" } & PingRecord)
   | ({ kind: "slow" } & SlowBlock)
   | ({ kind: "gpu" } & GpuRecord)
+  | ({ kind: "diskio" } & DiskIoRecord)
   | ({ kind: "self" } & SelfRecord);
 
 interface ErrorRecord {
@@ -142,6 +154,8 @@ interface Report {
 
 interface ServerState {
   staticInfo: StaticInfo | null;
+  /** agent 版本（X-Agent-Version 头），用于下发兼容判断 */
+  agentVersion: string;
   dynamic: DynamicRecord[];
   asyncs: AsyncRecord[];
   errors: ErrorRecord[];
@@ -186,6 +200,7 @@ function getServer(id: string): ServerState {
   if (!s) {
     s = {
       staticInfo: null,
+      agentVersion: "",
       dynamic: [],
       asyncs: [],
       errors: [],
@@ -218,6 +233,7 @@ function handleReport(req: Request, report: Report): Response {
 
   const s = getServer(id);
   s.lastSeen = Date.now();
+  s.agentVersion = req.headers.get("x-agent-version") ?? s.agentVersion;
   s.configVersion = report.config_version ?? "";
   if (report.static) s.staticInfo = report.static;
   if (Array.isArray(report.dynamic)) {
@@ -281,6 +297,7 @@ function handleSetConfig(id: string, cfg: Record<string, unknown>): Response {
     slow,
     gpu,
     ip,
+    diskio,
     reset_day,
     interfaces,
     enable_gpu,
@@ -288,29 +305,45 @@ function handleSetConfig(id: string, cfg: Record<string, unknown>): Response {
     report_errors,
     report_self,
   } = cfg;
-  // intervals：提供了就必须三项齐全；slow/gpu/ip 可选
-  const hasAnyInterval = collect !== undefined || report !== undefined ||
-    ping !== undefined;
+  // intervals：7 项任一提供即整体下发；未提供的按该机器 static 回执的当前值补齐
+  const hasAnyInterval = [collect, report, ping, slow, gpu, ip, diskio].some((
+    v,
+  ) => v !== undefined);
   const next: Partial<RemoteConfig> = {};
   if (hasAnyInterval) {
-    for (const [k, v] of Object.entries({ collect, report, ping })) {
-      if (!Number.isInteger(v) || (v as number) < 1) {
-        return json({ error: `提供 intervals 时 ${k} 必须为 >=1 的整数` }, 400);
+    const curIv = getServer(id).staticInfo?.config?.intervals;
+    const fill = (
+      v: unknown,
+      cur: number | undefined,
+      def: number,
+      name: string,
+    ) => {
+      if (v !== undefined) {
+        if (!Number.isInteger(v) || (v as number) < 1) {
+          throw { status: 400, msg: `intervals.${name} 必须为 >=1 的整数` };
+        }
+        return v as number;
       }
-    }
-    for (const [k, v] of Object.entries({ slow, gpu, ip })) {
-      if (v !== undefined && (!Number.isInteger(v) || (v as number) < 1)) {
-        return json({ error: `${k} 必须为 >=1 的整数` }, 400);
-      }
-    }
-    next.intervals = {
-      collect: collect as number,
-      report: report as number,
-      ping: ping as number,
-      slow: (slow as number) ?? 60,
-      gpu: (gpu as number) ?? 60,
-      ip: (ip as number) ?? 600,
+      return cur ?? def;
     };
+    try {
+      next.intervals = {
+        collect: fill(collect, curIv?.collect, 10, "collect"),
+        report: fill(report, curIv?.report, 60, "report"),
+        ping: fill(ping, curIv?.ping, 30, "ping"),
+        slow: fill(slow, curIv?.slow, 60, "slow"),
+        gpu: fill(gpu, curIv?.gpu, 60, "gpu"),
+        ip: fill(ip, curIv?.ip, 600, "ip"),
+        diskio: fill(diskio, curIv?.diskio, 10, "diskio"),
+      };
+    } catch (e) {
+      const err = e as { status: number; msg: string };
+      return json({ error: err.msg }, err.status);
+    }
+    // 0.1.0 agent 的 Intervals 是 deny_unknown_fields：带 diskio 会让它解析响应失败
+    if (getServer(id).agentVersion === "0.1.0" && next.intervals) {
+      delete (next.intervals as unknown as Record<string, unknown>).diskio;
+    }
   }
   if (reset_day !== undefined) {
     if (
@@ -412,9 +445,11 @@ function serversView() {
       async_count: s.asyncs.length,
       recent,
       ping_list: pings,
+      diskio_list: asyncs.filter((a) => a.kind === "diskio"),
       slow_latest: asyncs.findLast((a) => a.kind === "slow") ?? null,
       gpu_latest: asyncs.findLast((a) => a.kind === "gpu") ?? null,
       self_latest: asyncs.findLast((a) => a.kind === "self") ?? null,
+      diskio_latest: asyncs.findLast((a) => a.kind === "diskio") ?? null,
       errors: s.errors.slice(-10),
       error_count: s.errors.length,
     };
@@ -744,16 +779,18 @@ function cfBody(r) {
   var view = serverLatest[r.server_id] || {};
   var dyn = rep.dynamic || [];
   var last = dyn.length ? dyn[dyn.length - 1] : {};
-  var slow = null, gpus = [], pings = {};
+  var slow = null, gpus = [], pings = {}, dio = null;
   (rep.async || []).forEach(function (a) {
     if (a.kind === 'slow') slow = a;
     else if (a.kind === 'gpu') gpus.push(a);
     else if (a.kind === 'ping') pings[a.name] = a;
+    else if (a.kind === 'diskio') dio = a;
   });
   /* 与 agent 一致：异步字段读最新快照而非仅本条报文（async[] 有新鲜度去重，
      大多数报文不含 ping/slow/gpu 记录） */
   if (!slow && view.slow_latest) slow = view.slow_latest;
   if (!gpus.length && view.gpu_latest) gpus = [view.gpu_latest];
+  if (!dio && view.diskio_latest) dio = view.diskio_latest;
   (view.ping_list || []).forEach(function (p) { if (!pings[p.name]) pings[p.name] = p; });
   function pingOf(names) {
     for (var i = 0; i < names.length; i++) {
@@ -775,6 +812,14 @@ function cfBody(r) {
   set('swap_used', cfMb(last.swap_used));
   m.disk_total = cfMb(st.disk_total) || 0;
   set('disk_used', cfMb(slow && slow.disk_used));
+  if (dio && (dio.read_bps != null || dio.write_bps != null || dio.read_iops != null)) {
+    var dk = {};
+    ['read_bps', 'write_bps', 'read_iops', 'write_iops', 'await_ms'].forEach(function (k) {
+      if (dio[k] != null) dk[k] = cfRound2(dio[k]);
+    });
+    if (dio.usage != null) dk.util = cfRound2(dio.usage); // CF 侧字段名叫 util
+    m.disk = dk;
+  }
   set('load_avg', cfLoad(last.load));
   m.boot_time = st.boot_time || 0;
   set('net_rx', last.net_rx); set('net_tx', last.net_tx);
@@ -1066,6 +1111,15 @@ function render(data) {
       (byTarget[p.name] = byTarget[p.name] || []).push({ t: p.ts, v: p.rtt >= 0 ? p.rtt : null });
     });
     var targets = Object.keys(byTarget).sort();
+    var ioSeries = (s.diskio_list || []).filter(function (d) { return d.read_bps != null; });
+    if (ioSeries.length) {
+      var ioC = makeChart({ title: '磁盘 IO', unit: fmtB,
+        series: [
+          { name: '↓ 读', color: PALETTE[0], points: ioSeries.map(function (d) { return { t: d.ts, v: d.read_bps }; }) },
+          { name: '↑ 写', color: PALETTE[1], points: ioSeries.map(function (d) { return { t: d.ts, v: d.write_bps }; }) }] });
+      chartBox.append(ioC.el);
+      charts.push(ioC);
+    }
     if (targets.length) {
       var pingC = makeChart({ title: '探测延迟 (ms)', unit: function (v) { return v + 'ms'; }, endLabels: targets.length <= 4, noArea: true,
         series: targets.map(function (name, i) { return { name: name, color: PALETTE[i % PALETTE.length], points: byTarget[name] }; }) });
@@ -1092,6 +1146,13 @@ function render(data) {
       return name + ' ' + (raw && raw.rtt < 0 ? '失败' : (raw ? raw.rtt + 'ms/丢' + raw.loss + '%' : '–'));
     }).join('　'), '', '']);
     detailRow(tb, ['最近上报', new Date(s.last_seen).toLocaleString('zh-CN'), '缓存样本', String(s.dynamic_count)]);
+    if (s.diskio_latest && s.diskio_latest.read_bps != null) {
+      var io = s.diskio_latest;
+      detailRow(tb, ['磁盘 IO', '读 ' + fmtS(io.read_bps) + ' · 写 ' + fmtS(io.write_bps)
+        + ' · iops ' + (io.read_iops != null ? Math.round(io.read_iops + (io.write_iops || 0)) : '–'),
+        'await / usage', (io.await_ms != null ? io.await_ms.toFixed(1) + 'ms' : '–')
+        + ' / ' + (io.usage != null ? io.usage.toFixed(1) + '%' : '–')]);
+    }
     if (s.self_latest) {
       detailRow(tb, ['探针自身', 'CPU ' + (s.self_latest.cpu_usage != null ? s.self_latest.cpu_usage.toFixed(1) + '%' : '–')
         + ' · RSS ' + fmtB(s.self_latest.mem_rss), '', '']);
@@ -1124,7 +1185,7 @@ function rptRow(r) {
   ((r.report && r.report.async) || []).forEach(function (a) {
     kindCount[a.kind] = (kindCount[a.kind] || 0) + 1;
   });
-  var kindSum = ['ping', 'slow', 'gpu', 'self'].filter(function (k) { return kindCount[k]; })
+  var kindSum = ['ping', 'slow', 'gpu', 'self', 'diskio'].filter(function (k) { return kindCount[k]; })
     .map(function (k) { return k + ' ×' + kindCount[k]; }).join(' · ');
   var sum = (r.has_static ? 'static · ' : '') + 'dynamic ×' + r.dynamic_count
     + (kindSum ? ' · ' + kindSum : '')
@@ -1271,7 +1332,8 @@ function cfgEditForm(s, st) {
    ['ping', '探测 ping', gAsync],
    ['slow', '慢变指标 slow', gAsync],
    ['gpu', 'GPU gpu', gAsync],
-   ['ip', '公网 IP ip', gAsync]].forEach(function (def) {
+   ['ip', '公网 IP ip', gAsync],
+   ['diskio', '磁盘 IO diskio', gAsync]].forEach(function (def) {
     var k = def[0], inp = numInput(iv[k], 1);
     editRow(def[2], def[1], sec(iv[k]), inp, function () {});
     intItems[k] = { cb: items[items.length - 1].cb, inp: inp };
@@ -1360,8 +1422,8 @@ function cfgEditForm(s, st) {
   wrap.append(foot);
   wrap.addEventListener('focusin', function () { cfgFormActive = true; });
 
-  var INT_KEYS = ['collect', 'report', 'ping', 'slow', 'gpu', 'ip'];
-  var INT_DEFAULT = { slow: 60, gpu: 60, ip: 600 };
+  var INT_KEYS = ['collect', 'report', 'ping', 'slow', 'gpu', 'ip', 'diskio'];
+  var INT_DEFAULT = { slow: 60, gpu: 60, ip: 600, diskio: 10 };
   function buildIntervals() {
     if (!INT_KEYS.some(function (k) { return intItems[k].cb.checked; })) return null;
     var out = {};
@@ -1446,7 +1508,7 @@ function renderConfig(data) {
       var rows = [['config_version', fmtVer(s.config_version) + ' → ' + fmtVer(p.config_version)]];
       if (p.intervals) {
         rows.push(['collect / report', p.intervals.collect + 's / ' + p.intervals.report + 's'],
-          ['ping / slow / gpu / ip', p.intervals.ping + 's / ' + (p.intervals.slow ?? '–') + 's / ' + (p.intervals.gpu ?? '–') + 's / ' + (p.intervals.ip ?? '–') + 's']);
+          ['ping/slow/gpu/ip/diskio', p.intervals.ping + 's / ' + (p.intervals.slow ?? '–') + 's / ' + (p.intervals.gpu ?? '–') + 's / ' + (p.intervals.ip ?? '–') + 's / ' + (p.intervals.diskio ?? '–') + 's']);
       }
       if (p.reset_day != null) rows.push(['reset_day', String(p.reset_day)]);
       if (p.interfaces) rows.push(['interfaces', p.interfaces.join(', ') || '(空)']);
@@ -1543,7 +1605,7 @@ var EXAMPLE_JSON5 = \`{
     "config": {                             // 当前生效配置（供服务端展示/核对）
       "reset_day": 1,                       // 月流量账期重置日 0-31；0 = 不重置
       "intervals": {                        // 各间隔（秒），完全独立无关系约束
-        "collect": 10, "report": 60, "ping": 30, "slow": 60, "gpu": 60, "ip": 600
+        "collect": 10, "report": 60, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10
       },
       "interfaces": ["eth*"],               // 网卡白名单（glob）；空 = 所有非虚拟网卡
       "enable_gpu": true,                   // GPU 采集开关
@@ -1581,8 +1643,10 @@ var EXAMPLE_JSON5 = \`{
     // 系统慢指标（每台机器必有）；disk_used 与 disk_total 同口径；TCP 全状态计数
     { "kind": "gpu", "ts": 1754300050000, "name": "NVIDIA A100 80GB", "usage": 42.5, "mem_total": 85899345920, "mem_used": 10737418240, "temp": 55 },
     // 可选硬件指标（仅部分机器）；多卡时每卡一条；mem/temp 仅 nvidia 路径有，macOS 为 null；无 GPU 时整个 kind 不出现
-    { "kind": "self", "ts": 1754300055000, "cpu_usage": 1.2, "mem_rss": 13631488 }
+    { "kind": "self", "ts": 1754300055000, "cpu_usage": 1.2, "mem_rss": 13631488 },
     // 探针自身资源占用；report_self=true 时才有（默认 false）
+    { "kind": "diskio", "ts": 1754300056000, "read_bps": 1048576, "write_bps": 524288, "read_iops": 40, "write_iops": 18, "await_ms": 1.8, "usage": 3.2 }
+    // 磁盘 IO（整盘合计）；usage 仅 Linux 有，macOS 为 null
   ],
 
   // 错误事件：采集/上报失败记录，空数组 = 无错误；同源同文去重
@@ -1608,7 +1672,8 @@ var CONFIG_EXAMPLE_JSON5 = \`{
     "ping": 30,                     // 探测默认间隔；[[pings]] 组未设 interval 时生效
     "slow": 60,                     // 慢变指标（磁盘/连接数/进程数）采集间隔
     "gpu": 60,                      // GPU 采集间隔
-    "ip": 600                       // 公网 IP 查询间隔
+    "ip": 600,                      // 公网 IP 查询间隔
+    "diskio": 10                    // 磁盘 IO 采集间隔（macOS 走 ioreg 子进程建议 >= 10）
   },
   "interfaces": [],                 // 网卡白名单（glob，如 "eth*"）；空 = 所有非虚拟网卡
   "enable_gpu": false,              // GPU 采集开关（nvidia-smi；macOS 用 ioreg）
@@ -1640,7 +1705,8 @@ var RESPONSE_EXAMPLE_JSON5 = \`// 无配置变更时：200 OK，body 为 {} 或�
       "ping": 30,                   // 探测默认间隔（[[pings]] 组未设 interval 时生效）
       "slow": 60,                   // 慢变指标采集间隔
       "gpu": 60,                    // GPU 采集间隔
-      "ip": 600                     // 公网 IP 查询间隔
+      "ip": 600,                    // 公网 IP 查询间隔
+      "diskio": 10                  // 磁盘 IO 采集间隔
     },
     "interfaces": ["eth*"],         // 可选；网卡白名单（glob）
     "enable_gpu": true,             // 可选；GPU 采集开关
