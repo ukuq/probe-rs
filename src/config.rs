@@ -70,8 +70,8 @@ impl LocalConfig {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             bail!("worker_url 必须是 http(s) URL");
         }
-        if self.protocol != "probe" && self.protocol != "cf" {
-            bail!("protocol 必须是 \"probe\" 或 \"cf\"");
+        if !["probe", "cf", "komari"].contains(&self.protocol.as_str()) {
+            bail!("protocol 必须是 \"probe\" / \"cf\" / \"komari\"");
         }
         self.intervals.validate().map_err(anyhow::Error::msg)?;
         if self.reset_day > 31 {

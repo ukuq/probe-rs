@@ -8,7 +8,9 @@ description = "Server monitoring probe agent"
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net", "process", "fs"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 url = "2"
+futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

@@ -17,6 +17,7 @@ use crate::model::{
 };
 use crate::netstatic::{period_start_ms, NetStatic};
 use crate::reporter::Reporter;
+use crate::worker::komari::KomariOut;
 use crate::worker::ping::PingSnapshot;
 use crate::worker::public_ip::IpSnapshot;
 
@@ -37,6 +38,8 @@ pub struct Scheduler {
     diskio_rx: watch::Receiver<Option<crate::model::DiskIoRecord>>,
     shutdown: Arc<Notify>,
     agent_version: String,
+    /// komari 模式：发往 WS worker 的通道（其余协议为 None）
+    komari_tx: Option<watch::Sender<KomariOut>>,
 
     cpu: CpuMonitor,
     prev_net: Option<(net::NetBytes, Instant)>,
@@ -68,6 +71,7 @@ impl Scheduler {
         diskio_rx: watch::Receiver<Option<crate::model::DiskIoRecord>>,
         shutdown: Arc<Notify>,
         agent_version: String,
+        komari_tx: Option<watch::Sender<KomariOut>>,
     ) -> Self {
         Self {
             cfg,
@@ -84,6 +88,7 @@ impl Scheduler {
             diskio_rx,
             shutdown,
             agent_version,
+            komari_tx,
             cpu: CpuMonitor::new(),
             prev_net: None,
             last_static: None,
@@ -236,6 +241,10 @@ impl Scheduler {
             self.on_report_cf(cfg).await;
             return;
         }
+        if cfg.protocol == "komari" {
+            self.on_report_komari(cfg).await;
+            return;
+        }
         let (dynamic, async_records, errors) = self.buffers.drain();
         // report_errors=false 时不上报错误事件（缓冲照常 drain，防积压）
         let errors = if cfg.report_errors {
@@ -305,6 +314,52 @@ impl Scheduler {
         }
     }
 
+    /// komari 协议上报：WS 长连接 + JSON-RPC，只报最新值（无 ts/批量/配置下发语义，
+    /// 失败无保留价值——断线期间数据直接丢弃，重连后发最新）
+    async fn on_report_komari(&mut self, cfg: crate::config::LocalConfig) {
+        let Some(tx) = &self.komari_tx else { return };
+        let (dynamic, _async, errors) = self.buffers.drain();
+        let errors = if cfg.report_errors {
+            errors
+        } else {
+            Vec::new()
+        };
+
+        let due = self
+            .last_static
+            .is_none_or(|t| t.elapsed() >= STATIC_REFRESH);
+        let mut basic_info = None;
+        if due || self.static_cache.is_none() {
+            self.last_static = Some(Instant::now());
+            let (ipv4, ipv6) = self.ip_rx.borrow().clone();
+            let gpu_name = self.gpu_name_rx.borrow().clone();
+            let st = collector::static_info(ipv4, ipv6, gpu_name, &self.agent_version, &cfg);
+            basic_info = Some(crate::reporter_komari::build_basic_info(
+                &st,
+                &self.agent_version,
+            ));
+            self.static_cache = Some(st);
+        }
+        let st = self.static_cache.clone().expect("static_cache 上面刚填充");
+
+        let report = {
+            let slow = self.slow_rx.borrow().clone();
+            let gpus = self.gpu_rx.borrow().clone();
+            crate::reporter_komari::build_report(
+                &st,
+                dynamic.last(),
+                slow.as_ref(),
+                &gpus,
+                &errors,
+                crate::model::now_millis(),
+            )
+        };
+        tx.send_replace(KomariOut {
+            report: Some(report),
+            basic_info,
+        });
+    }
+
     /// CF 协议上报：metrics 每次全量（static 走缓存），dynamic[] → samples[]。
     /// errors/self 无落点直接丢弃；ping/slow/gpu 从快照直读最新值
     async fn on_report_cf(&mut self, cfg: crate::config::LocalConfig) {
@@ -333,13 +388,17 @@ impl Scheduler {
             let gpus = self.gpu_rx.borrow();
             let pings = self.ping_rx.borrow();
             let diskio = self.diskio_rx.borrow();
+            // 快照超过 3 个采集周期未更新 = 采集停滞，不上报过期 IO 数据
+            let max_age = (cfg.intervals.diskio.max(1) * 3 * 1000) as i64;
+            let now = crate::model::now_millis();
+            let diskio_fresh = diskio.as_ref().filter(|d| now - d.ts <= max_age);
             crate::reporter_cf::build_metrics(
                 &st,
                 dynamic.last(),
                 slow.as_ref(),
                 &gpus,
                 &pings,
-                diskio.as_ref(),
+                diskio_fresh,
             )
         };
         let samples = if cfg.ext.cf.batch {

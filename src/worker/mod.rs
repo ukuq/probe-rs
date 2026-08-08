@@ -9,6 +9,7 @@
 
 pub mod diskio;
 pub mod gpu;
+pub mod komari;
 pub mod ping;
 pub mod public_ip;
 pub mod slow;

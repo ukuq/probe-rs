@@ -91,14 +91,21 @@ done
 [ -n "$SECRET" ] || die "缺少 -secret="
 [ -n "$URL" ] || die "缺少 -url="
 command -v systemctl >/dev/null || die "仅支持 systemd 系统"
-# collect_interval=0 按 1s（实时）；其余非法值兜底
+# collect_interval=0 按 1s（实时）；其余非法值兜底；前导零剥掉（08 不是合法 TOML 整数）
 case "$COLLECT" in ''|*[!0-9]*) COLLECT=1 ;; esac
-[ "$COLLECT" -lt 1 ] && COLLECT=1
 case "$REPORT" in ''|*[!0-9]*) REPORT=60 ;; esac
+case "$RESET_DAY" in ''|*[!0-9]*) RESET_DAY=1 ;; esac
+COLLECT=$((10#$COLLECT)); REPORT=$((10#$REPORT)); RESET_DAY=$((10#$RESET_DAY))
+[ "$COLLECT" -lt 1 ] && COLLECT=1
 [ "$REPORT" -lt 1 ] && REPORT=60
 
+# TOML 字符串转义（\ 与 " 防注入/解析失败）
+toml_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+ID=$(toml_escape "$ID"); SECRET=$(toml_escape "$SECRET"); URL=$(toml_escape "$URL")
+CT=$(toml_escape "$CT"); CU=$(toml_escape "$CU"); CM=$(toml_escape "$CM"); BD=$(toml_escape "$BD")
+
 # ---- 二进制 ----
-TMP_BIN=/tmp/probe-rs.bin
+TMP_BIN=$(mktemp /tmp/probe-rs.XXXXXX)
 if [ -z "$BIN" ]; then
     arch=$(uname -m)
     case "$arch" in
@@ -109,7 +116,7 @@ if [ -z "$BIN" ]; then
     BIN="$RELEASE_BASE/probe-rs-linux-$arch"
 fi
 if [ -f "$BIN" ]; then
-    cp "$BIN" "$TMP_BIN"
+    cp -f "$BIN" "$TMP_BIN"
 else
     log "下载二进制: $BIN"
     curl -fSL --connect-timeout 10 -o "$TMP_BIN" "$BIN" || die "二进制下载失败（可用 -bin= 指定本地路径）"

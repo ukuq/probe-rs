@@ -312,6 +312,15 @@ function handleSetConfig(id: string, cfg: Record<string, unknown>): Response {
   const next: Partial<RemoteConfig> = {};
   if (hasAnyInterval) {
     const curIv = getServer(id).staticInfo?.config?.intervals;
+    if (
+      !curIv &&
+      (collect === undefined || report === undefined || ping === undefined)
+    ) {
+      return json({
+        error:
+          "该机器还没有 static 回执，部分下发 intervals 请至少提供 collect/report/ping",
+      }, 400);
+    }
     const fill = (
       v: unknown,
       cur: number | undefined,
@@ -340,8 +349,12 @@ function handleSetConfig(id: string, cfg: Record<string, unknown>): Response {
       const err = e as { status: number; msg: string };
       return json({ error: err.msg }, err.status);
     }
-    // 0.1.0 agent 的 Intervals 是 deny_unknown_fields：带 diskio 会让它解析响应失败
-    if (getServer(id).agentVersion === "0.1.0" && next.intervals) {
+    // <=0.1.1 的 agent Intervals 是 deny_unknown_fields（不认识 diskio）；
+    // 版本未知（还没上报过）也按不认识处理，宁可不下发
+    const ver = getServer(id).agentVersion.split(".").map(Number);
+    const knowsDiskio = ver.length === 3 && ver.every((n) => !isNaN(n)) &&
+      (ver[0] > 0 || ver[1] > 1 || (ver[1] === 1 && ver[2] >= 2));
+    if (!knowsDiskio && next.intervals) {
       delete (next.intervals as unknown as Record<string, unknown>).diskio;
     }
   }
@@ -727,7 +740,7 @@ const PAGE = `<!doctype html>
       <button data-view="dash" class="on">监控</button>
       <button data-view="reports">上报记录</button>
       <button data-view="config">配置</button>
-      <button data-view="cfview">CF 预览</button>
+      <button data-view="cfview">协议预览</button>
       <button data-view="example">上报样例</button>
       <button data-view="cfgex">配置样例</button>
     </div>
@@ -773,7 +786,8 @@ var serverLatest = {};    // server_id -> serversView 条目（异步快照兜�
 function cfMb(b) { return b == null ? null : Math.floor(b / 1048576); }
 function cfRound2(v) { return v == null ? null : Math.round(v * 100) / 100; }
 function cfLoad(l) { return l ? l.map(function (x) { return x.toFixed(2); }).join(' ') : null; }
-function cfBody(r) {
+/* 收集一条上报的最新值（报文自带 + 服务端快照兜底），CF/komari 换算共用 */
+function gatherLatest(r) {
   var rep = r.report || {};
   var st = rep.static || serverStatics[r.server_id] || {};
   var view = serverLatest[r.server_id] || {};
@@ -792,6 +806,13 @@ function cfBody(r) {
   if (!gpus.length && view.gpu_latest) gpus = [view.gpu_latest];
   if (!dio && view.diskio_latest) dio = view.diskio_latest;
   (view.ping_list || []).forEach(function (p) { if (!pings[p.name]) pings[p.name] = p; });
+  return { rep: rep, st: st, dyn: dyn, last: last, slow: slow, gpus: gpus, pings: pings, dio: dio };
+}
+
+function cfBody(r) {
+  var g = gatherLatest(r);
+  var rep = g.rep, st = g.st, last = g.last, slow = g.slow, gpus = g.gpus, pings = g.pings, dio = g.dio;
+  var dyn = g.dyn;
   function pingOf(names) {
     for (var i = 0; i < names.length; i++) {
       var p = pings[names[i]];
@@ -865,6 +886,59 @@ function cfBody(r) {
   var out = { id: r.server_id, secret: '<API_SECRET>', metrics: m };
   if (samples.length) out.samples = samples;
   return out;
+}
+
+/* komari 协议换算（镜像 reporter_komari.rs）：JSON-RPC 2.0 通知帧 */
+function komariFrames(r) {
+  var g = gatherLatest(r);
+  var rep = g.rep, st = g.st, last = g.last, slow = g.slow, gpus = g.gpus;
+  var network = {};
+  if (last.net_tx_speed != null) network.up = last.net_tx_speed;
+  if (last.net_rx_speed != null) network.down = last.net_rx_speed;
+  if (last.net_tx != null) network.totalUp = last.net_tx;
+  if (last.net_rx != null) network.totalDown = last.net_rx;
+  var report = {
+    cpu: { usage: cfRound2(last.cpu_usage) || 0 },
+    ram: { total: st.mem_total || 0, used: last.mem_used || 0 },
+    swap: { total: st.swap_total || 0, used: last.swap_used || 0 },
+    disk: { total: st.disk_total || 0, used: (slow && slow.disk_used) || 0 },
+    network: network,
+    uptime: st.boot_time ? Math.max(0, Math.floor((r.received_at - st.boot_time) / 1000)) : 0,
+    process: (slow && slow.processes) || 0,
+    message: (rep.errors || []).map(function (e) { return '[' + e.source + '] ' + e.msg; }).join('; '),
+  };
+  if (last.load) report.load = { load1: last.load[0], load5: last.load[1], load15: last.load[2] };
+  if (slow) report.connections = { tcp: slow.tcp_conn || 0, udp: slow.udp_conn || 0 };
+  if (gpus.length) {
+    var sum = 0, n = 0;
+    gpus.forEach(function (x) { if (x.usage != null) { sum += x.usage; n++; } });
+    report.gpu = {
+      count: gpus.length,
+      average_usage: n ? sum / n : 0,
+      detailed_info: gpus.map(function (x) {
+        return {
+          name: x.name,
+          memory_total: x.mem_total || 0,
+          memory_used: x.mem_used || 0,
+          utilization: x.usage || 0,
+          temperature: x.temp || 0,
+        };
+      }),
+    };
+  }
+  var info = {
+    cpu_name: st.cpu_name || '', cpu_cores: st.cpu_cores || 0,
+    cpu_physical_cores: st.cpu_physical_cores || 0, arch: st.arch || '',
+    os: st.os || '', kernel_version: st.kernel || '',
+    ipv4: st.ipv4 || '', ipv6: st.ipv6 || '',
+    mem_total: st.mem_total || 0, swap_total: st.swap_total || 0, disk_total: st.disk_total || 0,
+    gpu_name: st.gpu_name || '', virtualization: st.virtualization || '',
+    version: 'probe-rs_' + (st.agent_version || '?'),
+  };
+  return {
+    report: { jsonrpc: '2.0', method: 'agent.report', params: { report: report } },
+    basic_info: { jsonrpc: '2.0', method: 'agent.basicInfo', params: { info: info } },
+  };
 }
 
 /* CF 配置下发串预览（对齐 CF 服务端 buildAgentConfig 的输出格式） */
@@ -1525,8 +1599,9 @@ function renderConfig(data) {
   });
 }
 
-/* ---- CF 预览视图：每台机器展示换算后的 CF 请求体 + 配置下发串 ----
+/* ---- 协议预览视图：每台机器按子 tab 展示 probe / CF / komari 报文 ----
    servers 可传 WS 推送的最新视图（避免每次推送重复拉取） */
+var protoSub = 'cf';   // 协议预览的子 tab：probe | cf | komari
 function renderCfView(servers) {
   var reportsP = fetch('/api/reports').then(function (r) { return r.json(); });
   var serversP = servers
@@ -1536,44 +1611,72 @@ function renderCfView(servers) {
     var servers = res[0], reports = res[1];
     var app = document.getElementById('app');
     app.textContent = '';
-    document.getElementById('summary').textContent = 'CF 协议视角（由 probe 报文实时换算）';
+    document.getElementById('summary').textContent = '三种协议视角（CF/komari 由 probe 报文实时换算）';
+
+    /* 子 tab：probe / CF / komari */
+    var sub = el('div', 'seg');
+    sub.style.marginBottom = '14px';
+    [['probe', 'probe（原生）'], ['cf', 'CF /update'], ['komari', 'komari WS']].forEach(function (def) {
+      var b = el('button', null, def[1]);
+      b.type = 'button';
+      b.dataset.sub = def[0];
+      b.classList.toggle('on', protoSub === def[0]);
+      b.onclick = function () { protoSub = def[0]; renderCfView(servers); };
+      sub.append(b);
+    });
+    app.append(sub);
+
     servers.forEach(function (s) {
       if (s.static) serverStatics[s.server_id] = s.static;
       serverLatest[s.server_id] = s;
       var card = el('div', 'card' + (s.online ? '' : ' offline'));
       var head = el('div', 'card-head');
+      var endpoint = { probe: 'POST /report', cf: 'POST /update', komari: 'WS v2 JSON-RPC' }[protoSub];
       head.append(
         el('span', 'dot ' + (s.online ? 'on' : 'off')),
         el('span', 'name', s.server_id),
-        el('span', 'meta', 'POST /update 预览'));
+        el('span', 'meta', endpoint + ' 预览'));
       card.append(head);
 
-      /* 请求体：取该机器最近一条上报换算 */
+      /* 该机器最近一条上报 */
       var latest = reports.find(function (r) { return r.server_id === s.server_id; });
       var g1 = el('div', 'cfg-groups');
       var b1 = el('div', 'cfg-group');
-      b1.append(el('h3', null, '请求体（最近一条上报换算' + (latest ? '，#' + latest.seq : '') + '）'));
-      b1.append(el('pre', 'code', latest
-        ? JSON.stringify(cfBody(latest), null, 2)
-        : '（暂无上报记录）'));
+      var title = protoSub === 'probe' ? '上报报文' : protoSub === 'cf' ? '请求体' : 'WS 帧（basicInfo + report）';
+      b1.append(el('h3', null, title + '（最近一条上报换算' + (latest ? '，#' + latest.seq : '') + '）'));
+      if (!latest) {
+        b1.append(el('pre', 'code', '（暂无上报记录）'));
+      } else if (protoSub === 'probe') {
+        b1.append(el('pre', 'code', JSON.stringify(latest.report, null, 2)));
+      } else if (protoSub === 'cf') {
+        b1.append(el('pre', 'code', JSON.stringify(cfBody(latest), null, 2)));
+      } else {
+        var kf = komariFrames(latest);
+        b1.append(el('pre', 'code',
+          JSON.stringify(kf.basic_info, null, 2) + String.fromCharCode(10) + String.fromCharCode(10)
+          + JSON.stringify(kf.report, null, 2)));
+        b1.append(el('div', 'note', 'komari 无 ts/批量/配置下发语义：只报最新值；下行方法（exec/terminal 等）一律不实现。'));
+      }
       g1.append(b1);
+      card.append(g1);
 
-      /* 配置下发：当前生效配置 → CF URL-encoded 响应 */
-      var body = cfConfigString((s.static || {}).config || {});
-      var g2 = el('div', 'cfg-groups');
-      var b2 = el('div', 'cfg-group');
-      b2.append(el('h3', null, '配置下发（CF 响应格式）'));
-      b2.append(el('pre', 'code',
-        'HTTP 200（配置 MD5 不一致时；一致则 204 No Content）' + String.fromCharCode(10)
-        + 'X-Agent-Config-Schema: 3' + String.fromCharCode(10)
-        + 'X-Agent-Config-Md5: <md5(下方配置串)>' + String.fromCharCode(10)
-        + 'Content-Type: application/x-www-form-urlencoded' + String.fromCharCode(10)
-        + String.fromCharCode(10)
-        + body));
-      b2.append(el('div', 'note', '流量校正在配置串尾部追加 rx_correction/tx_correction（不参与 MD5），确认由 agent 独立请求回传。'));
-      g2.append(b2);
-
-      card.append(g1, g2);
+      /* CF 子 tab 额外展示配置下发 */
+      if (protoSub === 'cf') {
+        var body = cfConfigString((s.static || {}).config || {});
+        var g2 = el('div', 'cfg-groups');
+        var b2 = el('div', 'cfg-group');
+        b2.append(el('h3', null, '配置下发（CF 响应格式）'));
+        b2.append(el('pre', 'code',
+          'HTTP 200（配置 MD5 不一致时；一致则 204 No Content）' + String.fromCharCode(10)
+          + 'X-Agent-Config-Schema: 3' + String.fromCharCode(10)
+          + 'X-Agent-Config-Md5: <md5(下方配置串)>' + String.fromCharCode(10)
+          + 'Content-Type: application/x-www-form-urlencoded' + String.fromCharCode(10)
+          + String.fromCharCode(10)
+          + body));
+        b2.append(el('div', 'note', '流量校正在配置串尾部追加 rx_correction/tx_correction（不参与 MD5），确认由 agent 独立请求回传。'));
+        g2.append(b2);
+        card.append(g2);
+      }
       app.append(card);
     });
     if (!servers.length) app.append(el('div', 'empty', '暂无服务器数据'));

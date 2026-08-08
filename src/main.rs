@@ -5,6 +5,7 @@ mod model;
 mod netstatic;
 mod reporter;
 mod reporter_cf;
+mod reporter_komari;
 mod scheduler;
 mod worker;
 
@@ -45,7 +46,7 @@ async fn main() -> Result<()> {
         reporter::Reporter::new(&local.worker_url, &local.secret, AGENT_VERSION)
             .context("reporter 初始化失败")?,
     );
-    let (shared, intervals_rx, config_rx) = SharedConfig::new(local, config_path.clone());
+    let (shared, intervals_rx, config_rx) = SharedConfig::new(local.clone(), config_path.clone());
     let buffers = Arc::new(buffer::Buffers::new());
     let net = netstatic::NetStatic::load(&net_static_path);
     let shutdown = Arc::new(Notify::new());
@@ -78,6 +79,20 @@ async fn main() -> Result<()> {
         worker::slow::spawn(Arc::clone(&shared), intervals_rx.clone());
     let (_diskio_handle, diskio_rx) =
         worker::diskio::spawn(intervals_rx.clone(), Arc::clone(&buffers));
+
+    // komari 模式：WS worker（v2 JSON-RPC）；其余协议不建通道
+    let (komari_tx, _komari_handle) = if local.protocol == "komari" {
+        let (tx, rx) = tokio::sync::watch::channel(worker::komari::KomariOut::default());
+        let h = worker::komari::spawn(
+            local.worker_url.clone(),
+            local.secret.clone(),
+            rx,
+            Arc::clone(&buffers),
+        );
+        (Some(tx), Some(h))
+    } else {
+        (None, None)
+    };
 
     let init_cfg = shared.get();
     let mut ping_worker = (!init_cfg.pings.is_empty()).then(|| {
@@ -185,6 +200,7 @@ async fn main() -> Result<()> {
         diskio_rx,
         Arc::clone(&shutdown),
         AGENT_VERSION.to_string(),
+        komari_tx,
     );
 
     let shutdown_trigger = Arc::clone(&shutdown);

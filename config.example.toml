@@ -7,8 +7,10 @@ secret = "change-me"
 worker_url = "https://monitor.example.com/report"
 net_static_path = "/var/lib/probe-rs/net_static.json"
 # 协议类型："probe"（默认，REPORT.md 协议）| "cf"（CF-Server-Monitor 的 POST /update）
+#        | "komari"（komari 面板的 WS v2 JSON-RPC）
 # 仅本地修改，重启生效。CF 模式下：server_id 填 CF 后台分配的 UUID，
-# secret 填 API_SECRET，worker_url 填 https://<worker>/update
+# secret 填 API_SECRET，worker_url 填 https://<worker>/update。
+# komari 模式下：secret 填面板的 API token，worker_url 填面板地址（https://<panel>）
 protocol = "probe"
 
 # ===== 本地或远端均可修改（本地热加载 ~3s；远端便车下发即时） =====

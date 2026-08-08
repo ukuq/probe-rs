@@ -162,6 +162,7 @@ sudo ./deploy/install.sh       # 装二进制/unit/示例配置；已装过则�
 - 首次安装需先编辑配置填 `server_id` / `secret` / `worker_url`，再 `systemctl enable --now probe-rs`
 - unit 加固：`ProtectSystem=strict` + `ReadWritePaths=/var/lib/probe-rs /etc/probe-rs`（后者因远端配置要回写 config.toml）；未来启用 ICMP ping 时解开 `AmbientCapabilities=CAP_NET_RAW`
 - 卸载：`./deploy/install.sh uninstall`（保留配置与数据，加 `--purge` 全清）
+- 一键脚本（换 URL 即可装，参数对齐各官方探针）：CF 模式 `deploy/cf-install.sh`（-id/-secret/-url/-ct/-cu/-cm/-bd）；komari 模式 `deploy/komari-install.sh`（-e 面板地址/-t token/-i 间隔，缺省 collect=1 report=3 对齐官方节奏）
 
 ## CF 协议模式（protocol = "cf"）
 
@@ -174,3 +175,13 @@ agent 可切换为 CF-Server-Monitor 的 `POST /update` 协议（适配官方服
 **配置下发**：请求头 `X-Agent-Config-Schema: 3` + `X-Agent-Config-Md5`（复用 `config_version` 字段存 MD5，空 = `none`）。响应 204 = 无变更；200 + URL-encoded body → 解析 collect_interval/report_interval/reset_day/custom_ct/cu/cm/bd/interface，合成 `RemoteConfig`（config_version 取响应头 MD5）走 `apply_remote` 同一条热应用管线。CF 未覆盖的字段（ping/slow/gpu/ip 子间隔、enable_gpu、report_*、ext.*）保持现值，仅本地可改。
 
 **流量校正**：响应尾部 `rx_correction/tx_correction`（GB，覆盖当月累计）。netstatic 记账期偏移（offset = 校正字节 − 原始月累计，period_start 匹配才生效，翻页自动失效），立即落盘；校正确认用**独立请求**回传（CF 服务端见到 correction 字段会把整个请求当确认、丢弃 metrics），服务端清空后停止。`ext.cf.correction = false` 时整个回路忽略。`update=1`（自升级）永远忽略。
+
+## komari 协议模式（protocol = "komari"）
+
+对接 komari 面板的 WS v2 JSON-RPC（`/api/clients/v2/rpc?token=<secret>`，worker_url 填面板地址）。
+
+- **上行**：`agent.report`（最新值快照，字节单位；无 ts/批量语义，断线期间数据不保留）+ `agent.basicInfo`（连接建立与 static 刷新时）；errors 事件拼进 report 的 `message` 字段
+- **下行**：不执行任何服务端调用，但**友好回绝**（不干等）：exec → POST task/result "Remote control is disabled."(exit -1)；terminal → 拨终端 WS 发说明即关闭（否则面板空转 30s）；ping 任务 → 回 agent.pingResult value=-1。我们从不调 agent.pull 声明能力
+- komari 的月流量由面板自算；ping 为服务端任务制，我们的 `[[pings]]` 在该模式下无落点；无配置下发通道（配置仅本地）
+- **保活**：komari 服务端读超时 11s 且只有数据帧续期（ping 无效）→ 心跳为每 5s 重发最新 report 文本帧
+- 映射见 reporter_komari.rs（纯函数）；WS 机械（重连/心跳/下行忽略）在 worker/komari.rs
