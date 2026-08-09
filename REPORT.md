@@ -11,6 +11,10 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
 | Content-Type | `application/json` |
 | `X-Secret` | 服务器密钥（认证，不出现在 body） |
 | `X-Agent-Version` | agent 版本号 |
+| `X-Reporter-Id` | 当前独立上报实例 id（百分号编码）；缺席兼容为 `primary` |
+| `X-Reporter-Protocol` | 当前 Reporter 协议（百分号编码）；原始协议通常为 `probe` |
+
+服务端应以 `server_id + X-Reporter-Id` 区分上报实例。这样同一 `server_id` 的多个原始协议 Reporter 不会串数据或共用远端配置；旧服务端可以安全忽略新增请求头。
 
 ## 完整报文示例
 
@@ -35,7 +39,7 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
     "boot_time": 1754300000000,
     "ipv4": "203.0.113.10",
     "ipv6": "2001:db8::10",
-    "agent_version": "0.1.0",
+    "agent_version": "0.1.3-beta.1",
     "config": {
       "reset_day": 1,
       "intervals": { "collect": 10, "report": 60, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
@@ -118,10 +122,10 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
 | `reset_day` | number | 0-31 |
 | `intervals` | object | {collect, report, ping, slow, gpu, ip, diskio}（秒） |
 | `interfaces` | string[] | 网卡白名单（glob）；空 = 所有非虚拟网卡 |
-| `enable_gpu` | boolean | GPU 采集开关 |
+| `enable_gpu` | boolean | 当前 Reporter 是否输出 GPU（沿用 wire 字段名；实际 worker 由本地全局 `enable_gpu` 控制） |
 | `report_errors` | boolean | 是否上报 errors 错误事件 |
 | `report_self` | boolean | 是否上报探针自身占用 kind:"self" |
-| `pings` | array | 探测目标组：`[{name, target, interval?}]` |
+| `pings` | array | 当前 Reporter 选中的全局探测目标：`[{name, target, interval?}]` |
 | `ext` | object | 协议扩展 `{cf: {correction, batch}}`（仅 cf 协议生效） |
 
 ## dynamic 记录字段（每条 = 一次 collect tick）
@@ -150,7 +154,7 @@ kind 按数据语义划分（DESIGN.md §2.3"机制同类、语义分流"）：s
 | `ping` | `name`, `rtt`, `loss` | 探测结果：name = `[[pings]]` 组 key；rtt 毫秒，**-1 = 失败**；loss 0-100 |
 | `slow` | `disk_used`, `tcp_conn`, `udp_conn`, `processes` | 慢变指标（disk_used 与 disk_total 同口径；TCP 全状态计数） |
 | `gpu` | `name`, `usage`, `mem_total`, `mem_used`, `temp` | GPU 型号、利用率（0-100）、显存（字节）、温度（℃）；多卡时每卡一条；mem/temp 仅 nvidia 路径有，macOS 为 null |
-| `self` | `cpu_usage`, `mem_rss` | 探针自身 CPU（单核 %）与常驻内存（字节）；`report_self=true` 才产生（默认 false） |
+| `self` | `cpu_usage`, `mem_rss` | 探针自身 CPU（单核 %）与常驻内存（字节）；始终随 slow worker 采集，`report_self=true` 的 Reporter 才输出 |
 | `diskio` | `read_bps`, `write_bps`, `read_iops`, `write_iops`, `await_ms`, `util` | 磁盘 IO（整盘合计）：bps 字节/秒、await 毫秒、util %；首轮差值无前值为 null；macOS 无 util（恒 null） |
 
 约定：
@@ -181,16 +185,12 @@ kind 按数据语义划分（DESIGN.md §2.3"机制同类、语义分流"）：s
 {
   "config": {
     "config_version": "2026-08-06T16:00:00.000+08:00",
+    "report_interval": 60,
     "reset_day": 15,
-    "intervals": {
-      "collect": 10,
-      "report": 60,
-      "ping": 30,
-      "slow": 60,
-      "gpu": 60,
-      "ip": 600,
-      "diskio": 10
-    }
+    "interfaces": ["eth*"],
+    "report_gpu": true,
+    "report_errors": true,
+    "report_self": false
   }
 }
 ```
@@ -198,28 +198,21 @@ kind 按数据语义划分（DESIGN.md §2.3"机制同类、语义分流"）：s
 | 字段 | 约束 |
 |---|---|
 | `config_version` | 与 agent 当前版本**不等**才应用（幂等；人类可读时间戳无可靠大小语义，故用不等判断） |
+| `report_interval` | 当前 Reporter 的上报间隔（秒），>= 1；与全局 collect 无任何关系约束 |
 | `reset_day` | 账期重置日 1-31；0 = 不重置 |
-| `intervals.collect` | 采样间隔（秒），>= 1；CF 的 0 输入兼容映射为 1 |
-| `intervals.report` | 上报间隔（秒），>= 1；与 collect 无任何关系约束 |
-| `intervals.ping` | 探测间隔（秒），>= 1；`[[pings]]` 组未设 interval 时的默认 |
-| `intervals.slow` | 慢变指标采集间隔（秒），>= 1，缺省 60 |
-| `intervals.gpu` | GPU 采集间隔（秒），>= 1，缺省 60 |
-| `intervals.ip` | 公网 IP 查询间隔（秒），>= 1，缺省 600 |
-| `intervals.diskio` | 磁盘 IO 采集间隔（秒），>= 1，缺省 10 |
 | `interfaces` | 可选；网卡白名单（glob 数组） |
-| `enable_gpu` | 可选；GPU 采集开关（布尔） |
+| `report_gpu` | 可选；当前 Reporter 是否输出 GPU（布尔） |
 | `report_errors` | 可选；是否上报 errors 错误事件（布尔，缺省 true） |
 | `report_self` | 可选；是否上报探针自身资源占用 kind:"self"（布尔，缺省 false） |
-| `pings` | 可选；探测目标组数组，整体替换：`[{name, target, interval?}]`，name 唯一键不可重复 |
 | `ext` | 可选；协议扩展 `{cf: {correction?, batch?}}`，仅对应协议启用时生效 |
 
-`config` 内全部字段可选：出现的才应用，缺席的保持现值。pings/interfaces/enable_gpu 应用后由配置 supervisor 重建对应 worker（即时）。
+`config` 内除 `config_version` 外的字段均可选：出现的才应用，缺席的保持现值。响应只修改产生该响应的 Reporter，不会影响其他上报线路。
 
 配置收在 `config` 一级（信封后续可扩展其他指令）；`config` 缺席表示无变更。
 
-agent 行为：校验 `config_version` 与基本合法性（间隔 >= 1、reset_day 0-31），全部通过才应用并落盘；任何一项非法则整体拒绝并记录日志。应用后立即生效，无需重启。
+agent 行为：校验 `config_version` 与基本合法性（report_interval >= 1、reset_day 0-31），全部通过才应用并落盘；任何一项非法则整体拒绝并记录日志。应用后立即生效，无需重启。
 
-**🔒 不允许远端修改**：`server_id` / `secret` / `worker_url` / `net_static_path`（身份与安全边界，只接受本地配置）。
+**🔒 不允许远端修改**：连接身份 `id` / `protocol` / `server_id` / `secret` / `worker_url`，以及全局实际采集配置 `net_static_path` / `intervals` / `enable_gpu` / `pings`。这些字段只接受本地配置。
 
 ## 服务端判定规则（约定）
 

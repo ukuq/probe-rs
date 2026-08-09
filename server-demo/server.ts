@@ -8,7 +8,7 @@
  *   GET  /api/servers       全部服务器最新数据 JSON
  *   GET  /api/reports       最近收到的原始上报（debug 用）
  *   GET  /ws                面板 WebSocket 实时推送
- *   POST /api/config/:id    设置待下发配置，下次上报时随响应便车下发
+ *   POST /api/config/:instance_id  设置该 Reporter 的待下发配置
  *
  * 运行: deno run --allow-net server.ts [PORT]   默认 8080，密钥见 SECRET
  */
@@ -33,13 +33,13 @@ interface PingTarget {
 
 interface RemoteConfig {
   config_version: string; // 人类可读的 UTC+8 时间戳；与 agent 当前值不等才应用
-  intervals?: Intervals;
+  report_interval?: number;
   reset_day?: number;
   interfaces?: string[];
-  enable_gpu?: boolean;
-  pings?: PingTarget[];
+  report_gpu?: boolean;
   report_errors?: boolean;
   report_self?: boolean;
+  ext?: { cf?: { correction?: boolean; batch?: boolean } };
 }
 
 interface StaticInfo {
@@ -153,6 +153,10 @@ interface Report {
 // ---------- 存储（全内存，演示定位） ----------
 
 interface ServerState {
+  instanceId: string;
+  reporterId: string;
+  protocol: string;
+  serverId: string;
   staticInfo: StaticInfo | null;
   /** agent 版本（X-Agent-Version 头），用于下发兼容判断 */
   agentVersion: string;
@@ -166,6 +170,9 @@ interface ServerState {
 interface RawReport {
   seq: number;
   received_at: number;
+  instance_id: string;
+  reporter_id: string;
+  protocol: string;
   server_id: string;
   report: Report;
 }
@@ -195,10 +202,32 @@ function broadcast(): void {
   }
 }
 
-function getServer(id: string): ServerState {
-  let s = servers.get(id);
+function reporterInstanceId(reporterId: string, serverId: string): string {
+  return JSON.stringify([reporterId, serverId]);
+}
+
+function decodeReporterHeader(value: string | null, fallback: string): string {
+  if (!value) return fallback;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function getServer(
+  instanceId: string,
+  reporterId: string,
+  protocol: string,
+  serverId: string,
+): ServerState {
+  let s = servers.get(instanceId);
   if (!s) {
     s = {
+      instanceId,
+      reporterId,
+      protocol,
+      serverId,
       staticInfo: null,
       agentVersion: "",
       dynamic: [],
@@ -207,31 +236,56 @@ function getServer(id: string): ServerState {
       lastSeen: 0,
       configVersion: "",
     };
-    servers.set(id, s);
+    servers.set(instanceId, s);
   }
   return s;
+}
+
+function resolveInstanceId(routeId: string): string | null {
+  let decoded = routeId;
+  try {
+    decoded = decodeURIComponent(routeId);
+  } catch {
+    return null;
+  }
+  if (servers.has(decoded)) return decoded;
+  const matches = [...servers.values()].filter((s) => s.serverId === decoded);
+  if (matches.length === 1) return matches[0].instanceId;
+  return matches.find((s) => s.reporterId === "primary")?.instanceId ?? null;
 }
 
 // ---------- 协议处理 ----------
 
 function handleReport(req: Request, report: Report): Response {
-  const id = report.server_id;
-  if (!id) return json({ error: "missing server_id" }, 400);
+  const serverId = report.server_id;
+  if (!serverId) return json({ error: "missing server_id" }, 400);
   if (req.headers.get("x-secret") !== SECRET) {
     return json({ error: "bad secret" }, 401);
   }
+  const reporterId = decodeReporterHeader(
+    req.headers.get("x-reporter-id"),
+    "primary",
+  );
+  const protocol = decodeReporterHeader(
+    req.headers.get("x-reporter-protocol"),
+    "probe",
+  );
+  const instanceId = reporterInstanceId(reporterId, serverId);
 
   rawReports.push({
     seq: ++reportSeq,
     received_at: Date.now(),
-    server_id: id,
+    instance_id: instanceId,
+    reporter_id: reporterId,
+    protocol,
+    server_id: serverId,
     report,
   });
   if (rawReports.length > KEEP_REPORTS) {
     rawReports.splice(0, rawReports.length - KEEP_REPORTS);
   }
 
-  const s = getServer(id);
+  const s = getServer(instanceId, reporterId, protocol, serverId);
   s.lastSeen = Date.now();
   s.agentVersion = req.headers.get("x-agent-version") ?? s.agentVersion;
   s.configVersion = report.config_version ?? "";
@@ -259,20 +313,23 @@ function handleReport(req: Request, report: Report): Response {
 
   // 组装响应信封：config 缺席 = 无变更；next.static = 强制下次带 static（一次性）
   const resp: { config?: RemoteConfig; next?: { static: boolean } } = {};
-  const pending = pendingConfig.get(id);
+  const pending = pendingConfig.get(instanceId);
   if (pending && pending.config_version !== s.configVersion) {
-    pendingConfig.delete(id);
+    pendingConfig.delete(instanceId);
     resp.config = pending;
     console.log(
-      `[config] 下发到 ${id}: ${
+      `[config] 下发到 ${serverId}/${reporterId}: ${
         s.configVersion || "(无版本)"
       } -> ${pending.config_version}`,
       pending,
     );
   }
-  if (needStatic.delete(id)) {
+  const autoStatic = !s.staticInfo && !report.static;
+  if (needStatic.delete(instanceId) || autoStatic) {
     resp.next = { static: true };
-    console.log(`[static] 要求 ${id} 下次上报带 static`);
+    if (!autoStatic) {
+      console.log(`[static] 要求 ${serverId}/${reporterId} 下次上报带 static`);
+    }
   }
   return json(resp);
 }
@@ -289,74 +346,28 @@ function newConfigVersion(): string {
     }+08:00`;
 }
 
-function handleSetConfig(id: string, cfg: Record<string, unknown>): Response {
+function handleSetConfig(
+  instanceId: string,
+  cfg: Record<string, unknown>,
+): Response {
+  const state = servers.get(instanceId);
+  if (!state) return json({ error: "Reporter 实例不存在" }, 404);
   const {
-    collect,
-    report,
-    ping,
-    slow,
-    gpu,
-    ip,
-    diskio,
+    report_interval,
     reset_day,
     interfaces,
-    enable_gpu,
-    pings,
+    report_gpu,
     report_errors,
     report_self,
+    cf_correction,
+    cf_batch,
   } = cfg;
-  // intervals：7 项任一提供即整体下发；未提供的按该机器 static 回执的当前值补齐
-  const hasAnyInterval = [collect, report, ping, slow, gpu, ip, diskio].some((
-    v,
-  ) => v !== undefined);
   const next: Partial<RemoteConfig> = {};
-  if (hasAnyInterval) {
-    const curIv = getServer(id).staticInfo?.config?.intervals;
-    if (
-      !curIv &&
-      (collect === undefined || report === undefined || ping === undefined)
-    ) {
-      return json({
-        error:
-          "该机器还没有 static 回执，部分下发 intervals 请至少提供 collect/report/ping",
-      }, 400);
+  if (report_interval !== undefined) {
+    if (!Number.isInteger(report_interval) || (report_interval as number) < 1) {
+      return json({ error: "report_interval 必须为 >=1 的整数" }, 400);
     }
-    const fill = (
-      v: unknown,
-      cur: number | undefined,
-      def: number,
-      name: string,
-    ) => {
-      if (v !== undefined) {
-        if (!Number.isInteger(v) || (v as number) < 1) {
-          throw { status: 400, msg: `intervals.${name} 必须为 >=1 的整数` };
-        }
-        return v as number;
-      }
-      return cur ?? def;
-    };
-    try {
-      next.intervals = {
-        collect: fill(collect, curIv?.collect, 10, "collect"),
-        report: fill(report, curIv?.report, 60, "report"),
-        ping: fill(ping, curIv?.ping, 30, "ping"),
-        slow: fill(slow, curIv?.slow, 60, "slow"),
-        gpu: fill(gpu, curIv?.gpu, 60, "gpu"),
-        ip: fill(ip, curIv?.ip, 600, "ip"),
-        diskio: fill(diskio, curIv?.diskio, 10, "diskio"),
-      };
-    } catch (e) {
-      const err = e as { status: number; msg: string };
-      return json({ error: err.msg }, err.status);
-    }
-    // <=0.1.1 的 agent Intervals 是 deny_unknown_fields（不认识 diskio）；
-    // 版本未知（还没上报过）也按不认识处理，宁可不下发
-    const ver = getServer(id).agentVersion.split(".").map(Number);
-    const knowsDiskio = ver.length === 3 && ver.every((n) => !isNaN(n)) &&
-      (ver[0] > 0 || ver[1] > 1 || (ver[1] === 1 && ver[2] >= 2));
-    if (!knowsDiskio && next.intervals) {
-      delete (next.intervals as unknown as Record<string, unknown>).diskio;
-    }
+    next.report_interval = report_interval as number;
   }
   if (reset_day !== undefined) {
     if (
@@ -380,11 +391,11 @@ function handleSetConfig(id: string, cfg: Record<string, unknown>): Response {
     }
     next.interfaces = interfaces as string[];
   }
-  if (enable_gpu !== undefined) {
-    if (typeof enable_gpu !== "boolean") {
-      return json({ error: "enable_gpu 必须为布尔值" }, 400);
+  if (report_gpu !== undefined) {
+    if (typeof report_gpu !== "boolean") {
+      return json({ error: "report_gpu 必须为布尔值" }, 400);
     }
-    next.enable_gpu = enable_gpu;
+    next.report_gpu = report_gpu;
   }
   if (report_errors !== undefined) {
     if (typeof report_errors !== "boolean") {
@@ -398,44 +409,48 @@ function handleSetConfig(id: string, cfg: Record<string, unknown>): Response {
     }
     next.report_self = report_self;
   }
-  if (pings !== undefined) {
-    if (!Array.isArray(pings)) return json({ error: "pings 必须为数组" }, 400);
-    const names = new Set<string>();
-    for (const p of pings as PingTarget[]) {
-      if (!p || typeof p.name !== "string" || !p.name.trim()) {
-        return json({ error: "pings 存在空 name" }, 400);
-      }
-      if (typeof p.target !== "string" || !p.target.trim()) {
-        return json({ error: `pings ${p.name} 的 target 为空` }, 400);
-      }
-      if (names.has(p.name)) {
-        return json({ error: `pings name 重复: ${p.name}` }, 400);
-      }
-      names.add(p.name);
-      if (
-        p.interval !== undefined &&
-        (!Number.isInteger(p.interval) || p.interval < 1)
-      ) {
-        return json({ error: `pings ${p.name} 的 interval 必须 >= 1` }, 400);
-      }
+  const cf: { correction?: boolean; batch?: boolean } = {};
+  if (cf_correction !== undefined) {
+    if (typeof cf_correction !== "boolean") {
+      return json({ error: "cf_correction 必须为布尔值" }, 400);
     }
-    next.pings = pings as PingTarget[];
+    cf.correction = cf_correction;
   }
+  if (cf_batch !== undefined) {
+    if (typeof cf_batch !== "boolean") {
+      return json({ error: "cf_batch 必须为布尔值" }, 400);
+    }
+    cf.batch = cf_batch;
+  }
+  if (Object.keys(cf).length) next.ext = { cf };
   if (
-    !hasAnyInterval && reset_day === undefined && interfaces === undefined &&
-    enable_gpu === undefined && pings === undefined &&
-    report_errors === undefined && report_self === undefined
+    report_interval === undefined && reset_day === undefined &&
+    interfaces === undefined && report_gpu === undefined &&
+    report_errors === undefined && report_self === undefined &&
+    cf_correction === undefined && cf_batch === undefined
   ) {
     return json({ error: "没有可下发的字段" }, 400);
   }
-  const pending: Partial<RemoteConfig> = pendingConfig.get(id) ?? {};
+  const pending: Partial<RemoteConfig> = pendingConfig.get(instanceId) ?? {};
+  const mergedExt = pending.ext || next.ext
+    ? {
+      cf: {
+        ...(pending.ext?.cf ?? {}),
+        ...(next.ext?.cf ?? {}),
+      },
+    }
+    : undefined;
   const merged: RemoteConfig = {
     ...pending,
     ...next,
+    ...(mergedExt ? { ext: mergedExt } : {}),
     config_version: newConfigVersion(),
   } as RemoteConfig;
-  pendingConfig.set(id, merged);
-  console.log(`[config] ${id} 待下发:`, merged);
+  pendingConfig.set(instanceId, merged);
+  console.log(
+    `[config] ${state.serverId}/${state.reporterId} 待下发:`,
+    merged,
+  );
   return json({ ok: true, pending: merged });
 }
 
@@ -443,16 +458,20 @@ function handleSetConfig(id: string, cfg: Record<string, unknown>): Response {
 
 function serversView() {
   const now = Date.now();
-  return [...servers.entries()].map(([id, s]) => {
+  return [...servers.entries()].map(([instanceId, s]) => {
     const recent = s.dynamic.slice(-150);
     const asyncs = s.asyncs.slice(-300);
     const pings = asyncs.filter((a) => a.kind === "ping");
     return {
-      server_id: id,
+      instance_id: instanceId,
+      reporter_id: s.reporterId,
+      protocol: s.protocol,
+      server_id: s.serverId,
+      agent_version: s.agentVersion,
       online: now - s.lastSeen < 90_000,
       last_seen: s.lastSeen,
       config_version: s.configVersion,
-      pending_config: pendingConfig.get(id) ?? null,
+      pending_config: pendingConfig.get(instanceId) ?? null,
       static: s.staticInfo,
       dynamic_count: s.dynamic.length,
       async_count: s.asyncs.length,
@@ -473,6 +492,9 @@ function reportsView() {
   return rawReports.slice(-KEEP_REPORTS).reverse().map((r) => ({
     seq: r.seq,
     received_at: r.received_at,
+    instance_id: r.instance_id,
+    reporter_id: r.reporter_id,
+    protocol: r.protocol,
     server_id: r.server_id,
     has_static: !!r.report.static,
     dynamic_count: r.report.dynamic?.length ?? 0,
@@ -504,7 +526,9 @@ Deno.serve({ port: PORT }, async (req) => {
   }
   const nsMatch = url.pathname.match(/^\/api\/need-static\/([^/]+)$/);
   if (req.method === "POST" && nsMatch) {
-    needStatic.add(nsMatch[1]);
+    const instanceId = resolveInstanceId(nsMatch[1]);
+    if (!instanceId) return json({ error: "Reporter 实例不存在" }, 404);
+    needStatic.add(instanceId);
     return json({
       ok: true,
       note: "下次该 agent 上报时响应将带 next.static=true",
@@ -513,7 +537,9 @@ Deno.serve({ port: PORT }, async (req) => {
   const cfgMatch = url.pathname.match(/^\/api\/config\/([^/]+)$/);
   if (req.method === "POST" && cfgMatch) {
     try {
-      return handleSetConfig(cfgMatch[1], await req.json());
+      const instanceId = resolveInstanceId(cfgMatch[1]);
+      if (!instanceId) return json({ error: "Reporter 实例不存在" }, 404);
+      return handleSetConfig(instanceId, await req.json());
     } catch {
       return json({ error: "invalid json" }, 400);
     }
@@ -725,7 +751,7 @@ const PAGE = `<!doctype html>
   .cfg-status { color: var(--orange); font-size: 12px; }
   .cfg-hint { color: var(--text3); font-size: 11.5px; margin-left: auto; }
   /* 样例 */
-  .example .note { color: var(--text2); font-size: 12px; margin-top: 10px; }
+  .note { color: var(--text2); font-size: 12px; margin-top: 10px; }
   .example .cm { color: var(--text3); }
 </style></head><body>
 <div class="window">
@@ -780,17 +806,19 @@ document.getElementById('theme-btn').onclick = function () {
 
 /* ---- CF 协议换算（对齐 agent 端 reporter_cf.rs；CF 预览 tab 用） ----
    注意：这是 agent 线协议映射的 JS 镜像，改 reporter_cf.rs 时需同步 */
-var CF_COMPAT_VERSION = '1.3.8'; // 同步 reporter_cf.rs 的 CF_COMPAT_VERSION
-var serverStatics = {};   // server_id -> 最新 static
-var serverLatest = {};    // server_id -> serversView 条目（异步快照兜底用）
+var CF_COMPAT_VERSION = '0.0.0'; // 同步 reporter_cf.rs 的 CF_COMPAT_VERSION
+var serverStatics = {};   // instance_id -> 最新 static
+var serverLatest = {};    // instance_id -> serversView 条目（异步快照兜底用）
 function cfMb(b) { return b == null ? null : Math.floor(b / 1048576); }
 function cfRound2(v) { return v == null ? null : Math.round(v * 100) / 100; }
 function cfLoad(l) { return l ? l.map(function (x) { return x.toFixed(2); }).join(' ') : null; }
 /* 收集一条上报的最新值（报文自带 + 服务端快照兜底），CF/komari 换算共用 */
 function gatherLatest(r) {
   var rep = r.report || {};
-  var st = rep.static || serverStatics[r.server_id] || {};
-  var view = serverLatest[r.server_id] || {};
+  var key = r.instance_id || r.server_id;
+  var st = rep.static || serverStatics[key] || {};
+  var view = serverLatest[key] || {};
+  if (!st.agent_version && view.agent_version) st = Object.assign({}, st, { agent_version: view.agent_version });
   var dyn = rep.dynamic || [];
   var last = dyn.length ? dyn[dyn.length - 1] : {};
   var slow = null, gpus = [], pings = {}, dio = null;
@@ -968,6 +996,8 @@ function fmtHM(ts) { var d = new Date(ts); return pad2(d.getHours())+':'+pad2(d.
 /* 配置版本展示：UTC+8 时间戳字符串缩短为 "08-06 15:30:45"，其他原样 */
 function fmtVer(v) { if (v == null || v === '') return '–'; var s = String(v);
   return /^\\d{4}-\\d{2}-\\d{2}T/.test(s) ? s.slice(5, 19).replace('T', ' ') : s; }
+function instanceKey(x) { return x.instance_id || x.server_id; }
+function reporterTag(x) { return (x.reporter_id || 'primary') + ' / ' + (x.protocol || 'probe'); }
 /* 展示归并（前端职责）：取每字段最近的非 null 值 */
 function mergeLatest(recent) {
   var d = {};
@@ -1143,7 +1173,7 @@ function render(data) {
   var app = document.getElementById('app');
   app.textContent = '';
   var online = data.filter(function (s) { return s.online; }).length;
-  document.getElementById('summary').textContent = '在线 ' + online + ' / ' + data.length;
+  document.getElementById('summary').textContent = '在线 Reporter ' + online + ' / ' + data.length;
   if (!data.length) {
     var e = el('div', 'empty');
     e.append(el('p', null, '暂无服务器数据'), el('code', null, 'probe-rs -c config.toml'));
@@ -1157,7 +1187,8 @@ function render(data) {
     head.append(
       el('span', 'dot ' + (s.online ? 'on' : 'off')),
       el('span', 'name', s.server_id),
-      el('span', 'meta', [st.os, st.arch, 'agent v' + (st.agent_version || '?'), 'cfg ' + fmtVer(s.config_version)].filter(Boolean).join(' · ')));
+      el('span', 'badge', reporterTag(s)),
+      el('span', 'meta', [st.os, st.arch, 'agent v' + (st.agent_version || s.agent_version || '?'), 'cfg ' + fmtVer(s.config_version)].filter(Boolean).join(' · ')));
     if (s.pending_config) head.append(el('span', 'badge', '待下发 ' + fmtVer(s.pending_config.config_version)));
     card.append(head);
     var tiles = el('div', 'tiles');
@@ -1267,7 +1298,7 @@ function rptRow(r) {
   row.append(
     el('span', 'rpt-seq', '#' + r.seq),
     el('span', 'rpt-time', fmtTime(r.received_at)),
-    el('span', 'rpt-id', r.server_id),
+    el('span', 'rpt-id', r.server_id + ' · ' + reporterTag(r)),
     el('span', 'rpt-sum', sum));
   row.onclick = function () { selectReport(r.seq); };
   return row;
@@ -1284,7 +1315,7 @@ function selectReport(seq) {
   var r = rptData[seq];
   if (!r) return;
   detail.append(
-    el('div', 'd-head', '#' + seq + ' · ' + r.server_id + ' · ' + new Date(r.received_at).toLocaleString('zh-CN')),
+    el('div', 'd-head', '#' + seq + ' · ' + r.server_id + ' · ' + reporterTag(r) + ' · ' + new Date(r.received_at).toLocaleString('zh-CN')),
     el('pre', 'code', JSON.stringify(r.report, null, 2)));
 }
 
@@ -1293,7 +1324,7 @@ function renderReports(list) {
   if (!document.getElementById('rpt-list')) {
     app.textContent = '';
     var bar = el('div', 'rpt-bar');
-    bar.append(el('span', 'lab', '机器'));
+    bar.append(el('span', 'lab', 'Reporter 实例'));
     var sel = el('select'); sel.id = 'rpt-filter';
     var optAll = el('option', null, '全部'); optAll.value = ''; sel.append(optAll);
     sel.onchange = function () { rptFilter = sel.value; rebuildRptList(); };
@@ -1311,8 +1342,9 @@ function renderReports(list) {
     rptKnown[r.seq] = 1;
     rptData[r.seq] = r;
     var exists = false;
-    Array.prototype.forEach.call(sel.options, function (o) { if (o.value === r.server_id) exists = true; });
-    if (!exists) { var o = el('option', null, r.server_id); o.value = r.server_id; sel.append(o); }
+    var key = instanceKey(r);
+    Array.prototype.forEach.call(sel.options, function (o) { if (o.value === key) exists = true; });
+    if (!exists) { var o = el('option', null, r.server_id + ' · ' + reporterTag(r)); o.value = key; sel.append(o); }
   });
   rebuildRptList();
 }
@@ -1326,22 +1358,20 @@ function rebuildRptList() {
   var shown = 0;
   seqs.forEach(function (seq) {
     var r = rptData[seq];
-    if (rptFilter && r.server_id !== rptFilter) return;
+    if (rptFilter && instanceKey(r) !== rptFilter) return;
     var row = rptRow(r);
     row.classList.toggle('sel', seq === rptSelected);
     listEl.append(row);
     shown++;
   });
-  if (!shown) listEl.append(el('div', 'empty', rptFilter ? '该机器暂无上报记录' : '暂无上报记录'));
+  if (!shown) listEl.append(el('div', 'empty', rptFilter ? '该 Reporter 暂无上报记录' : '暂无上报记录'));
   else if (rptSelected == null || !rptData[rptSelected]
-      || (rptFilter && rptData[rptSelected].server_id !== rptFilter)) {
+      || (rptFilter && instanceKey(rptData[rptSelected]) !== rptFilter)) {
     selectReport(rptData[Number(listEl.firstChild.dataset.seq)].seq);
   }
 }
 
-/* ---- 配置编辑：每项一个「更新」勾选框，勾中才可编辑；未勾选项保持现值 ----
-   intervals 特例：6 项里勾选任意一项即整体下发（collect/report/ping 必填，
-   未勾选的按 static 里当前生效值补齐；slow/gpu/ip 缺省 60/60/600） */
+/* ---- Reporter 配置编辑。全局采集周期与 Ping 定义只读，不能由上报端下发。 ---- */
 var cfgFormActive = false;  // 编辑中暂停 WS 重渲染，避免表单被上报推送刷掉
 
 function cfgGroup(title, rows) {
@@ -1362,7 +1392,6 @@ function cfgEditForm(s, st) {
   var groups = el('div', 'cfg-groups');
   wrap.append(groups);
   var items = [];
-  var intItems = {};
   function group(title) {
     var g = el('div', 'cfg-group');
     g.append(el('h3', null, title));
@@ -1398,22 +1427,27 @@ function cfgEditForm(s, st) {
   }
   function sec(v) { return v != null ? v + ' s' : '–'; }
 
-  var gCollect = group('采集');
-  var gReport = group('上报');
-  var gAsync = group('异步');
-  [['collect', '采样间隔 collect', gCollect],
-   ['report', '上报间隔 report', gReport],
-   ['ping', '探测 ping', gAsync],
-   ['slow', '慢变指标 slow', gAsync],
-   ['gpu', 'GPU gpu', gAsync],
-   ['ip', '公网 IP ip', gAsync],
-   ['diskio', '磁盘 IO diskio', gAsync]].forEach(function (def) {
-    var k = def[0], inp = numInput(iv[k], 1);
-    editRow(def[2], def[1], sec(iv[k]), inp, function () {});
-    intItems[k] = { cb: items[items.length - 1].cb, inp: inp };
-  });
+  var gIdentity = group('Reporter 实例（连接信息只读）');
+  plainRow(gIdentity, 'Reporter ID', s.reporter_id || 'primary');
+  plainRow(gIdentity, '协议 protocol', s.protocol || 'probe');
+  plainRow(gIdentity, '服务器 server_id', s.server_id);
+  plainRow(gIdentity, '当前接收入口', location.origin + '/report');
+  plainRow(gIdentity, '认证 secret', '••••••（不展示）');
+  plainRow(gIdentity, 'net_static_path', '本地私有，协议不回传');
+
+  var gCollect = group('全局实际采集（只读）');
+  [['collect', '采样 collect'], ['ping', '探测 ping'], ['slow', '慢变 slow'],
+   ['gpu', 'GPU gpu'], ['ip', '公网 IP ip'], ['diskio', '磁盘 IO diskio']]
+    .forEach(function (def) { plainRow(gCollect, def[1], sec(iv[def[0]])); });
+  var gReport = group('Reporter 上报策略');
+  editRow(gReport, '上报间隔 report_interval', sec(iv.report), numInput(iv.report, 1),
+    function (p, inp) {
+      var v = Number(inp.value);
+      if (!Number.isInteger(v) || v < 1) throw 'report_interval 必须 >= 1';
+      p.report_interval = v;
+    });
   plainRow(gReport, '配置版本 config_version', fmtVer(s.config_version));
-  editRow(gCollect, '流量重置日 reset_day',
+  editRow(gReport, '流量重置日 reset_day',
     cf.reset_day != null ? (cf.reset_day === 0 ? '不重置' : '每月 ' + cf.reset_day + ' 号') : '–',
     numInput(cf.reset_day, 0, 31),
     function (p, inp) {
@@ -1422,17 +1456,30 @@ function cfgEditForm(s, st) {
       p.reset_day = v;
     });
 
-  var gBool = group('开关');
-  [['enable_gpu', 'GPU 采集 enable_gpu'],
-   ['report_errors', '错误上报 report_errors'],
-   ['report_self', '自身占用 report_self']].forEach(function (def) {
+  var gBool = group('Reporter 输出开关');
+  [['report_gpu', 'enable_gpu', 'GPU 输出 report_gpu'],
+   ['report_errors', 'report_errors', '错误上报 report_errors'],
+   ['report_self', 'report_self', '自身占用 report_self']].forEach(function (def) {
     var sel = el('select');
     [['true', '开'], ['false', '关']].forEach(function (o) {
       var opt = el('option', null, o[1]); opt.value = o[0]; sel.append(opt);
     });
-    if (cf[def[0]] != null) sel.value = String(cf[def[0]]);
-    var cur = cf[def[0]] == null ? '–' : (cf[def[0]] ? '开' : '关');
-    editRow(gBool, def[1], cur, sel, function (p, inp) { p[def[0]] = inp.value === 'true'; });
+    if (cf[def[1]] != null) sel.value = String(cf[def[1]]);
+    var cur = cf[def[1]] == null ? '–' : (cf[def[1]] ? '开' : '关');
+    editRow(gBool, def[2], cur, sel, function (p, inp) { p[def[0]] = inp.value === 'true'; });
+  });
+
+  var cfExt = ((cf.ext || {}).cf) || {};
+  var gCf = group('CF 扩展 ext.cf（仅 protocol=cf 生效）');
+  [['cf_correction', '流量校正 correction', cfExt.correction],
+   ['cf_batch', '批量 samples batch', cfExt.batch]].forEach(function (def) {
+    var sel = el('select');
+    [['true', '开'], ['false', '关']].forEach(function (o) {
+      var opt = el('option', null, o[1]); opt.value = o[0]; sel.append(opt);
+    });
+    if (def[2] != null) sel.value = String(def[2]);
+    var cur = def[2] == null ? '–' : (def[2] ? '开' : '关');
+    editRow(gCf, def[1], cur, sel, function (p, inp) { p[def[0]] = inp.value === 'true'; });
   });
 
   var gIface = group('网卡 interfaces');
@@ -1445,49 +1492,19 @@ function cfgEditForm(s, st) {
     p.interfaces = inp.value.split(',').map(function (x) { return x.trim(); }).filter(Boolean);
   });
 
-  var gPing = group('探测目标 pings（勾选后整体替换）');
-  var pingHead = el('div', 'cfg-item plain');
-  var pingLab = el('label', 'lab');
-  var pingCb = el('input'); pingCb.type = 'checkbox';
-  pingLab.append(pingCb, el('span', null, '更新 pings'));
-  var pingCur = Array.isArray(cf.pings) && cf.pings.length
-    ? cf.pings.map(function (p) { return p.name; }).join(', ')
-    : '（空）';
-  pingHead.append(pingLab, el('span', 'cur', pingCur));
-  gPing.append(pingHead);
-  var pingRows = el('div', 'cfg-pings');
-  gPing.append(pingRows);
-  function addPingRow(name, target, interval) {
-    var r = el('div', 'ping-row');
-    var n = el('input'); n.placeholder = 'name';
-    var t = el('input'); t.placeholder = 'host[:port] / https://…';
-    var i = el('input'); i.type = 'number'; i.min = '1'; i.placeholder = '间隔 s';
-    if (name) n.value = name;
-    if (target) t.value = target;
-    if (interval != null) i.value = interval;
-    var del = el('button', 'ping-del', '✕'); del.type = 'button'; del.title = '删除';
-    del.onclick = function () { r.remove(); };
-    [n, t, i].forEach(function (x) { x.disabled = !pingCb.checked; });
-    r.append(n, t, i, del);
-    pingRows.append(r);
-  }
-  pingCb.onchange = function () {
-    Array.prototype.forEach.call(pingRows.querySelectorAll('input'), function (x) {
-      x.disabled = !pingCb.checked;
+  var gPing = group('全局探测目标（只读）');
+  if (Array.isArray(cf.pings) && cf.pings.length) {
+    cf.pings.forEach(function (p) {
+      plainRow(gPing, p.name, p.target + (p.interval != null ? ' · ' + sec(p.interval) : ''));
     });
-  };
-  var prefill = (Array.isArray(cf.pings) && cf.pings.length ? cf.pings
-    : (s.pending_config && s.pending_config.pings)) || [];
-  if (prefill.length) prefill.forEach(function (p) { addPingRow(p.name, p.target, p.interval); });
-  else addPingRow();
-  var addBtn = el('button', 'btn ping-add', '＋ 添加目标'); addBtn.type = 'button';
-  addBtn.onclick = function () { addPingRow(); };
-  gPing.append(addBtn);
+  } else {
+    plainRow(gPing, 'pings', '（当前 Reporter 不输出探测结果）');
+  }
 
   var gStatic = group('静态（只读）');
   plainRow(gStatic, 'static 刷新周期', '600 s（固定）');
   plainRow(gStatic, 'static 采集于', st.ts ? new Date(st.ts).toLocaleString('zh-CN') : '–');
-  plainRow(gStatic, 'agent 版本', 'v' + (st.agent_version || '?'));
+  plainRow(gStatic, 'agent 版本', 'v' + (st.agent_version || s.agent_version || '?'));
 
   var foot = el('div', 'cfg-foot');
   var btn = el('button', 'btn primary', '下发配置'); btn.type = 'button';
@@ -1496,46 +1513,14 @@ function cfgEditForm(s, st) {
   wrap.append(foot);
   wrap.addEventListener('focusin', function () { cfgFormActive = true; });
 
-  var INT_KEYS = ['collect', 'report', 'ping', 'slow', 'gpu', 'ip', 'diskio'];
-  var INT_DEFAULT = { slow: 60, gpu: 60, ip: 600, diskio: 10 };
-  function buildIntervals() {
-    if (!INT_KEYS.some(function (k) { return intItems[k].cb.checked; })) return null;
-    var out = {};
-    INT_KEYS.forEach(function (k) {
-      var it = intItems[k];
-      var v = it.cb.checked ? Number(it.inp.value)
-        : (iv[k] != null ? iv[k] : INT_DEFAULT[k]);
-      if (!Number.isInteger(v) || v < 1) {
-        throw k + ' 无法确定：请勾选并填写（或等 static 上报当前生效值）';
-      }
-      out[k] = v;
-    });
-    return out;
-  }
-
   btn.onclick = function () {
     var payload = {};
     try {
-      var ints = buildIntervals();
-      if (ints) INT_KEYS.forEach(function (k) { payload[k] = ints[k]; });
       items.forEach(function (it) { if (it.cb.checked) it.apply(payload); });
-      if (pingCb.checked) {
-        var ps = [];
-        Array.prototype.forEach.call(pingRows.children, function (r) {
-          var ins = r.querySelectorAll('input');
-          var name = ins[0].value.trim(), target = ins[1].value.trim(), intv = ins[2].value.trim();
-          if (!name && !target) return;
-          if (!name || !target) throw 'pings 存在只填了一半的行（name/target 必填）';
-          var p = { name: name, target: target };
-          if (intv) p.interval = Number(intv);
-          ps.push(p);
-        });
-        payload.pings = ps;
-      }
     } catch (e) { status.textContent = String(e.message || e); return; }
     if (!Object.keys(payload).length) { status.textContent = '没有勾选任何更新项'; return; }
     btn.disabled = true;
-    fetch('/api/config/' + encodeURIComponent(s.server_id), {
+    fetch('/api/config/' + encodeURIComponent(instanceKey(s)), {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
     }).then(function (r) {
       return r.json().then(function (body) { return { ok: r.ok, body: body }; });
@@ -1553,11 +1538,35 @@ function cfgEditForm(s, st) {
 }
 
 /* ---- 配置视图 ---- */
+function reporterTopology(data) {
+  var card = el('div', 'card');
+  var head = el('div', 'card-head');
+  head.append(el('span', 'name', '多路上报拓扑'),
+    el('span', 'meta', '按 server_id 汇总当前 Demo 已观察到的 Reporter'));
+  card.append(head);
+  var byServer = {};
+  data.forEach(function (s) { (byServer[s.server_id] = byServer[s.server_id] || []).push(s); });
+  var groups = el('div', 'cfg-groups');
+  Object.keys(byServer).sort().forEach(function (serverId) {
+    var routes = byServer[serverId].slice().sort(function (a, b) {
+      return String(a.reporter_id).localeCompare(String(b.reporter_id));
+    });
+    groups.append(cfgGroup(serverId, routes.map(function (s) {
+      return [s.reporter_id || 'primary', (s.protocol || 'probe') + ' · ' + (s.online ? '在线' : '离线')
+        + ' · report ' + ((((s.static || {}).config || {}).intervals || {}).report ?? '–') + 's'];
+    })));
+  });
+  card.append(groups, el('div', 'note',
+    '这里只列出向本 Demo 上报的实例；发往外部 CF/Komari 面板的线路不会向本服务泄露连接地址或密钥。新增、删除 Reporter 属于本地安全配置，不能远端下发。'));
+  return card;
+}
+
 function renderConfig(data) {
   var app = document.getElementById('app');
   app.textContent = '';
-  document.getElementById('summary').textContent = data.length + ' 台服务器';
+  document.getElementById('summary').textContent = data.length + ' 路 Reporter';
   if (!data.length) { app.append(el('div', 'empty', '暂无服务器数据')); return; }
+  app.append(reporterTopology(data));
   data.forEach(function (s) {
     var st = s.static || {};
     var card = el('div', 'card' + (s.online ? '' : ' offline'));
@@ -1565,13 +1574,14 @@ function renderConfig(data) {
     head.append(
       el('span', 'dot ' + (s.online ? 'on' : 'off')),
       el('span', 'name', s.server_id),
-      el('span', 'meta', 'agent v' + (st.agent_version || '?')),
+      el('span', 'badge', reporterTag(s)),
+      el('span', 'meta', 'agent v' + (st.agent_version || s.agent_version || '?')),
       el('span', 'meta', 'cfg ' + fmtVer(s.config_version)));
     if (s.pending_config) head.append(el('span', 'badge', '待下发 ' + fmtVer(s.pending_config.config_version)));
     var spacer = el('span', 'spacer');
     var refreshBtn = el('button', 'btn', '↻ 刷新 static'); refreshBtn.type = 'button';
     refreshBtn.onclick = function () {
-      fetch('/api/need-static/' + encodeURIComponent(s.server_id), { method: 'POST' });
+      fetch('/api/need-static/' + encodeURIComponent(instanceKey(s)), { method: 'POST' });
       refreshBtn.textContent = '已安排 ✓';
       setTimeout(function () { refreshBtn.textContent = '↻ 刷新 static'; }, 3000);
     };
@@ -1580,16 +1590,16 @@ function renderConfig(data) {
     if (s.pending_config) {
       var p = s.pending_config;
       var rows = [['config_version', fmtVer(s.config_version) + ' → ' + fmtVer(p.config_version)]];
-      if (p.intervals) {
-        rows.push(['collect / report', p.intervals.collect + 's / ' + p.intervals.report + 's'],
-          ['ping/slow/gpu/ip/diskio', p.intervals.ping + 's / ' + (p.intervals.slow ?? '–') + 's / ' + (p.intervals.gpu ?? '–') + 's / ' + (p.intervals.ip ?? '–') + 's / ' + (p.intervals.diskio ?? '–') + 's']);
-      }
+      if (p.report_interval != null) rows.push(['report_interval', p.report_interval + 's']);
       if (p.reset_day != null) rows.push(['reset_day', String(p.reset_day)]);
       if (p.interfaces) rows.push(['interfaces', p.interfaces.join(', ') || '(空)']);
-      if (p.enable_gpu != null) rows.push(['enable_gpu', String(p.enable_gpu)]);
+      if (p.report_gpu != null) rows.push(['report_gpu', String(p.report_gpu)]);
       if (p.report_errors != null) rows.push(['report_errors', String(p.report_errors)]);
       if (p.report_self != null) rows.push(['report_self', String(p.report_self)]);
-      if (p.pings) rows.push(['pings', p.pings.map(function (x) { return x.name; }).join(', ') || '(清空)']);
+      if (p.ext && p.ext.cf) {
+        if (p.ext.cf.correction != null) rows.push(['ext.cf.correction', String(p.ext.cf.correction)]);
+        if (p.ext.cf.batch != null) rows.push(['ext.cf.batch', String(p.ext.cf.batch)]);
+      }
       var pendWrap = el('div', 'cfg-groups');
       pendWrap.append(cfgGroup('⚠ 待下发（下次上报生效）', rows));
       card.append(pendWrap);
@@ -1627,19 +1637,20 @@ function renderCfView(servers) {
     app.append(sub);
 
     servers.forEach(function (s) {
-      if (s.static) serverStatics[s.server_id] = s.static;
-      serverLatest[s.server_id] = s;
+      if (s.static) serverStatics[instanceKey(s)] = s.static;
+      serverLatest[instanceKey(s)] = s;
       var card = el('div', 'card' + (s.online ? '' : ' offline'));
       var head = el('div', 'card-head');
       var endpoint = { probe: 'POST /report', cf: 'POST /update', komari: 'WS v2 JSON-RPC' }[protoSub];
       head.append(
         el('span', 'dot ' + (s.online ? 'on' : 'off')),
         el('span', 'name', s.server_id),
+        el('span', 'badge', reporterTag(s)),
         el('span', 'meta', endpoint + ' 预览'));
       card.append(head);
 
       /* 该机器最近一条上报 */
-      var latest = reports.find(function (r) { return r.server_id === s.server_id; });
+      var latest = reports.find(function (r) { return instanceKey(r) === instanceKey(s); });
       var g1 = el('div', 'cfg-groups');
       var b1 = el('div', 'cfg-group');
       var title = protoSub === 'probe' ? '上报报文' : protoSub === 'cf' ? '请求体' : 'WS 帧（basicInfo + report）';
@@ -1704,14 +1715,14 @@ var EXAMPLE_JSON5 = \`{
     "boot_time": 1754300000000,             // ms 时间戳
     "ipv4": "203.0.113.10",                 // 查询失败保留旧值
     "ipv6": "2001:db8::10",                 // 可选；无 v6 出口为 null
-    "agent_version": "0.1.0",
+    "agent_version": "0.1.3-beta.1",
     "config": {                             // 当前生效配置（供服务端展示/核对）
       "reset_day": 1,                       // 月流量账期重置日 0-31；0 = 不重置
       "intervals": {                        // 各间隔（秒），完全独立无关系约束
         "collect": 10, "report": 60, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10
       },
       "interfaces": ["eth*"],               // 网卡白名单（glob）；空 = 所有非虚拟网卡
-      "enable_gpu": true,                   // GPU 采集开关
+      "enable_gpu": true,                   // 当前 Reporter 是否输出 GPU（wire 字段沿用旧名）
       "report_errors": true,                // 是否上报 errors 错误事件
       "report_self": false,                 // 是否上报探针自身占用 kind:"self"
       "pings": [                            // 探测目标组
@@ -1761,37 +1772,52 @@ var EXAMPLE_JSON5 = \`{
 }\`;
 
 var CONFIG_EXAMPLE_JSON5 = \`{
-  // ===== 🔒 不可远端修改（身份与安全边界） =====
-  "server_id": "srv-01",            // 🔒 服务器 ID
-  "secret": "change-me",            // 🔒 认证密钥，经 X-Secret 头发送
-  "worker_url": "https://monitor.example.com/report",   // 🔒 上报地址
-  "net_static_path": "/var/lib/probe-rs/net_static.json",   // 🔒 netstatic 流量时序落盘路径
-
-  // ===== 本地或远端均可修改（本地热加载 ~3s；远端便车下发即时） =====
-  "reset_day": 1,                   // 月流量账期重置日 1-31；0 = 不重置（永久累计）
-  "intervals": {                    // 各间隔完全独立，无任何关系约束
-    "collect": 10,                  // 采样间隔（秒）
-    "report": 60,                   // 上报间隔（秒）；report < collect 时多余上报只是空数组心跳
-    "ping": 30,                     // 探测默认间隔；[[pings]] 组未设 interval 时生效
-    "slow": 60,                     // 慢变指标（磁盘/连接数/进程数）采集间隔
+  // ===== 全局实际采集 / 异步 worker（只接受本地配置） =====
+  "net_static_path": "/var/lib/probe-rs/net_static.json",   // netstatic 流量时序落盘路径
+  "enable_gpu": true,               // 是否实际启动 GPU worker
+  "intervals": {                    // 这里只放采集周期，不含 report
+    "collect": 1,                   // 同步采样间隔（秒）
+    "ping": 30,                     // [[pings]] 未设 interval 时的默认值
+    "slow": 60,                     // 慢变指标 + 探针自身占用采集间隔
     "gpu": 60,                      // GPU 采集间隔
     "ip": 600,                      // 公网 IP 查询间隔
-    "diskio": 10                    // 磁盘 IO 采集间隔（macOS 走 ioreg 子进程建议 >= 10）
+    "diskio": 10                    // 磁盘 IO 采集间隔
   },
-  "interfaces": [],                 // 网卡白名单（glob，如 "eth*"）；空 = 所有非虚拟网卡
-  "enable_gpu": false,              // GPU 采集开关（nvidia-smi；macOS 用 ioreg）
-  "report_errors": true,            // 是否上报 errors 错误事件
-  "report_self": false,             // 是否上报探针自身资源占用 kind:"self"
-  "pings": [                        // 探测目标组：name 为唯一键（远端下发时 name 不可重复）
-    {
-      "name": "ct",
-      "target": "gd-ct-dualstack.ip.zstaticcdn.com:80",   // http(s):// 开头 → HTTP；否则 TCP（host[:port]，默认 80）
-      "interval": 30                // 可选；缺省跟随 intervals.ping
-    },
-    { "name": "baidu", "target": "https://www.baidu.com", "interval": 60 }
+  "pings": [                        // 全局实际探测任务；name 唯一
+    { "name": "ct", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 },
+    { "name": "cu", "target": "gd-cu-dualstack.ip.zstaticcdn.com:80", "interval": 30 }
   ],
 
-  "config_version": ""              // 配置版本（机制维护，远端下发幂等用，勿手改）；UTC+8 可读时间戳字符串，不等才应用
+  // ===== 所有连接都是独立 Reporter；不存在特殊的根部 primary 配置 =====
+  "reporters": [
+    {
+      "id": "primary", "protocol": "cf",                // id 只需在本文件内唯一
+      "server_id": "cf-panel-uuid", "secret": "cf-api-secret",
+      "worker_url": "https://cf.example.com/update", "config_version": "",
+      "report_interval": 30,        // 此 Reporter 自己的上报周期
+      "reset_day": 1, "interfaces": [],
+      "report_gpu": true,           // 只过滤输出；不会启停全局 GPU worker
+      "report_errors": true, "report_self": false,
+      "ping_names": ["ct", "cu"], // 缺席 = 全部全局 Ping；[] = 一个也不输出
+      "ext": { "cf": { "correction": true, "batch": true } }
+    },
+    {
+      "id": "komari", "protocol": "komari",
+      "server_id": "srv-01", "secret": "komari-token",
+      "worker_url": "https://komari.example.com", "config_version": "",
+      "report_interval": 1, "reset_day": 12, "interfaces": [],
+      "report_gpu": true, "report_errors": true, "report_self": false,
+      "ping_names": []
+    },
+    {
+      "id": "local-demo", "protocol": "probe",
+      "server_id": "srv-01", "secret": "change-me",
+      "worker_url": "http://127.0.0.1:8080/report", "config_version": "",
+      "report_interval": 1, "reset_day": 1, "interfaces": [],
+      "report_gpu": true, "report_errors": true, "report_self": true
+      // ping_names 缺席，因此本路输出全部全局 Ping
+    }
+  ]
 }\`;
 
 var RESPONSE_EXAMPLE_JSON5 = \`// 无配置变更时：200 OK，body 为 {} 或空
@@ -1801,23 +1827,15 @@ var RESPONSE_EXAMPLE_JSON5 = \`// 无配置变更时：200 OK，body 为 {} 或�
 {
   "config": {                       // 配置收在一级；信封后续可扩展其他指令（如动作类）
     "config_version": "2026-08-06T16:00:00.000+08:00",   // 与 agent 当前版本不等才应用（幂等）
+    "report_interval": 30,          // 可选；只改当前 Reporter 的上报周期，>= 1
     "reset_day": 15,                // 可选；账期重置日 1-31；0 = 不重置
-    "intervals": {                  // 各项 >= 1 秒，相互无任何关系约束
-      "collect": 10,                // 采样间隔
-      "report": 60,                 // 上报间隔
-      "ping": 30,                   // 探测默认间隔（[[pings]] 组未设 interval 时生效）
-      "slow": 60,                   // 慢变指标采集间隔
-      "gpu": 60,                    // GPU 采集间隔
-      "ip": 600,                    // 公网 IP 查询间隔
-      "diskio": 10                  // 磁盘 IO 采集间隔
-    },
     "interfaces": ["eth*"],         // 可选；网卡白名单（glob）
-    "enable_gpu": true,             // 可选；GPU 采集开关
+    "report_gpu": true,             // 可选；只控制当前 Reporter 是否输出 GPU
     "report_errors": false,         // 可选；是否上报 errors 错误事件
     "report_self": true,            // 可选；是否上报探针自身资源占用 kind:"self"
-    "pings": [                      // 可选；探测目标组（整体替换；name 唯一键，不可重复）
-      { "name": "ct", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 }
-    ]
+    "ext": {                        // 可选；协议扩展，只写出现的子项
+      "cf": { "correction": true, "batch": true }
+    }
   },
   "next": {                         // 可选；对下一次上报的指令
     "static": true                  // 为 true 时 agent 下次上报强制带 static（一次性）
@@ -1845,12 +1863,12 @@ function renderExample() {
   document.getElementById('summary').textContent = 'POST /report 请求与响应（JSON5 注释版）';
   app.append(
     annotatedCard(EXAMPLE_JSON5, '//', [
-      '请求头：X-Secret（认证）、X-Agent-Version。',
+      '请求头：X-Secret（认证）、X-Agent-Version，以及用于多路隔离的 X-Reporter-Id / X-Reporter-Protocol（百分号编码；旧服务端可忽略）。',
       '上报失败时 agent 有界保留（10 条）待重发——只覆盖短暂抖动，长断网历史不补发；服务端收到延迟记录按 ts 去重排序即可。',
     ]),
     annotatedCard(RESPONSE_EXAMPLE_JSON5, '//', [
-      'agent 行为：整体校验（config_version 不等才应用、间隔 >= 1、reset_day 0-31），全部通过才应用并落盘、立即生效；任何一项非法则整体拒绝并记录日志。',
-      '🔒 不允许远端修改：server_id / secret / worker_url / net_static_path。',
+      'agent 行为：整体校验（config_version 不等才应用、report_interval >= 1、reset_day 0-31），全部通过才应用并落盘、立即生效；任何一项非法则整体拒绝并记录日志。',
+      '🔒 全局 intervals / enable_gpu / pings 以及连接身份只接受本地配置；远端响应只修改产生该响应的 Reporter。',
     ]));
 }
 
@@ -1859,14 +1877,15 @@ function renderConfigExample() {
   app.textContent = '';
   document.getElementById('summary').textContent = 'agent 本地配置（JSON5 注释版）';
   app.append(annotatedCard(CONFIG_EXAMPLE_JSON5, '//', [
-    '实际配置文件为 TOML（仓库根目录 config.example.toml），此处以 JSON5 等价展示。🔒 标记的字段不允许远端修改；「本地或远端均可」字段两条通道都热生效（本地热加载 ~3s / 远端便车即时）。',
+    '实际配置文件为 TOML（仓库根目录 config.example.toml），此处以 JSON5 等价展示。全局采集配置只接受本地修改；Reporter 输出策略可由本地或所属上报端修改。',
+    'reporters[] 等价于多个 [[reporters]]，包括惯例命名为 primary 的首路。每路有独立周期、游标、ACK、重试和远端配置版本，采集 worker 全局只运行一份。',
   ]));
 }
 
 function loadReports() {
   // 同时拉 servers（CF 视角换算需要各机最新 static）
   fetch('/api/servers').then(function (r) { return r.json(); }).then(function (data) {
-    data.forEach(function (s) { if (s.static) serverStatics[s.server_id] = s.static; });
+    data.forEach(function (s) { if (s.static) serverStatics[instanceKey(s)] = s.static; });
   }).catch(function () {});
   fetch('/api/reports').then(function (r) { return r.json(); }).then(renderReports).catch(function () {});
 }

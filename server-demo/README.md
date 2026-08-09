@@ -13,7 +13,7 @@ deno run --allow-net server.ts 9000   # 指定端口
 
 ## 面板
 
-每服务器一张卡片：
+每个 Reporter 实例一张卡片；同一 `server_id` 的多路原始协议上报独立展示、独立下发配置：
 
 - **KPI 磁贴**：CPU / 内存 / 磁盘（带用量 meter，>70% 黄 >90% 红）、下行 /
   上行网速、连接数
@@ -29,28 +29,32 @@ deno run --allow-net server.ts 9000   # 指定端口
 
 | 接口                          | 说明                                                     |
 | ----------------------------- | -------------------------------------------------------- |
-| `POST /report`                | agent 上报，头 `X-Secret: change-me`；响应携带待下发配置 |
+| `POST /report`                | agent 上报；含认证、版本与 Reporter 身份头，响应携带该实例的待下发配置 |
 | `GET /`                       | 监控面板（3s 自动刷新）                                  |
-| `GET /api/servers`            | 全部服务器最新数据 JSON                                  |
-| `POST /api/config/:server_id` | 设置待下发配置，下次上报时随响应便车下发                 |
+| `GET /api/servers`            | 全部 Reporter 实例最新数据 JSON                           |
+| `POST /api/config/:instance_id` | 设置该 Reporter 的待下发配置；`instance_id` 由 `/api/servers` 返回 |
 
 ## 演示流程
 
 1. 启动服务端：`deno run --allow-net server.ts`
-2. 配置
-   agent（`config.toml`）：`worker_url = "http://127.0.0.1:8080/report"`、`secret = "change-me"`
+2. 在 agent 的 `config.toml` 中增加一条 `[[reporters]]`：`protocol = "probe"`、
+   `worker_url = "http://127.0.0.1:8080/report"`、`secret = "change-me"`
 3. 启动 agent：`probe-rs -c config.toml`，面板上出现数据
 4. 下发配置（演示远端热更新）：
 
 ```bash
-curl -X POST localhost:8080/api/config/服务器ID \
-  -d '{"collect":5,"report":10,"ping":15,"reset_day":1}'
+curl -X POST localhost:8080/api/config/URL编码后的instance_id \
+  -H 'Content-Type: application/json' \
+  -d '{"report_interval":10,"reset_day":1,"report_gpu":true}'
 ```
 
-服务端校验基本合法性（间隔 >= 1、reset_day 0-31）→ 下次上报随响应下发 → agent
-原子应用、重建 ticker 并落盘，面板上的 `cfg v` 版本号随之 +1。
+服务端校验基本合法性（report_interval >= 1、reset_day 0-31）→ 下次上报随响应下发 → agent
+原子应用该 Reporter 配置并落盘，面板上的 `cfg v` 版本号随之更新。全局采集周期、GPU worker
+开关和 Ping 定义只能在本地 TOML 修改。
 
 ## 注意
 
 - 数据全在内存，重启即丢（演示定位，不接数据库）
 - 全局单一密钥 `change-me`，生产应按 server_id 分配并换 HTTPS
+- 面板只能列出实际向本 Demo 上报的实例；发往外部 CF/Komari 面板的连接地址、密钥和状态不会被枚举
+- Reporter 的新增/删除及 `server_id`、`secret`、`worker_url`、`protocol` 只允许改本地配置；远端配置始终只作用于响应所属实例

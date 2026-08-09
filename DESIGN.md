@@ -9,11 +9,9 @@
 
 ```
 ┌─────────────────────────────────────────────────┐
-│ scheduler                                       │
-│  ├─ collect ticker (intervals.collect)          │
-│  │    └─ sync collectors → buffer.dynamic[]     │
-│  └─ report ticker (intervals.report)            │
-│       └─ drain buffer → reporter → POST         │
+│ shared collectors                               │
+│  └─ collect ticker (intervals.collect)          │
+│       └─ sync collectors → shared event log     │
 ├─────────────────────────────────────────────────┤
 │ async workers（各自独立节奏，只发布最新快照）      │
 │  ├─ ping worker      (每组 [[pings]] 独立间隔)  │
@@ -23,15 +21,17 @@
 │  ├─ diskio worker    (intervals.diskio)  │
 │  └─ netstatic        (2s 采样 / 10min 落盘)      │
 ├─────────────────────────────────────────────────┤
-│ reporter                                        │
-│  └─ POST /report ← 响应携带远端配置（便车下发）  │
+│ [[reporters]]（每路独立）                        │
+│  ├─ report ticker (report_interval)             │
+│  ├─ 独立事件游标 / ACK / 重试                    │
+│  └─ probe / CF / Komari → 各自服务端             │
 └─────────────────────────────────────────────────┘
 ```
 
 核心原则：
 
 1. **采集分三类**：静态（低频变化）/ 动态-同步（高频变化、采集便宜）/ 动态-异步（采集贵或有网络依赖）。
-2. **采集与上报分离**：采集频率与上报频率完全解耦，二者没有任何关系约束——report 时把缓冲全部发出即可；report < collect 时多余的上报只是空数组心跳。
+2. **采集与上报分离**：全局采集频率与每个 Reporter 的上报频率完全解耦，二者没有任何关系约束；每路按自己的游标读取共享事件，互不 drain 对方的数据。
 3. **动态数据用数组**：每次采集追加一条带 `ts` 的记录，上报时整体携带并清空。
 4. **异步只发快照**：异步 worker 只保留最近一次测量（带真实测量 ts）；采集端按 ts 新鲜度摘取——快照 ts 变了才带入记录，同一份异步数据不会重复出现，失败表现为 ts 停滞。
 
@@ -58,7 +58,7 @@
 | `boot_time` | /proc/stat btime | 毫秒时间戳 |
 | `ipv4` / `ipv6` | cloudflare trace | 公网 IP，会变，靠周期刷新 |
 | `agent_version` | 编译注入 | |
-| `config` | 当前生效配置 | static.config.*：intervals/reset_day/interfaces/enable_gpu/report_errors/report_self/pings，供服务端展示/核对，配置变更触发 static 重报 |
+| `config` | 当前 Reporter 视角的生效配置 | static.config.*：intervals 中采集周期来自全局、report 来自本 Reporter；其余为本 Reporter 的输出策略，供服务端展示/核对 |
 
 ### 2.2 动态-同步（dynamic，每个 collect tick 内联采集）
 
@@ -171,7 +171,7 @@ ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最
 | dynamic | 同步采集的动态指标数组，每个 collect tick 一条 |
 | ping | 网络探测子系统及其结果数组 |
 | collect tick | 采样周期触发点，间隔 `intervals.collect` |
-| report tick | 上报周期触发点，间隔 `intervals.report` |
+| report tick | 某一路 Reporter 的上报周期触发点，间隔 `reporters[].report_interval` |
 | 账期 | 以 `reset_day` 为起点的月流量统计周期 |
 | netstatic | 网卡流量 delta 时序模块（§5） |
 
@@ -183,33 +183,27 @@ ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最
 {
   "config": {
     "config_version": "2026-08-06T16:00:00.000+08:00",
-    "intervals": {
-      "collect": 10,
-      "report": 60,
-      "ping": 30,
-      "slow": 60,
-      "gpu": 60,
-      "ip": 600,
-      "diskio": 10
-    },
-    "reset_day": 15
+    "report_interval": 60,
+    "reset_day": 15,
+    "interfaces": ["eth*"],
+    "report_gpu": true,
+    "report_errors": true,
+    "report_self": false
   }
 }
 ```
 
 | 项 | 约束 |
 |---|---|
-| `intervals.collect` | 采样间隔（秒），>= 1；CF 的 0 输入兼容映射为 1 |
-| `intervals.report` | 上报间隔（秒），>= 1；与 collect 无任何关系约束 |
-| `intervals.ping` | 探测默认间隔（秒），`[[pings]]` 组未设 interval 时生效，缺省 30 |
-| `intervals.slow` | 慢变指标采集间隔（秒），缺省 60 |
-| `intervals.gpu` | GPU 采集间隔（秒），缺省 60 |
-| `intervals.ip` | 公网 IP 查询间隔（秒），缺省 600 |
-| `intervals.diskio` | 磁盘 IO 采集间隔（秒），缺省 10 |
+| `report_interval` | 当前 Reporter 上报间隔（秒），>= 1；与全局 collect 无任何关系约束 |
 | `reset_day` | 月流量账期重置日，1-31；0 = 不重置（永久累计） |
+| `interfaces` | 当前 Reporter 的网卡白名单（glob 数组） |
+| `report_gpu` | 当前 Reporter 是否输出 GPU |
+| `report_errors` | 当前 Reporter 是否输出错误事件 |
+| `report_self` | 当前 Reporter 是否输出探针自身指标 |
 | `config_version` | 配置版本（人类可读的 UTC+8 时间戳字符串），幂等机制，见下 |
 
-响应信封把配置收在 `config` 一级（全部字段可选，出现的才应用），另有 `next` 一级放对下一次上报的指令（如 `next.static`）。🔒 不允许远端修改：`server_id` / `secret` / `worker_url` / `net_static_path`（身份与安全边界）；其余字段（intervals/reset_day/interfaces/enable_gpu/pings）本地与远端双通道，均热生效（本地热加载 ~3s / 远端便车即时）。
+响应信封把配置收在 `config` 一级（除 config_version 外均可选，出现的才应用），另有 `next` 一级放对下一次上报的指令（如 `next.static`）。响应只能修改产生它的 Reporter。🔒 连接身份与全局实际采集配置 `intervals` / `enable_gpu` / `pings` / `net_static_path` 只接受本地 TOML，不允许任何上报端修改，因此多路下发不会争用同一份采集配置。
 
 ### 4.2 下发机制
 
@@ -217,7 +211,7 @@ ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最
 - agent 上报时带当前 `config_version`；服务端比对，不一致才下发。
 - **幂等**：version 与本地一致则不应用。
 - **原子**：整个配置对象全部校验通过才应用 + 落盘本地配置文件；任何一项非法（零值间隔、reset_day 越界等）整体拒绝，agent 日志记录原因。
-- 应用后立即生效（重建 ticker、重算账期），无需重启。
+- 应用后立即生效（只重建所属 Reporter ticker、重算该路账期），无需重启。
 
 ## 5. 流量统计（netstatic）
 
@@ -269,9 +263,9 @@ ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最
 | `collector/sync` | 平台门面 + Linux /proc 实现 + sysinfo 跨平台实现 |
 | `collector/async` | 异步 worker 框架：独立 task + watch channel 快照 |
 | `collector/netstatic` | 流量时序：采样、落盘、滚动保留、区间查询 |
-| `scheduler` | collect/report 双层 ticker；整数倍校验 |
-| `buffer` | dynamic / async 双缓冲，report 时 drain，失败 restore（有界） |
-| `reporter` | HTTP POST；响应解析（远端配置）；必报/失败丢弃策略 |
+| `scheduler` | 全局 collect ticker + 每 Reporter 独立 report ticker、事件游标和重试状态 |
+| `buffer` | dynamic / async 共享有界事件日志，支持多路独立游标读取 |
+| `reporter` | probe / CF / Komari 输出；响应解析并定向应用所属 Reporter 配置 |
 
 平台支持：Linux（手写 /proc 解析，零依赖）、macOS/Windows（sysinfo crate 实现，连接数解析 netstat）；`collector` 模块为平台门面，按 cfg 分流。Linux 默认从 `/etc/probe-rs/config.toml` 读取配置并把流量数据写到 `/var/lib/probe-rs/`；Windows 默认把配置和流量数据放在 `%ProgramData%\probe-rs\`，由 SYSTEM 开机计划任务托管。
 
@@ -289,7 +283,7 @@ ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最
 | 月流量计算位置 | **客户端自算，服务端只存展示值** | 统计与重置不依赖服务端 |
 | 流量统计底层 | **时序明细（非 KV 状态机）** | 按网卡存 delta，配置变更后新增增量始终正确；reset_day/interfaces 变更可重算 |
 | 实时网速来源 | **主采集计数器差值** | 比 netstatic 2s 粒度更贴合采集周期 |
-| 远端可下发项 | **intervals + reset_day** | 最小可用集，其余本地配置 |
+| 远端可下发项 | **仅 Reporter 输出策略** | 远端响应定向到所属 Reporter；全局实际采集配置只接受本地修改，消除多路冲突 |
 | 流量校正 | **服务端职责，agent 不做** | netstatic 报诚实累计值；重装跳变由服务端检测并加 offset，校正属展示/账务层 |
 | 自升级/远程命令 | **不做** | 安全边界 |
 | 单位/类型 | **字节 + JSON number** | komari 风格，不学 cfsm 全字符串 |
