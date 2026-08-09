@@ -16,8 +16,8 @@ use crate::buffer::{BufferBatch, Buffers};
 use crate::collector::{self, net, CpuMonitor};
 use crate::config::{ReporterSpec, SharedConfig};
 use crate::model::{
-    AsyncRecord, DynamicRecord, GpuRecord, Intervals, NetInterfaceSample, PingRecord, Report,
-    SelfRecord, SlowBlock, StaticInfo,
+    AsyncRecord, DynamicRecord, ErrorRecord, GpuRecord, Intervals, NetInterfaceSample, PingRecord,
+    Report, SelfRecord, SlowBlock, StaticInfo,
 };
 use crate::netstatic::{period_start_ms, NetStatic};
 use crate::reporter::Reporter;
@@ -274,7 +274,8 @@ impl ReporterRunner {
             tracing::error!(reporter_id = %self.id, "reporter config missing at startup");
             return;
         };
-        let mut report_ticker = ticker(initial.intervals.report);
+        let mut report_interval = initial.intervals.report;
+        let mut report_ticker = ticker(report_interval);
         tracing::info!(
             reporter_id = %self.id,
             protocol = %initial.protocol,
@@ -291,7 +292,9 @@ impl ReporterRunner {
                         tracing::warn!(reporter_id = %self.id, "reporter removal requires restart");
                         continue;
                     };
-                    report_ticker = ticker_from_next(spec.intervals.report);
+                    if report_interval_changed(&mut report_interval, spec.intervals.report) {
+                        report_ticker = ticker_from_next(report_interval);
+                    }
                     self.last_static = None;
                 }
                 changed = self.ip_rx.changed() => {
@@ -317,11 +320,7 @@ impl ReporterRunner {
             return;
         };
         let batch = self.buffers.read(&self.id);
-        let dynamic: Vec<DynamicRecord> = batch
-            .dynamic
-            .iter()
-            .map(|record| self.scope_dynamic(record, &spec))
-            .collect();
+        let dynamic = self.scope_dynamic_batch(&batch.dynamic, &spec);
         if let Some(latest) = dynamic.last() {
             self.last_dynamic = Some(latest.clone());
         }
@@ -345,23 +344,20 @@ impl ReporterRunner {
         let async_records = batch
             .async_records
             .iter()
-            .filter_map(|record| match record {
-                AsyncRecord::Ping(ping) => spec
-                    .pings
-                    .iter()
-                    .find(|target| target.task_id == ping.name)
-                    .map(|target| {
-                        let mut scoped = ping.clone();
-                        scoped.name.clone_from(&target.target.name);
-                        AsyncRecord::Ping(scoped)
-                    }),
-                AsyncRecord::Gpu(_) if spec.report_gpu => Some(record.clone()),
-                AsyncRecord::Self_(_) if spec.report_self => Some(record.clone()),
-                AsyncRecord::Slow(slow) => Some(AsyncRecord::Slow(self.scope_slow(slow, spec))),
-                AsyncRecord::DiskIo(diskio) => {
-                    Some(AsyncRecord::DiskIo(self.scope_diskio(diskio, spec)))
+            .flat_map(|record| match record {
+                AsyncRecord::Ping(ping) => scope_ping_aliases(ping, spec)
+                    .into_iter()
+                    .map(AsyncRecord::Ping)
+                    .collect(),
+                AsyncRecord::Gpu(_) if spec.report_gpu => vec![record.clone()],
+                AsyncRecord::Self_(_) if spec.report_self => vec![record.clone()],
+                AsyncRecord::Slow(slow) => {
+                    vec![AsyncRecord::Slow(self.scope_slow(slow, spec))]
                 }
-                AsyncRecord::Gpu(_) | AsyncRecord::Self_(_) => None,
+                AsyncRecord::DiskIo(diskio) => {
+                    vec![AsyncRecord::DiskIo(self.scope_diskio(diskio, spec))]
+                }
+                AsyncRecord::Gpu(_) | AsyncRecord::Self_(_) => Vec::new(),
             })
             .collect();
         let errors = self.scope_errors(&batch.errors, spec);
@@ -529,7 +525,13 @@ impl ReporterRunner {
         match self.reporter.send_cf(&update, &spec.config_version).await {
             Ok(response) => {
                 if let Some(push) = response.push {
-                    let remote = crate::reporter_cf::synthesize_remote(&push, &spec.intervals);
+                    let current_pings: Vec<_> =
+                        spec.pings.iter().map(|ping| ping.target.clone()).collect();
+                    let remote = crate::reporter_cf::synthesize_remote(
+                        &push,
+                        &spec.intervals,
+                        &current_pings,
+                    );
                     if let Err(error) = self.cfg.apply_remote_for(&self.id, remote) {
                         tracing::warn!(reporter_id = %self.id, %error, "CF config rejected");
                     } else {
@@ -562,43 +564,57 @@ impl ReporterRunner {
         }
     }
 
-    fn scope_dynamic(&self, record: &DynamicRecord, spec: &ReporterSpec) -> DynamicRecord {
-        let mut scoped = record.clone();
+    fn scope_dynamic_batch(
+        &self,
+        records: &[DynamicRecord],
+        spec: &ReporterSpec,
+    ) -> Vec<DynamicRecord> {
         let filter = net::IfaceFilter::new(&spec.interfaces);
-        let at = chrono::Local
-            .timestamp_millis_opt(record.ts)
-            .single()
-            .unwrap_or_else(chrono::Local::now);
-        let period_start = period_start_ms(spec.reset_day, at);
-        if !record.net_interfaces.is_empty() {
-            let selected: BTreeMap<String, NetInterfaceSample> = record
-                .net_interfaces
-                .iter()
-                .filter(|(name, _)| filter.includes(name))
-                .map(|(name, sample)| {
-                    let exact = net::IfaceFilter::new(std::slice::from_ref(name));
-                    let (rx_monthly, tx_monthly) =
-                        self.netstatic.query(&exact, period_start, record.ts);
-                    let mut sample = *sample;
-                    sample.rx_monthly = Some(rx_monthly);
-                    sample.tx_monthly = Some(tx_monthly);
-                    (name.clone(), sample)
-                })
-                .collect();
-            scoped.net_rx = Some(selected.values().map(|sample| sample.rx).sum());
-            scoped.net_tx = Some(selected.values().map(|sample| sample.tx).sum());
-            if record.net_rx_speed.is_some() {
-                scoped.net_rx_speed = Some(selected.values().map(|sample| sample.rx_speed).sum());
-                scoped.net_tx_speed = Some(selected.values().map(|sample| sample.tx_speed).sum());
-            }
-            scoped.net_interfaces = selected;
-        }
-        let (rx, tx) = self
-            .netstatic
-            .query_monthly(&self.id, &filter, period_start, record.ts);
-        scoped.net_rx_monthly = Some(rx);
-        scoped.net_tx_monthly = Some(tx);
-        scoped
+        let windows: Vec<_> = records
+            .iter()
+            .map(|record| {
+                let at = chrono::Local
+                    .timestamp_millis_opt(record.ts)
+                    .single()
+                    .unwrap_or_else(chrono::Local::now);
+                (period_start_ms(spec.reset_day, at), record.ts)
+            })
+            .collect();
+        let traffic = self.netstatic.query_batch(&self.id, &filter, &windows);
+
+        records
+            .iter()
+            .zip(traffic)
+            .map(|(record, traffic)| {
+                let mut scoped = record.clone();
+                if !record.net_interfaces.is_empty() {
+                    let selected: BTreeMap<String, NetInterfaceSample> = record
+                        .net_interfaces
+                        .iter()
+                        .filter(|(name, _)| filter.includes(name))
+                        .map(|(name, sample)| {
+                            let monthly = traffic.interfaces.get(name).copied().unwrap_or_default();
+                            let mut sample = *sample;
+                            sample.rx_monthly = Some(monthly.rx);
+                            sample.tx_monthly = Some(monthly.tx);
+                            (name.clone(), sample)
+                        })
+                        .collect();
+                    scoped.net_rx = Some(selected.values().map(|sample| sample.rx).sum());
+                    scoped.net_tx = Some(selected.values().map(|sample| sample.tx).sum());
+                    if record.net_rx_speed.is_some() {
+                        scoped.net_rx_speed =
+                            Some(selected.values().map(|sample| sample.rx_speed).sum());
+                        scoped.net_tx_speed =
+                            Some(selected.values().map(|sample| sample.tx_speed).sum());
+                    }
+                    scoped.net_interfaces = selected;
+                }
+                scoped.net_rx_monthly = Some(traffic.total.rx);
+                scoped.net_tx_monthly = Some(traffic.total.tx);
+                scoped
+            })
+            .collect()
     }
 
     fn scope_slow(&self, record: &SlowBlock, spec: &ReporterSpec) -> SlowBlock {
@@ -624,32 +640,7 @@ impl ReporterRunner {
         record: &crate::model::DiskIoRecord,
         spec: &ReporterSpec,
     ) -> crate::model::DiskIoRecord {
-        let mut scoped = record.clone();
-        scoped
-            .disks
-            .retain(|disk| disk_selected(&spec.disks, [disk.name.as_str(), "", ""]));
-        let sum = |pick: fn(&crate::model::DiskIoDeviceRecord) -> Option<f64>| {
-            let values: Vec<_> = scoped.disks.iter().filter_map(pick).collect();
-            (!values.is_empty()).then(|| values.into_iter().sum())
-        };
-        scoped.read_bps = sum(|disk| disk.read_bps);
-        scoped.write_bps = sum(|disk| disk.write_bps);
-        scoped.read_iops = sum(|disk| disk.read_iops);
-        scoped.write_iops = sum(|disk| disk.write_iops);
-        let (wait_total, ops_total) = scoped.disks.iter().fold((0.0, 0.0), |(wait, ops), disk| {
-            let disk_ops = disk.read_iops.unwrap_or(0.0) + disk.write_iops.unwrap_or(0.0);
-            (
-                wait + disk.await_ms.unwrap_or(0.0) * disk_ops,
-                ops + disk_ops,
-            )
-        });
-        scoped.await_ms = (ops_total > 0.0).then_some(wait_total / ops_total);
-        scoped.usage = scoped
-            .disks
-            .iter()
-            .filter_map(|disk| disk.usage)
-            .reduce(f64::max);
-        scoped
+        scope_diskio_record(record, &spec.disks)
     }
 
     fn scope_errors(
@@ -662,26 +653,20 @@ impl ReporterRunner {
         }
         records
             .iter()
-            .filter_map(|record| {
+            .flat_map(|record| {
                 if let Some(task_id) = record.source.strip_prefix("ping:") {
-                    return spec
-                        .pings
-                        .iter()
-                        .find(|target| target.task_id == task_id)
-                        .map(|target| {
-                            let mut scoped = record.clone();
-                            scoped.source = format!("ping:{}", target.target.name);
-                            scoped
-                        });
+                    return scope_ping_error_aliases(record, task_id, spec);
                 }
                 if let Some(reporter_id) = record.source.strip_prefix("reporter:") {
-                    return (reporter_id == spec.id).then(|| {
+                    return if reporter_id == spec.id {
                         let mut scoped = record.clone();
                         scoped.source = "reporter".to_string();
-                        scoped
-                    });
+                        vec![scoped]
+                    } else {
+                        Vec::new()
+                    };
                 }
-                Some(record.clone())
+                vec![record.clone()]
             })
             .collect()
     }
@@ -726,6 +711,71 @@ impl ReporterRunner {
     }
 }
 
+fn scope_diskio_record(
+    record: &crate::model::DiskIoRecord,
+    disk_patterns: &[String],
+) -> crate::model::DiskIoRecord {
+    let mut scoped = record.clone();
+    if record.disks.is_empty() && disk_patterns.is_empty() {
+        // macOS exposes aggregate counters without per-device records. With
+        // no Reporter filter there is nothing to re-scope, so retain them.
+        return scoped;
+    }
+    scoped
+        .disks
+        .retain(|disk| disk_selected(disk_patterns, [disk.name.as_str(), "", ""]));
+    let sum = |pick: fn(&crate::model::DiskIoDeviceRecord) -> Option<f64>| {
+        let values: Vec<_> = scoped.disks.iter().filter_map(pick).collect();
+        (!values.is_empty()).then(|| values.into_iter().sum())
+    };
+    scoped.read_bps = sum(|disk| disk.read_bps);
+    scoped.write_bps = sum(|disk| disk.write_bps);
+    scoped.read_iops = sum(|disk| disk.read_iops);
+    scoped.write_iops = sum(|disk| disk.write_iops);
+    let (wait_total, ops_total) = scoped.disks.iter().fold((0.0, 0.0), |(wait, ops), disk| {
+        let disk_ops = disk.read_iops.unwrap_or(0.0) + disk.write_iops.unwrap_or(0.0);
+        (
+            wait + disk.await_ms.unwrap_or(0.0) * disk_ops,
+            ops + disk_ops,
+        )
+    });
+    scoped.await_ms = (ops_total > 0.0).then_some(wait_total / ops_total);
+    scoped.usage = scoped
+        .disks
+        .iter()
+        .filter_map(|disk| disk.usage)
+        .reduce(f64::max);
+    scoped
+}
+
+fn scope_ping_aliases(ping: &PingRecord, spec: &ReporterSpec) -> Vec<PingRecord> {
+    spec.pings
+        .iter()
+        .filter(|target| target.task_id == ping.name)
+        .map(|target| {
+            let mut scoped = ping.clone();
+            scoped.name.clone_from(&target.target.name);
+            scoped
+        })
+        .collect()
+}
+
+fn scope_ping_error_aliases(
+    record: &ErrorRecord,
+    task_id: &str,
+    spec: &ReporterSpec,
+) -> Vec<ErrorRecord> {
+    spec.pings
+        .iter()
+        .filter(|target| target.task_id == task_id)
+        .map(|target| {
+            let mut scoped = record.clone();
+            scoped.source = format!("ping:{}", target.target.name);
+            scoped
+        })
+        .collect()
+}
+
 fn disk_selected<'a>(patterns: &[String], values: impl IntoIterator<Item = &'a str>) -> bool {
     if patterns.is_empty() {
         return true;
@@ -733,11 +783,25 @@ fn disk_selected<'a>(patterns: &[String], values: impl IntoIterator<Item = &'a s
     let values: Vec<_> = values.into_iter().collect();
     patterns.iter().any(|pattern| {
         globset::Glob::new(pattern).is_ok_and(|glob| {
-            values
-                .iter()
-                .any(|value| glob.compile_matcher().is_match(value))
+            let matcher = glob.compile_matcher();
+            values.iter().any(|value| {
+                matcher.is_match(value)
+                    || value
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .is_some_and(|basename| matcher.is_match(basename))
+            })
         })
     })
+}
+
+fn report_interval_changed(current: &mut u64, next: u64) -> bool {
+    if *current == next {
+        false
+    } else {
+        *current = next;
+        true
+    }
 }
 
 /// First tick is immediate.
@@ -753,4 +817,110 @@ fn ticker_from_next(secs: u64) -> Interval {
     let mut ticker = interval_at(tokio::time::Instant::now() + duration, duration);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ScopedPingTarget;
+    use crate::model::{PingKind, PingTarget};
+
+    fn reporter_with_ping_aliases() -> ReporterSpec {
+        let task_id = "tcp:example.com:80";
+        let ping = |name: &str| ScopedPingTarget {
+            task_id: task_id.into(),
+            target: PingTarget {
+                name: name.into(),
+                kind: PingKind::Tcp,
+                target: "example.com:80".into(),
+                interval: Some(30),
+            },
+        };
+        ReporterSpec {
+            id: "primary".into(),
+            protocol: "probe".into(),
+            server_id: "server".into(),
+            secret: "secret".into(),
+            worker_url: "https://example.com/report".into(),
+            config_version: String::new(),
+            intervals: Intervals::default(),
+            reset_day: 1,
+            interfaces: vec![],
+            disks: vec![],
+            report_gpu: false,
+            report_errors: true,
+            report_self: false,
+            pings: vec![ping("first"), ping("second")],
+            ext: Default::default(),
+        }
+    }
+
+    #[test]
+    fn normalized_ping_results_and_errors_keep_all_logical_aliases() {
+        let spec = reporter_with_ping_aliases();
+        let ping = PingRecord {
+            ts: 1,
+            name: "tcp:example.com:80".into(),
+            rtt: 12,
+            loss: 0,
+        };
+        let names: Vec<_> = scope_ping_aliases(&ping, &spec)
+            .into_iter()
+            .map(|ping| ping.name)
+            .collect();
+        assert_eq!(names, ["first", "second"]);
+
+        let error = ErrorRecord {
+            ts: 1,
+            source: "ping:tcp:example.com:80".into(),
+            msg: "timeout".into(),
+        };
+        let sources: Vec<_> = scope_ping_error_aliases(&error, "tcp:example.com:80", &spec)
+            .into_iter()
+            .map(|error| error.source)
+            .collect();
+        assert_eq!(sources, ["ping:first", "ping:second"]);
+    }
+
+    #[test]
+    fn report_interval_changes_only_when_value_differs() {
+        let mut current = 30;
+        assert!(!report_interval_changed(&mut current, 30));
+        assert_eq!(current, 30);
+        assert!(report_interval_changed(&mut current, 60));
+        assert_eq!(current, 60);
+    }
+
+    #[test]
+    fn disk_filter_matches_linux_device_basename() {
+        assert!(disk_selected(
+            &["nvme*".into()],
+            ["/dev/nvme0n1p1", "/mnt/data"]
+        ));
+        assert!(!disk_selected(
+            &["sda*".into()],
+            ["/dev/nvme0n1p1", "/mnt/data"]
+        ));
+    }
+
+    #[test]
+    fn aggregate_only_diskio_survives_without_a_filter() {
+        let record = crate::model::DiskIoRecord {
+            ts: 1,
+            read_bps: Some(10.0),
+            write_bps: Some(20.0),
+            read_iops: Some(1.0),
+            write_iops: Some(2.0),
+            await_ms: Some(3.0),
+            usage: None,
+            disks: vec![],
+        };
+        let scoped = scope_diskio_record(&record, &[]);
+        assert_eq!(scoped.read_bps, Some(10.0));
+        assert_eq!(scoped.write_bps, Some(20.0));
+
+        let filtered = scope_diskio_record(&record, &["disk0".into()]);
+        assert_eq!(filtered.read_bps, None);
+        assert_eq!(filtered.write_bps, None);
+    }
 }

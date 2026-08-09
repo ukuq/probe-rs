@@ -13,7 +13,8 @@ deno run --allow-net server.ts 9000   # 指定端口
 
 ## 面板
 
-每个 Reporter 实例一张卡片；同一 `server_id` 的多路原始协议上报独立展示、独立下发配置：
+每个 Reporter 实例一张卡片；同一 `server_id`
+的多路原始协议上报独立展示、独立下发配置：
 
 - **KPI 磁贴**：CPU / 内存 / 磁盘（带用量 meter，>70% 黄 >90% 红）、下行 /
   上行网速、连接数
@@ -27,12 +28,12 @@ deno run --allow-net server.ts 9000   # 指定端口
 
 ## 接口
 
-| 接口                          | 说明                                                     |
-| ----------------------------- | -------------------------------------------------------- |
-| `POST /report`                | agent 上报；含认证、版本与 Reporter 身份头，响应携带该实例的待下发配置 |
-| `GET /`                       | 监控面板（3s 自动刷新）                                  |
-| `GET /api/servers`            | 全部 Reporter 实例最新数据 JSON                           |
-| `POST /api/config/:instance_id` | 设置该 Reporter 的待下发配置；`instance_id` 由 `/api/servers` 返回 |
+| 接口                            | 说明                                                                   |
+| ------------------------------- | ---------------------------------------------------------------------- |
+| `POST /report`                  | agent 上报；含认证、版本与 Reporter 身份头，响应携带该实例的待下发配置 |
+| `GET /`                         | 监控面板（3s 自动刷新）                                                |
+| `GET /api/servers`              | 全部 Reporter 实例最新数据 JSON                                        |
+| `POST /api/config/:instance_id` | 设置该 Reporter 的待下发配置；`instance_id` 由 `/api/servers` 返回     |
 
 ## 演示流程
 
@@ -48,14 +49,17 @@ curl -X POST localhost:8080/api/config/URL编码后的instance_id \
   -d '{"intervals":{"collect":2,"ping":60,"slow":60,"gpu":60,"ip":600,"diskio":10},"report_interval":10,"reset_day":1,"interfaces":["eth*"],"disks":["nvme*"],"pings":[{"name":"edge","type":"icmp","target":"1.1.1.1","interval":60}],"report_gpu":true}'
 ```
 
-服务端校验周期、glob 与 Ping 基本格式 → 下次上报随响应下发 → agent 原子应用该 Reporter
-配置并落盘，面板上的 `cfg v` 版本号随之更新。Agent 随后自动重算实际机器级配置：周期取所有
-Reporter 最小值、GPU 取 OR、网卡/磁盘/Ping 取并集。生产服务端允许下发 Ping 时应额外限制目标，
-避免 SSRF/内网探测。
+服务端校验周期、glob 与 Ping 基本格式 → 下次上报随响应下发 → agent 原子应用该
+Reporter 配置并落盘，面板上的 `cfg v` 版本号随之更新。Agent
+随后自动重算实际机器级配置：周期取所有 Reporter 最小值、GPU 取
+OR、网卡/磁盘/Ping 取并集。生产服务端允许下发 Ping 时应额外限制目标， 避免
+SSRF/内网探测。
 
 ## 注意
 
 - 数据全在内存，重启即丢（演示定位，不接数据库）
 - 全局单一密钥 `change-me`，生产应按 server_id 分配并换 HTTPS
-- 面板只能列出实际向本 Demo 上报的实例；发往外部 CF/Komari 面板的连接地址、密钥和状态不会被枚举
-- Reporter 的新增/删除及 `server_id`、`secret`、`worker_url`、`protocol` 只允许改本地配置；远端配置始终只作用于响应所属实例
+- 面板只能列出实际向本 Demo 上报的实例；发往外部 CF/Komari
+  面板的连接地址、密钥和状态不会被枚举
+- Reporter 的新增/删除及 `server_id`、`secret`、`worker_url`、`protocol`
+  只允许改本地配置；远端配置始终只作用于响应所属实例

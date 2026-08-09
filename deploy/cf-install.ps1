@@ -164,19 +164,38 @@ function New-CfReporterBlock {
 function Remove-ReporterBlock {
     param([string]$Text, [string]$Id)
 
-    $quotedId = ConvertTo-TomlString $Id
     $blockPattern = '(?ms)^[ \t]*\[\[reporters\]\][ \t]*\r?\n(?<body>.*?)(?=^[ \t]*\[\[reporters\]\][ \t]*\r?$|\z)'
     return [regex]::Replace($Text, $blockPattern, {
             param($match)
-            $idPattern = '(?m)^[ \t]*id[ \t]*=[ \t]*' + [regex]::Escape($quotedId) + '[ \t]*\r?$'
+            $escapedId = [regex]::Escape($Id)
+            $idPattern = "(?m)^[ \t]*id[ \t]*=[ \t]*(?:`"$escapedId`"|'$escapedId')[ \t]*(?:#[^\r\n]*)?\r?$"
             if ([regex]::IsMatch($match.Groups['body'].Value, $idPattern)) { return '' }
             return $match.Value
         })
 }
 
+function Remove-SeededReporterBlocks {
+    param([string]$Text)
+
+    $blockPattern = '(?ms)^[ \t]*\[\[reporters\]\][ \t]*\r?\n(?<body>.*?)(?=^[ \t]*\[\[reporters\]\][ \t]*\r?$|\z)'
+    return [regex]::Replace($Text, $blockPattern, {
+            param($match)
+            $body = $match.Groups['body'].Value
+            $seeded = $body -match '(?m)^[ \t]*server_id[ \t]*=[ \t]*"cf-server-uuid"' -or
+                $body -match '(?m)^[ \t]*worker_url[ \t]*=[ \t]*"https://monitor\.example\.com/update"' -or
+                $body -match '(?m)^[ \t]*worker_url[ \t]*=[ \t]*"https://komari\.example\.com"' -or
+                $body -match '(?m)^[ \t]*worker_url[ \t]*=[ \t]*"http://127\.0\.0\.1:8080/report"'
+            if ($seeded) { return '' }
+            return $match.Value
+        })
+}
+
 function Write-CfConfig {
-    if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) {
+    param([bool]$PreserveExisting)
+
+    if ($PreserveExisting -and (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
         $existing = [IO.File]::ReadAllText($ConfigPath)
+        $existing = Remove-SeededReporterBlocks $existing
         $firstReporter = [regex]::Match($existing, '(?m)^[ \t]*\[\[reporters\]\][ \t]*\r?$')
         if ($firstReporter.Success) {
             $global = $existing.Substring(0, $firstReporter.Index)
@@ -224,8 +243,12 @@ try {
         $resolvedBinary = $temporaryBinary
     }
 
+    # install.ps1 seeds config.example.toml on a clean host. Remember whether
+    # the config predated this CF installation so those sample Reporters are
+    # not mistaken for user-owned Reporters that should be preserved.
+    $preserveExistingConfig = Test-Path -LiteralPath $ConfigPath -PathType Leaf
     & $Installer install -BinaryPath $resolvedBinary -NoStart
-    Write-CfConfig
+    Write-CfConfig -PreserveExisting $preserveExistingConfig
     & $Installer start
     Write-Host "CF mode installed. Config: $ConfigPath"
 }

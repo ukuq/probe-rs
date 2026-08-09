@@ -155,9 +155,12 @@ remove_reporter_block() {
                 block=block $0 ORS
                 if ($0 ~ /^[[:space:]]*id[[:space:]]*=/) {
                     value=$0
-                    sub(/^[^=]*=[[:space:]]*"/, "", value)
-                    sub(/"[[:space:]]*(#.*)?$/, "", value)
-                    if (value == target) drop=1
+                    sub(/^[^=]*=[[:space:]]*/, "", value)
+                    sub(/[[:space:]]*#.*$/, "", value)
+                    sub(/[[:space:]]+$/, "", value)
+                    double_quoted="\"" target "\""
+                    single_quoted=sprintf("%c%s%c", 39, target, 39)
+                    if (value == double_quoted || value == single_quoted) drop=1
                 }
             } else print
         }
@@ -165,6 +168,39 @@ remove_reporter_block() {
     ' "$cfg" > "$tmp"
     mv -f "$tmp" "$cfg"
 }
+strip_seeded_sample_reporters() {
+    cfg="$1"; tmp=$(mktemp "$CONF_DIR/config.toml.XXXXXX")
+    awk '
+        function flush() {
+            if (in_reporter && !seeded) printf "%s", block
+            block=""; seeded=0
+        }
+        /^[[:space:]]*\[\[reporters\]\][[:space:]]*$/ {
+            if (in_reporter) flush()
+            in_reporter=1; block=$0 ORS; next
+        }
+        {
+            if (in_reporter && $0 ~ /^[[:space:]]*\[/ &&
+                $0 !~ /^[[:space:]]*\[\[?reporters(\.|\]\])/) {
+                flush(); in_reporter=0
+            }
+            if (in_reporter) {
+                block=block $0 ORS
+                if ($0 ~ /^[[:space:]]*server_id[[:space:]]*=[[:space:]]*"cf-server-uuid"/) seeded=1
+                if ($0 ~ /^[[:space:]]*worker_url[[:space:]]*=[[:space:]]*"https:\/\/monitor\.example\.com\/update"/) seeded=1
+                if ($0 ~ /^[[:space:]]*worker_url[[:space:]]*=[[:space:]]*"https:\/\/komari\.example\.com"/) seeded=1
+                if ($0 ~ /^[[:space:]]*worker_url[[:space:]]*=[[:space:]]*"http:\/\/127\.0\.0\.1:8080\/report"/) seeded=1
+            } else print
+        }
+        END { if (in_reporter) flush() }
+    ' "$cfg" > "$tmp"
+    mv -f "$tmp" "$cfg"
+}
+
+if [ -s "$CONFIG_PATH" ] && grep -q '^[[:space:]]*\[\[reporters\]\]' "$CONFIG_PATH"; then
+    strip_seeded_sample_reporters "$CONFIG_PATH"
+fi
+
 
 if [ -s "$CONFIG_PATH" ] &&
    grep -q '^[[:space:]]*\[\[reporters\]\]' "$CONFIG_PATH" &&

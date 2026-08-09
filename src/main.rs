@@ -68,7 +68,11 @@ async fn main() -> Result<()> {
     for spec in &initial_specs {
         buffers.register(spec.id.clone());
     }
-    let net = netstatic::NetStatic::load(&net_static_path);
+    let legacy_cf_reporter = initial_specs
+        .iter()
+        .find(|spec| spec.protocol == "cf")
+        .map(|spec| spec.id.as_str());
+    let net = netstatic::NetStatic::load_with_legacy_reporter(&net_static_path, legacy_cf_reporter);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // The persistent traffic ledger captures all interfaces. Reporter-specific

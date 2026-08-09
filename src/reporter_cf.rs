@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::model::{
-    DiskIoRecord, DynamicRecord, GpuRecord, PingRecord, PingTarget, SlowBlock, StaticInfo,
+    DiskIoRecord, DynamicRecord, GpuRecord, PingKind, PingRecord, PingTarget, SlowBlock, StaticInfo,
 };
 
 /// 一次 /update 请求体
@@ -333,6 +333,7 @@ pub struct CfPush {
 pub fn synthesize_remote(
     push: &CfPush,
     current: &crate::model::Intervals,
+    current_pings: &[PingTarget],
 ) -> crate::model::RemoteConfig {
     crate::model::RemoteConfig {
         config_version: push.version.clone(),
@@ -359,12 +360,65 @@ pub fn synthesize_remote(
                 .collect()
         }),
         disks: None,
-        pings: None,
+        pings: synthesize_cf_pings(&push.custom, current_pings),
         report_gpu: None,
         report_errors: None,
         report_self: None,
         ext: None,
     }
+}
+
+/// CF 只下发四个固定线路，缺席的线路保持本地定义，空值则显式清除。
+/// `bd` 兼容旧配置使用的 `bgp` 逻辑名；其他自定义 Ping 原样保留。
+fn synthesize_cf_pings(
+    custom: &[Option<String>; 4],
+    current: &[PingTarget],
+) -> Option<Vec<PingTarget>> {
+    if custom.iter().all(Option::is_none) {
+        return None;
+    }
+
+    let mut pings = current.to_vec();
+    for (index, target) in custom.iter().enumerate() {
+        let Some(target) = target else {
+            continue;
+        };
+        let names: &[&str] = match index {
+            0 => &["ct"],
+            1 => &["cu"],
+            2 => &["cm"],
+            3 => &["bd", "bgp"],
+            _ => unreachable!("CF custom Ping index is bounded by the array"),
+        };
+        let existing_index = pings
+            .iter()
+            .position(|ping| names.contains(&ping.name.as_str()));
+        let existing = existing_index.map(|position| pings[position].clone());
+        pings.retain(|ping| !names.contains(&ping.name.as_str()));
+
+        let target = target.trim();
+        if target.is_empty() {
+            continue;
+        }
+        let lowercase = target.to_ascii_lowercase();
+        let kind = if lowercase.starts_with("http://") || lowercase.starts_with("https://") {
+            PingKind::Http
+        } else {
+            PingKind::Tcp
+        };
+        let replacement = PingTarget {
+            name: existing
+                .as_ref()
+                .map(|ping| ping.name.clone())
+                .unwrap_or_else(|| names[0].to_string()),
+            kind,
+            target: target.to_string(),
+            interval: existing.and_then(|ping| ping.interval),
+        };
+        let position = existing_index.unwrap_or(pings.len()).min(pings.len());
+        pings.insert(position, replacement);
+    }
+    Some(pings)
 }
 
 /// /update 响应解析结果
@@ -626,9 +680,54 @@ mod tests {
             custom: [None, None, None, None],
             interface: Some("eth0, eth1,,bond*".into()),
         };
-        let remote = synthesize_remote(&push, &crate::model::Intervals::default());
+        let remote = synthesize_remote(&push, &crate::model::Intervals::default(), &[]);
         assert_eq!(remote.report_interval, Some(60));
         assert_eq!(remote.interfaces.unwrap(), vec!["eth0", "eth1", "bond*"]);
+        assert!(remote.pings.is_none());
+    }
+
+    #[test]
+    fn synthesize_remote_applies_only_present_custom_pings() {
+        let ping = |name: &str, target: &str, interval| PingTarget {
+            name: name.into(),
+            kind: PingKind::Tcp,
+            target: target.into(),
+            interval,
+        };
+        let current = vec![
+            ping("ct", "old-ct.example:80", Some(15)),
+            ping("cu", "old-cu.example:80", None),
+            ping("cm", "keep-cm.example:80", Some(20)),
+            ping("bgp", "old-bd.example:80", Some(25)),
+            ping("private", "keep-private.example:80", None),
+        ];
+        let push = CfPush {
+            version: "v2".into(),
+            collect: None,
+            report: None,
+            reset_day: None,
+            custom: [
+                Some("new-ct.example:443".into()),
+                Some(String::new()),
+                None,
+                Some("https://new-bd.example".into()),
+            ],
+            interface: None,
+        };
+
+        let remote = synthesize_remote(&push, &crate::model::Intervals::default(), &current);
+        let pings = remote.pings.expect("custom Ping push must update pings");
+        assert_eq!(pings.len(), 4);
+        let find = |name: &str| pings.iter().find(|ping| ping.name == name).unwrap();
+        assert_eq!(find("ct").target, "new-ct.example:443");
+        assert_eq!(find("ct").interval, Some(15));
+        assert_eq!(find("ct").kind, PingKind::Tcp);
+        assert!(pings.iter().all(|ping| ping.name != "cu"));
+        assert_eq!(find("cm").target, "keep-cm.example:80");
+        assert_eq!(find("bgp").target, "https://new-bd.example");
+        assert_eq!(find("bgp").interval, Some(25));
+        assert_eq!(find("bgp").kind, PingKind::Http);
+        assert_eq!(find("private").target, "keep-private.example:80");
     }
 
     #[test]

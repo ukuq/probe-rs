@@ -92,6 +92,7 @@ mod tests {
             write_ops: 0,
             total_time_ms: 0,
             io_ms_per_dev: io.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            devices: Default::default(),
         }
     }
 

@@ -1,6 +1,6 @@
 //! netstatic：网卡流量 delta 时序（移植 komari netstatic 设计）
 //!
-//! 月流量完全由客户端计算：上报时现查 `query(period_start, now)`。
+//! 月流量完全由客户端计算：上报时按 Reporter 批量查询各采样时间点。
 //! 增量正确性纪律见 DESIGN.md §5.3。
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -63,20 +63,38 @@ pub struct NetStatic {
     path: Arc<PathBuf>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TrafficSnapshot {
+    pub interfaces: BTreeMap<String, NetBytes>,
+    pub total: NetBytes,
+}
+
 impl NetStatic {
+    #[cfg(test)]
     pub fn load(path: &Path) -> Self {
+        Self::load_with_legacy_reporter(path, None)
+    }
+
+    pub fn load_with_legacy_reporter(path: &Path, legacy_reporter_id: Option<&str>) -> Self {
         let store: StoreFile = std::fs::read_to_string(path)
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
         let cutoff = crate::model::now_millis() - RETAIN.num_milliseconds();
         let mut store = store;
-        if let Some(legacy) = store.correction.take() {
-            store
-                .corrections
-                .entry("primary".to_string())
-                .or_insert(legacy);
-        }
+        let migrated = if let Some(reporter_id) = legacy_reporter_id {
+            if let Some(legacy) = store.correction.take() {
+                store
+                    .corrections
+                    .entry(reporter_id.to_string())
+                    .or_insert(legacy);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         for entries in store.interfaces.values_mut() {
             while entries.front().is_some_and(|e| e.ts < cutoff) {
                 entries.pop_front();
@@ -87,7 +105,7 @@ impl NetStatic {
                 store,
                 last_counters: HashMap::new(),
                 last_save: Instant::now(),
-                dirty: false,
+                dirty: migrated,
             })),
             path: Arc::new(path.to_path_buf()),
         }
@@ -142,7 +160,60 @@ impl NetStatic {
         (rx, tx)
     }
 
+    /// Query all monthly snapshots for one Reporter batch while holding the
+    /// ledger lock once. Entries are scanned once per interface and distinct
+    /// period start, rather than once per dynamic record and interface.
+    pub fn query_batch(
+        &self,
+        reporter_id: &str,
+        filter: &IfaceFilter,
+        windows: &[(i64, i64)],
+    ) -> Vec<TrafficSnapshot> {
+        let inner = self.inner.lock().expect("netstatic lock poisoned");
+        let mut snapshots = vec![TrafficSnapshot::default(); windows.len()];
+        let mut groups: BTreeMap<i64, Vec<(i64, usize)>> = BTreeMap::new();
+        for (index, &(start, end)) in windows.iter().enumerate() {
+            groups.entry(start).or_default().push((end, index));
+        }
+        for points in groups.values_mut() {
+            points.sort_unstable();
+        }
+
+        for (name, entries) in &inner.store.interfaces {
+            if !filter.includes(name) {
+                continue;
+            }
+            for (&start, points) in &groups {
+                let mut entries = entries.iter().filter(|entry| entry.ts >= start).peekable();
+                let mut total = NetBytes::default();
+                for &(end, index) in points {
+                    while entries.peek().is_some_and(|entry| entry.ts <= end) {
+                        let entry = entries.next().expect("peeked ledger entry");
+                        total.rx += entry.rx;
+                        total.tx += entry.tx;
+                    }
+                    snapshots[index].interfaces.insert(name.clone(), total);
+                    snapshots[index].total.rx += total.rx;
+                    snapshots[index].total.tx += total.tx;
+                }
+            }
+        }
+
+        if let Some(correction) = inner.store.corrections.get(reporter_id).copied() {
+            for (&(period_start, _), snapshot) in windows.iter().zip(&mut snapshots) {
+                if correction.period_start == period_start {
+                    snapshot.total.rx =
+                        (snapshot.total.rx as i64 + correction.rx_offset).max(0) as u64;
+                    snapshot.total.tx =
+                        (snapshot.total.tx as i64 + correction.tx_offset).max(0) as u64;
+                }
+            }
+        }
+        snapshots
+    }
+
     /// 月累计查询：原始值 + 校正偏移（偏移仅当属于当前账期时生效）
+    #[cfg(test)]
     pub fn query_monthly(
         &self,
         reporter_id: &str,
@@ -368,6 +439,101 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("probe-rs-ns-{tag}-{}", std::process::id()));
         let path = dir.join("net.json");
         (NetStatic::load(&path), path)
+    }
+
+    #[test]
+    fn batch_query_scans_a_series_without_losing_sample_time_semantics() {
+        let (ns, path) = tmp_ns("batch");
+        {
+            let mut inner = ns.inner.lock().unwrap();
+            inner.store.interfaces.insert(
+                "eth0".into(),
+                [
+                    Entry {
+                        ts: 10,
+                        rx: 1,
+                        tx: 10,
+                    },
+                    Entry {
+                        ts: 20,
+                        rx: 2,
+                        tx: 20,
+                    },
+                    Entry {
+                        ts: 30,
+                        rx: 4,
+                        tx: 40,
+                    },
+                ]
+                .into(),
+            );
+            inner.store.interfaces.insert(
+                "eth1".into(),
+                [Entry {
+                    ts: 15,
+                    rx: 8,
+                    tx: 80,
+                }]
+                .into(),
+            );
+        }
+        let snapshots = ns.query_batch(
+            "probe",
+            &IfaceFilter::new(&[]),
+            &[(0, 15), (0, 25), (20, 35)],
+        );
+        assert_eq!((snapshots[0].total.rx, snapshots[0].total.tx), (9, 90));
+        assert_eq!((snapshots[1].total.rx, snapshots[1].total.tx), (11, 110));
+        assert_eq!((snapshots[2].total.rx, snapshots[2].total.tx), (6, 60));
+        assert_eq!(snapshots[1].interfaces["eth0"].rx, 3);
+        assert_eq!(snapshots[1].interfaces["eth1"].rx, 8);
+
+        {
+            let mut inner = ns.inner.lock().unwrap();
+            inner.store.corrections.insert(
+                "cf".into(),
+                Correction {
+                    period_start: 0,
+                    rx_offset: 100,
+                    tx_offset: 200,
+                    rx_gb: 0.0,
+                    tx_gb: 0.0,
+                    confirm_pending: false,
+                },
+            );
+        }
+        let corrected = ns.query_batch("cf", &IfaceFilter::new(&[]), &[(0, 25)]);
+        assert_eq!((corrected[0].total.rx, corrected[0].total.tx), (111, 310));
+        assert_eq!(corrected[0].interfaces["eth0"].rx, 3);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn legacy_correction_migrates_to_the_configured_cf_reporter() {
+        let (_, path) = tmp_ns("legacy-correction");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let correction = Correction {
+            period_start: 100,
+            rx_offset: 1,
+            tx_offset: 2,
+            rx_gb: 3.0,
+            tx_gb: 4.0,
+            confirm_pending: true,
+        };
+        let store = StoreFile {
+            correction: Some(correction),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+
+        let ns = NetStatic::load_with_legacy_reporter(&path, Some("cf"));
+        assert_eq!(ns.confirm_pending("cf"), Some((3.0, 4.0)));
+        assert_eq!(ns.confirm_pending("primary"), None);
+        let inner = ns.inner.lock().unwrap();
+        assert!(inner.store.correction.is_none());
+        assert!(inner.store.corrections.contains_key("cf"));
+        drop(inner);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]

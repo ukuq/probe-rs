@@ -34,8 +34,10 @@ do_uninstall() {
 
 is_placeholder() {
     # 示例配置未被编辑过的特征（身份/地址仍为占位值；secret 不算，可能是真实值）
-    grep -q '^server_id = "srv-01"' "$1" \
-        || grep -q '^worker_url = "https://monitor.example.com/report"' "$1"
+    grep -Eq '^[[:space:]]*server_id[[:space:]]*=[[:space:]]*"(srv-01|cf-server-uuid)"' "$1" \
+        || grep -Eq '^[[:space:]]*worker_url[[:space:]]*=[[:space:]]*"https://monitor\.example\.com/(report|update)"' "$1" \
+        || grep -Eq '^[[:space:]]*worker_url[[:space:]]*=[[:space:]]*"https://komari\.example\.com"' "$1" \
+        || grep -Eq '^[[:space:]]*worker_url[[:space:]]*=[[:space:]]*"http://127\.0\.0\.1:8080/report"' "$1"
 }
 
 do_install() {
@@ -53,7 +55,7 @@ do_install() {
         echo "保留已有配置 $CONF_DIR/config.toml"
         if is_placeholder "$CONF_DIR/config.toml"; then
             echo ""
-            echo "配置仍是示例占位（srv-01 / change-me），暂不启动。"
+            echo "配置仍包含示例占位身份或地址，暂不启动。"
             echo "编辑 $CONF_DIR/config.toml 后执行: systemctl enable --now probe-rs"
             exit 0
         fi

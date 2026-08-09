@@ -22,6 +22,7 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
       ref: ${{ steps.meta.outputs.ref }}
       skip: ${{ steps.meta.outputs.skip }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,6 +35,10 @@ jobs:
           ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           [ -n "$ver" ] || { echo "Cargo.toml 未找到 version" >&2; exit 1; }
           tag="v$ver"
+          case "$ver" in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
 
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
             build_ref="$tag"
@@ -43,16 +48,22 @@ jobs:
 
           assets=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
             --json assets --jq '.assets[].name' 2>/dev/null || true)
+          published_prerelease=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+            --json isPrerelease --jq '.isPrerelease' 2>/dev/null || true)
           complete=true
           for name in probe-rs-linux-x86_64 probe-rs-linux-aarch64 probe-rs-windows-x86_64.exe; do
             if ! grep -Fxq "$name" <<<"$assets"; then
               complete=false
             fi
           done
+          if [ -n "$published_prerelease" ] && [ "$published_prerelease" != "$prerelease" ]; then
+            complete=false
+          fi
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "ref=$build_ref" >> "$GITHUB_OUTPUT"
           echo "skip=$complete" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
           if [ "$complete" = true ]; then
             echo "$tag 的全部平台产物均已存在，跳过发版"
           else
@@ -135,6 +146,7 @@ jobs:
           tag_name: ${{ needs.metadata.outputs.tag }}
           target_commitish: ${{ needs.metadata.outputs.ref }}
           name: ${{ needs.metadata.outputs.tag }}
+          prerelease: ${{ needs.metadata.outputs.prerelease }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           overwrite_files: true

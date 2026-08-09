@@ -319,7 +319,13 @@ async fn icmp_ping(address: IpAddr) -> Result<i64> {
     if cfg!(windows) {
         command.args(["-n", "1", "-w", "3000", &ip]);
     } else {
-        command.args(["-c", "1", "-W", "3", &ip]);
+        command.args([
+            "-c",
+            "1",
+            "-W",
+            unix_ping_timeout_arg(std::env::consts::OS),
+            &ip,
+        ]);
     }
     let start = Instant::now();
     let output =
@@ -328,6 +334,16 @@ async fn icmp_ping(address: IpAddr) -> Result<i64> {
         bail!("icmp ping exit {}", output.status);
     }
     Ok((start.elapsed().as_millis() as i64).max(1))
+}
+
+fn unix_ping_timeout_arg(target_os: &str) -> &'static str {
+    if target_os == "macos" {
+        // BSD ping interprets -W as milliseconds.
+        "3000"
+    } else {
+        // Linux ping interprets -W as seconds.
+        "3"
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +361,12 @@ mod tests {
         assert_eq!(build_result(4, &mut [10, 20]).1, 50);
         assert_eq!(build_result(4, &mut []).0, -1);
         assert_eq!(build_result(4, &mut []).1, 100);
+    }
+
+    #[test]
+    fn ping_timeout_uses_platform_units() {
+        assert_eq!(unix_ping_timeout_arg("linux"), "3");
+        assert_eq!(unix_ping_timeout_arg("macos"), "3000");
     }
 
     #[test]
