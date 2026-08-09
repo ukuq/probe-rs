@@ -9,6 +9,8 @@ pub mod net;
 mod linux;
 #[cfg(not(target_os = "linux"))]
 mod universal;
+#[cfg(target_os = "windows")]
+mod windows_diskio;
 
 #[cfg(target_os = "linux")]
 use linux as imp;
@@ -62,8 +64,8 @@ pub fn processes() -> Option<u64> {
     imp::processes()
 }
 
-/// (tcp_conn, udp_conn)；失败为 (0, 0)
-pub fn connections() -> (u64, u64) {
+/// (tcp_conn, udp_conn)；失败返回错误，避免把采集故障误报为 0
+pub fn connections() -> Result<(u64, u64), String> {
     imp::connections()
 }
 

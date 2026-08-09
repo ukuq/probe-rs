@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::interval;
 
+use crate::buffer::Buffers;
 use crate::collector::{self, SelfMonitor};
 use crate::config::SharedConfig;
 use crate::model::{Intervals, SelfRecord, SlowBlock};
@@ -20,6 +21,7 @@ use crate::model::{Intervals, SelfRecord, SlowBlock};
 pub fn spawn(
     cfg: Arc<SharedConfig>,
     mut intervals_rx: watch::Receiver<Intervals>,
+    buffers: Arc<Buffers>,
 ) -> (
     tokio::task::JoinHandle<()>,
     watch::Receiver<Option<SlowBlock>>,
@@ -35,13 +37,20 @@ pub fn spawn(
                 _ = ticker.tick() => {
                     let ts = crate::model::now_millis();
                     let (_, disk_used) = collector::disk();
-                    let (tcp_conn, udp_conn) = collector::connections();
+                    let (tcp_conn, udp_conn) = match collector::connections() {
+                        Ok((tcp, udp)) => (Some(tcp), Some(udp)),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "连接数采集失败");
+                            buffers.push_error("connections", e);
+                            (None, None)
+                        }
+                    };
                     let processes = collector::processes();
                     slow_tx.send_replace(Some(SlowBlock {
                         ts,
                         disk_used: Some(disk_used),
-                        tcp_conn: Some(tcp_conn),
-                        udp_conn: Some(udp_conn),
+                        tcp_conn,
+                        udp_conn,
                         processes,
                     }));
                     // 探针自身资源：report_self 开关控制，关闭时快照也清空（ts 不再前进）

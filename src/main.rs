@@ -7,6 +7,8 @@ mod reporter;
 mod reporter_cf;
 mod reporter_komari;
 mod scheduler;
+#[cfg(windows)]
+mod tray;
 mod worker;
 
 use std::path::PathBuf;
@@ -18,10 +20,14 @@ use tokio::sync::watch;
 use crate::config::SharedConfig;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const DEFAULT_CONFIG: &str = "/etc/probe-rs/config.toml";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(windows)]
+    if std::env::args_os().any(|arg| arg == "--tray") {
+        return tray::run();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -78,8 +84,11 @@ async fn main() -> Result<()> {
     let (gpu_name_tx, gpu_name_rx) = tokio::sync::watch::channel::<Option<String>>(None);
     let (gpu_tx, gpu_rx) = tokio::sync::watch::channel::<Vec<model::GpuRecord>>(Vec::new());
     let (_ip_handle, ip_rx) = worker::public_ip::spawn(Arc::clone(&buffers), intervals_rx.clone());
-    let (_slow_handle, slow_rx, self_rx) =
-        worker::slow::spawn(Arc::clone(&shared), intervals_rx.clone());
+    let (_slow_handle, slow_rx, self_rx) = worker::slow::spawn(
+        Arc::clone(&shared),
+        intervals_rx.clone(),
+        Arc::clone(&buffers),
+    );
     let (_diskio_handle, diskio_rx) =
         worker::diskio::spawn(intervals_rx.clone(), Arc::clone(&buffers));
 
@@ -234,7 +243,7 @@ fn parse_config_arg() -> PathBuf {
             _ => {}
         }
     }
-    PathBuf::from(DEFAULT_CONFIG)
+    config::default_config_path()
 }
 
 async fn wait_for_signal() {

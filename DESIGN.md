@@ -273,7 +273,7 @@ ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最
 | `buffer` | dynamic / async 双缓冲，report 时 drain，失败 restore（有界） |
 | `reporter` | HTTP POST；响应解析（远端配置）；必报/失败丢弃策略 |
 
-平台支持：Linux（手写 /proc 解析，零依赖）、macOS/Windows（sysinfo crate 实现，连接数解析 netstat）；`collector` 模块为平台门面，按 cfg 分流。
+平台支持：Linux（手写 /proc 解析，零依赖）、macOS/Windows（sysinfo crate 实现，连接数解析 netstat）；`collector` 模块为平台门面，按 cfg 分流。Linux 默认从 `/etc/probe-rs/config.toml` 读取配置并把流量数据写到 `/var/lib/probe-rs/`；Windows 默认把配置和流量数据放在 `%ProgramData%\probe-rs\`，由 SYSTEM 开机计划任务托管。
 
 ## 7. 已明确的取舍（备忘）
 

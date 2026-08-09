@@ -1,6 +1,6 @@
 # 自动构建并发版：tag 取自 Cargo.toml 的 version（v<version>）
-# release 同时具有两个架构产物才算完成；缺少任一产物时可安全重试。
-# 产物命名与 deploy/cf-install.sh 的下载地址对应：probe-rs-linux-<arch>
+# release 同时具有全部平台产物才算完成；缺少任一产物时可安全重试。
+# 产物命名与 deploy/cf-install.sh、deploy/cf-install.ps1 的下载地址对应。
 name: release
 
 on:
@@ -44,7 +44,7 @@ jobs:
           assets=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
             --json assets --jq '.assets[].name' 2>/dev/null || true)
           complete=true
-          for name in probe-rs-linux-x86_64 probe-rs-linux-aarch64; do
+          for name in probe-rs-linux-x86_64 probe-rs-linux-aarch64 probe-rs-windows-x86_64.exe; do
             if ! grep -Fxq "$name" <<<"$assets"; then
               complete=false
             fi
@@ -54,7 +54,7 @@ jobs:
           echo "ref=$build_ref" >> "$GITHUB_OUTPUT"
           echo "skip=$complete" >> "$GITHUB_OUTPUT"
           if [ "$complete" = true ]; then
-            echo "$tag 的两个架构产物均已存在，跳过发版"
+            echo "$tag 的全部平台产物均已存在，跳过发版"
           else
             echo "$tag 产物不完整，将从 $build_ref 构建并发版"
           fi
@@ -68,10 +68,15 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             name: probe-rs-linux-x86_64
+            os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             name: probe-rs-linux-aarch64
+            os: ubuntu-latest
             linker: aarch64-linux-gnu-gcc
-    runs-on: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            name: probe-rs-windows-x86_64.exe
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -79,17 +84,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: 验证 Rust 编译目标
+      - name: 验证 Rust 编译目标（Linux）
+        if: runner.os == 'Linux'
         run: rustup target list --toolchain stable --installed | grep -Fx "${{ matrix.target }}"
+      - name: 验证 Rust 编译目标（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installed = rustup target list --toolchain stable --installed
+          if ($installed -notcontains '${{ matrix.target }}') {
+            throw 'Rust target is not installed: ${{ matrix.target }}'
+          }
       - name: 安装交叉链接器（aarch64）
         if: matrix.linker
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: 构建
+      - name: 构建（Linux）
+        if: runner.os == 'Linux'
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
         run: |
           cargo +stable build --release --target "${{ matrix.target }}"
           cp "target/${{ matrix.target }}/release/probe-rs" "${{ matrix.name }}"
+      - name: 构建（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo +stable build --release --target "${{ matrix.target }}"
+          Copy-Item "target/${{ matrix.target }}/release/probe-rs.exe" "${{ matrix.name }}"
       - name: 保存构建产物
         uses: actions/upload-artifact@v4
         with:
@@ -105,7 +126,7 @@ jobs:
       - name: 下载全部架构产物
         uses: actions/download-artifact@v4
         with:
-          pattern: probe-rs-linux-*
+          pattern: probe-rs-*
           path: dist
           merge-multiple: true
       - name: 一次性发布全部架构产物
@@ -120,3 +141,4 @@ jobs:
           files: |
             dist/probe-rs-linux-x86_64
             dist/probe-rs-linux-aarch64
+            dist/probe-rs-windows-x86_64.exe

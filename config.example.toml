@@ -5,6 +5,7 @@
 server_id = "srv-01"
 secret = "change-me"
 worker_url = "https://monitor.example.com/report"
+# Linux 默认路径；Windows 安装脚本会改写为 %ProgramData%\probe-rs\net_static.json
 net_static_path = "/var/lib/probe-rs/net_static.json"
 # 协议类型："probe"（默认，REPORT.md 协议）| "cf"（CF-Server-Monitor 的 POST /update）
 #        | "komari"（komari 面板的 WS v2 JSON-RPC）

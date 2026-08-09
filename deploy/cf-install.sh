@@ -136,7 +136,7 @@ install -d -m 0750 "$CONF_DIR"
     echo "reset_day = $RESET_DAY"
     echo 'config_version = ""'
     echo "interfaces = []"
-    echo "enable_gpu = false"
+    echo "enable_gpu = true"
     echo "report_errors = true"
     echo "report_self = false"
     echo ""

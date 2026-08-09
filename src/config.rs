@@ -54,8 +54,38 @@ fn default_reset_day() -> u8 {
     1
 }
 
+pub fn default_config_path() -> PathBuf {
+    platform_config_dir().join("config.toml")
+}
+
 fn default_net_static_path() -> String {
-    "/var/lib/probe-rs/net_static.json".into()
+    platform_data_dir()
+        .join("net_static.json")
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(windows)]
+fn platform_data_dir() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("probe-rs")
+}
+
+#[cfg(windows)]
+fn platform_config_dir() -> PathBuf {
+    platform_data_dir()
+}
+
+#[cfg(not(windows))]
+fn platform_data_dir() -> PathBuf {
+    PathBuf::from("/var/lib/probe-rs")
+}
+
+#[cfg(not(windows))]
+fn platform_config_dir() -> PathBuf {
+    PathBuf::from("/etc/probe-rs")
 }
 
 impl LocalConfig {
@@ -311,6 +341,34 @@ mod tests {
             report_errors: true,
             report_self: false,
             ext: Default::default(),
+        }
+    }
+
+    #[test]
+    fn default_paths_match_platform_layout() {
+        #[cfg(windows)]
+        {
+            let base = std::env::var_os("ProgramData")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+                .join("probe-rs");
+            assert_eq!(default_config_path(), base.join("config.toml"));
+            assert_eq!(
+                PathBuf::from(default_net_static_path()),
+                base.join("net_static.json")
+            );
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                default_config_path(),
+                PathBuf::from("/etc/probe-rs/config.toml")
+            );
+            assert_eq!(
+                default_net_static_path(),
+                "/var/lib/probe-rs/net_static.json"
+            );
         }
     }
 

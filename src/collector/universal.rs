@@ -149,13 +149,26 @@ pub fn processes() -> Option<u64> {
 }
 
 /// 解析 netstat -an：TCP 全状态计数（行首 tcp/TCP），UDP 同理
-pub fn connections() -> (u64, u64) {
-    let Ok(out) = Command::new("netstat").args(["-an"]).output() else {
-        return (0, 0);
-    };
+pub fn connections() -> Result<(u64, u64), String> {
+    let out = Command::new("netstat")
+        .args(["-an"])
+        .output()
+        .map_err(|e| format!("netstat -an 启动失败: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "netstat -an 退出失败（{}）: {}",
+            out.status,
+            stderr.trim()
+        ));
+    }
+    Ok(parse_netstat(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn parse_netstat(text: &str) -> (u64, u64) {
     let mut tcp = 0u64;
     let mut udp = 0u64;
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
+    for line in text.lines() {
         let line = line.trim_start().to_lowercase();
         if line.starts_with("tcp") {
             tcp += 1;
@@ -260,9 +273,9 @@ pub async fn read_disk_io_counters() -> Option<super::DiskIoCounters> {
     Some(parse_ioreg_statistics(&text))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
 pub async fn read_disk_io_counters() -> Option<super::DiskIoCounters> {
-    None // Windows：PDH 计数器一期不做
+    super::windows_diskio::read_counters()
 }
 
 #[cfg(target_os = "macos")]
@@ -303,5 +316,21 @@ mod diskio_tests {
         assert_eq!(c.write_ops, 15);
         assert_eq!(c.total_time_ms, 9);
         assert!(c.io_ms_per_dev.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    #[test]
+    fn parses_windows_and_unix_netstat_rows() {
+        let text = r#"
+  Proto  Local Address          Foreign Address        State
+  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING
+  TCP    [::]:445               [::]:0                 LISTENING
+  UDP    0.0.0.0:500            *:*
+tcp4       0      0  127.0.0.1.80          *.*                    LISTEN
+udp6       0      0  *.5353                *.*
+"#;
+        assert_eq!(super::parse_netstat(text), (3, 2));
     }
 }

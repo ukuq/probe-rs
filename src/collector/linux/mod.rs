@@ -57,8 +57,8 @@ pub fn processes() -> Option<u64> {
     process::collect()
 }
 
-pub fn connections() -> (u64, u64) {
-    conn::collect()
+pub fn connections() -> Result<(u64, u64), String> {
+    Ok(conn::collect())
 }
 
 pub fn net_bytes(filter: &IfaceFilter) -> NetBytes {

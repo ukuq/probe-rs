@@ -76,7 +76,7 @@ pub struct CfMetrics {
     pub kernel_version: String,
     pub cpu_info: String,
     pub cpu_cores: u32,
-    /// 探针标识（CF 存库展示；形如 1.3.8_probe-rs_0.1.0，可与官方探针区分）
+    /// 探针标识（CF 存库展示；形如 0.0.0_probe-rs_0.1.0，可与官方探针区分）
     pub agent_version: String,
     /// 上报时刻（毫秒），CF 映射为 last_updated
     pub timestamp: i64,
@@ -160,9 +160,9 @@ pub struct CfDynMetrics {
 
 const MIB: u64 = 1024 * 1024;
 
-/// 对应的 CF 官方探针版本（CF-Server-Monitor src/utils/settings.js AGENT_VERSION）。
+/// CF 服务端展示使用的探针版本前缀。
 /// 上报标识 = "{CF_COMPAT_VERSION}_probe-rs_{本版本}"（CF 允许的字符集：0-9A-Za-z.+_-）
-pub const CF_COMPAT_VERSION: &str = "1.3.8";
+pub const CF_COMPAT_VERSION: &str = "0.0.0";
 
 /// CF 探针标识：头部与 body 的 agent_version 统一用它
 pub fn cf_agent_version(our_version: &str) -> String {
@@ -581,7 +581,7 @@ mod tests {
         let m = build_metrics(&st, Some(&d), Some(&slow), &[], &pings, None, &ping_targets);
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["cpu"], 12.35);
-        assert_eq!(v["agent_version"], "1.3.8_probe-rs_0.1.0");
+        assert_eq!(v["agent_version"], "0.0.0_probe-rs_0.1.0");
         assert!(v["timestamp"].as_i64().unwrap() > 0);
         assert_eq!(v["ram_total"], 12884); // 13510758768 / 2^20（向下取整）
         assert_eq!(v["ram_used"], 925);

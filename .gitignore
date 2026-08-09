@@ -11,8 +11,9 @@ net_static.json
 
 # 参考项目（仅对照用，不属于本项目）
 /cfsm-agent/
+/CF-Server-Monitor/
+/komari/
 /komari-agent/
-/CF-Server-Monitor
 
 # 工具与环境
 /.claude/

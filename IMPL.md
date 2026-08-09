@@ -149,9 +149,11 @@ make build   # cargo build --release（strip + lto）
 make demo    # 本地演示服务端（8080）
 ```
 
-CI：`.github/workflows/ci.yml` 对所有 push/PR 跑 `make check` 同款门禁（rust 1.91.1 / deno 2.7.11 钉版）；`release.yml` 在 push master 时按 Cargo.toml version 发版（tag 已存在则跳过）。
+CI：`.github/workflows/ci.yml` 对所有 push/PR 在 Linux、Windows 跑 Rust 格式化与测试，并在 Linux 跑 Deno 门禁；`release.yml` 在 push master 时按 Cargo.toml version 发版，产出 Linux x86_64/aarch64 与 Windows x86_64 三个文件（资产完整时跳过）。
 
-## 部署（Linux + systemd）
+## 部署
+
+### Linux + systemd
 
 ```bash
 cargo build --release          # 产物 target/release/probe-rs（strip + lto）
@@ -164,11 +166,36 @@ sudo ./deploy/install.sh       # 装二进制/unit/示例配置；已装过则�
 - 卸载：`./deploy/install.sh uninstall`（保留配置与数据，加 `--purge` 全清）
 - 一键脚本（换 URL 即可装，参数对齐各官方探针）：CF 模式 `deploy/cf-install.sh`（-id/-secret/-url/-ct/-cu/-cm/-bd）；komari 模式 `deploy/komari-install.sh`（-e 面板地址/-t token/-i 间隔，缺省 collect=1 report=3 对齐官方节奏）
 
+### Windows + 计划任务
+
+在管理员 PowerShell 中执行：
+
+```powershell
+cargo build --release
+.\deploy\install.ps1
+```
+
+- 二进制 → `%ProgramFiles%\probe-rs\probe-rs.exe`；配置与流量数据 → `%ProgramData%\probe-rs\`
+- 使用 `SYSTEM`、最高权限的开机计划任务常驻；异常退出后每分钟重启
+- 首次安装会保留示例配置但禁用任务；填好 `server_id` / `secret` / `worker_url` 后执行 `.\deploy\install.ps1 start`
+- 状态/停止：`.\deploy\install.ps1 status` / `.\deploy\install.ps1 stop`
+- 卸载：`.\deploy\install.ps1 uninstall`（保留配置与数据，加 `-Purge` 全清）
+- Release 资产名为 `probe-rs-windows-x86_64.exe`，可用 `-BinaryPath` 指向下载后的文件
+
 ## CF 协议模式（protocol = "cf"）
 
 agent 可切换为 CF-Server-Monitor 的 `POST /update` 协议（适配官方服务端，零改动对接）。
 
 **配置**：`protocol = "cf"`（🔒 本地，重启生效）；`server_id` 填 CF 后台分配的 UUID，`secret` 填 `API_SECRET`，`worker_url` 填 `https://<worker>/update`。
+
+Windows 使用同一套 CF 协议逻辑；CF 一键安装默认启用 GPU 采集（无 `nvidia-smi` 时记录诊断但不影响其他指标）。可在管理员 PowerShell 中直接一键安装（`CollectInterval=0` 同样映射为内部 1 秒）：
+
+```powershell
+.\deploy\cf-install.ps1 install -Id <UUID> -Secret <API_SECRET> `
+  -Url https://<worker>/update -CollectInterval 0 -Interval 60
+```
+
+脚本默认下载 `probe-rs-windows-x86_64.exe`，也可用 `-BinarySource`/`-Bin` 指定本地文件或 URL；卸载使用 `.\deploy\cf-install.ps1 uninstall`，加 `-Purge` 可清除配置与流量数据。也可以通过通用 `deploy/install.ps1` 安装后，手动将 `%ProgramData%\probe-rs\config.toml` 的 `protocol` 改为 `"cf"`。
 
 **上报映射**（reporter_cf.rs）：顶层 `{id, secret, metrics, samples[]}`；ram/swap/disk 字节→MB；load 转空格字符串；GPU → `gpu_info:[{id,name,info}]`（显存/温度丢弃）；ping 按组名落 `ping_ct/cu/cm/bd` + `loss_*`（bgp 是 bd 别名，未配置为 `false`，已配置但失败为 `null`）；`ip_v4/v6` 不可达报数值 `0`；`dynamic[]` → `samples[]`（`ext.cf.batch=false` 时只发单条 metrics）。空上报周期复用最近一次独立采集快照，避免 CF 将缺失动态字段写成假 0，但不会由 report 触发采集。errors/self/virtualization 无落点，CF 模式下不产生。
 

@@ -13,7 +13,11 @@ concurrency:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       # 与 release 使用同一 stable 工具链
@@ -21,6 +25,8 @@ jobs:
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-${{ runner.os }}
       - run: cargo fmt --check
       - run: cargo test
 

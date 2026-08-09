@@ -1,16 +1,66 @@
 //! 网卡计数器：/proc/net/dev + 白名单过滤
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 #[cfg(target_os = "linux")]
 use super::scan_file;
 
 /// 默认排除的虚拟网卡前缀（Linux 容器/虚拟化 + macOS 虚拟接口）
+#[cfg(not(target_os = "windows"))]
 const EXCLUDED_PREFIXES: &[&str] = &[
     "br", "cni", "docker", "podman", "flannel", "lo", "veth", "virbr", "vmbr", "tap", "fwbr",
     "fwpr", // Linux
     "utun", "awdl", "gif", "stf", "llw", "anpi", // macOS
 ];
+
+/// Windows 的 sysinfo 网卡键是 InterfaceAlias；常见 Hyper-V、VPN 和隧道
+/// 接口通过别名片段排除。显式 interfaces 白名单始终优先，可重新纳入这些接口。
+#[cfg(target_os = "windows")]
+const WINDOWS_EXCLUDED_PARTS: &[&str] = &[
+    "vethernet",
+    "vswitch",
+    "virtual",
+    "loopback",
+    "vpn",
+    "wintun",
+    "wireguard",
+    "tailscale",
+    "zerotier",
+    "hamachi",
+    "nordlynx",
+    "openvpn",
+    "cloudflare warp",
+    "mihomo",
+    "clash",
+    "cfw-tap",
+    "sing-box",
+    "tap-windows",
+    "teredo",
+    "isatap",
+    "6to4",
+    "local area connection*",
+    "本地连接*",
+];
+
+#[cfg(target_os = "windows")]
+const WINDOWS_EXCLUDED_PREFIXES: &[&str] = &[
+    "docker", "veth", "br-", "virbr", "vmbr", "tap", "fwbr", "fwpr",
+];
+
+#[cfg(not(target_os = "windows"))]
+fn is_default_excluded(name: &str) -> bool {
+    EXCLUDED_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+#[cfg(target_os = "windows")]
+fn is_default_excluded(name: &str) -> bool {
+    let name = name.to_lowercase();
+    name == "lo"
+        || WINDOWS_EXCLUDED_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p))
+        || WINDOWS_EXCLUDED_PARTS.iter().any(|p| name.contains(p))
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NetBytes {
@@ -32,7 +82,12 @@ impl IfaceFilter {
             if p.is_empty() {
                 continue;
             }
-            if let Ok(g) = Glob::new(p) {
+            let glob = {
+                let mut builder = GlobBuilder::new(p);
+                builder.case_insensitive(cfg!(target_os = "windows"));
+                builder.build()
+            };
+            if let Ok(g) = glob {
                 builder.add(g);
                 any = true;
             } else {
@@ -51,7 +106,7 @@ impl IfaceFilter {
     pub fn includes(&self, name: &str) -> bool {
         match &self.whitelist {
             Some(set) => set.is_match(name),
-            None => !EXCLUDED_PREFIXES.iter().any(|p| name.starts_with(p)),
+            None => !is_default_excluded(name),
         }
     }
 }
@@ -114,6 +169,20 @@ mod tests {
         assert!(!f.includes("enp3s0"));
         // 白名单模式不排除 docker 之类：以白名单为准
         assert!(!f.includes("docker0"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_default_excludes_virtual_and_vpn_adapters() {
+        let f = IfaceFilter::new(&[]);
+        assert!(f.includes("Ethernet"));
+        assert!(f.includes("WLAN"));
+        assert!(!f.includes("vEthernet (Default Switch)"));
+        assert!(!f.includes("Mihomo"));
+        assert!(!f.includes("本地连接* 8"));
+
+        let explicit = IfaceFilter::new(&["VETHERNET*".to_string()]);
+        assert!(explicit.includes("vEthernet (Default Switch)"));
     }
 
     #[test]
