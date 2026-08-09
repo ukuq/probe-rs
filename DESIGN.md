@@ -110,7 +110,7 @@
 
 ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最多 3 次；TCP 探测若重测降幅 >800ms，判定为 SYN 重传污染，本次记为失败。
 
-Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端口，ICMP 为小写 host；HTTP 为 scheme + 小写 host + 有效端口，忽略 path/query，但 HTTP 与 HTTPS 不合并。重复任务周期取最小值（而非最大公约数）：最小值直接满足每个消费者要求且不会产生比任何一路更密的额外采样。结果与错误在出口恢复为该 Reporter 自己的逻辑名称。
+Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端口，ICMP 为小写 host；HTTP 为 scheme + 小写 host + 有效端口，HTTP 与 HTTPS 不合并。HTTP target 仅允许 `http(s)://host[:port]`（根 `/` 等价可接受），所有类型均禁止 path/query/fragment。重复任务周期取最小值（而非最大公约数）：最小值直接满足每个消费者要求且不会产生比任何一路更密的额外采样。结果与错误在出口恢复为该 Reporter 自己的逻辑名称。
 
 ## 3. 上报模型
 
@@ -147,6 +147,7 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 - **月流量/累计值**：放在 `dynamic` 记录中带当前值（上报时刻向 netstatic 现查）。
 - **上报失败有界保留**：失败的记录放回缓冲待下次重发，上限 10 条（只覆盖短暂抖动，长断网历史不补发）。
 - **数据陈旧判断交给服务端**：动态数据有 `ts`，静态数据本来不变，不报 `measured_at` 之类的额外字段。
+- **配置回执带完整 Ping 定义**：`static.config.global.pings` 是按 type + 规范化 target 聚合后的无 name/type 实际 worker 配置 `{target,interval}`，类型编码进 URI target（如 `tcp://host:80`、`https://host:443`、`icmp://host`），周期取各路最小值；`static.config.reporters[].pings` 保留每路原始 name/type/target/interval。target 用于配置核对，不脱敏；secret、worker_url 及其他线路身份仍不回传。
 
 ### 3.3 数据口径约定
 
@@ -206,7 +207,7 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 | `reset_day` | 月流量账期重置日，1-31；0 = 不重置（永久累计） |
 | `interfaces` | 当前 Reporter 的网卡白名单（glob 数组） |
 | `disks` | 当前 Reporter 的卷/物理盘白名单（glob 数组） |
-| `pings` | 当前 Reporter 的整组 Ping 需求（显式 type/target/interval） |
+| `pings` | 当前 Reporter 的整组 Ping 需求（显式 type/target/interval）；target 不允许 path/query/fragment |
 | `report_gpu` | 当前 Reporter 是否输出 GPU，并参与机器级 GPU worker 的 OR 聚合 |
 | `report_errors` | 当前 Reporter 是否输出错误事件 |
 | `report_self` | 当前 Reporter 是否输出探针自身指标 |

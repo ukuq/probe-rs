@@ -55,6 +55,11 @@ interface CollectionIntervals {
   diskio: number;
 }
 
+interface GlobalPingTarget {
+  target: string;
+  interval: number;
+}
+
 interface ReporterSummary {
   id: string;
   protocol: string;
@@ -66,7 +71,7 @@ interface ReporterSummary {
   report_gpu: boolean;
   report_errors: boolean;
   report_self: boolean;
-  ping_names: string[];
+  pings: PingTarget[];
 }
 
 interface StaticInfo {
@@ -97,9 +102,9 @@ interface StaticInfo {
       all_interfaces: boolean;
       disks: string[];
       all_disks: boolean;
-      ping_names: string[];
+      pings: GlobalPingTarget[];
     };
-    /** 全部 Reporter 的脱敏摘要；不包含地址、密钥、server_id 或配置版本 */
+    /** 全部 Reporter 的脱敏摘要；包含 Ping target，不包含上报地址、密钥、server_id 或配置版本 */
     reporters?: ReporterSummary[];
     reset_day: number;
     intervals: Intervals;
@@ -406,6 +411,27 @@ function newConfigVersion(): string {
     }+08:00`;
 }
 
+function pingTargetError(kind: string, target: string): string | null {
+  if (target.trim() !== target) return "target 首尾不能有空白";
+  if (kind === "http") {
+    let url: URL;
+    try {
+      url = new URL(target);
+    } catch {
+      return "HTTP target 必须是合法 URL";
+    }
+    if (!["http:", "https:"].includes(url.protocol) || !url.hostname) {
+      return "HTTP target 只允许 http(s)://host[:port]";
+    }
+    if (url.pathname !== "/" || url.search || url.hash) {
+      return "target 不允许 path/query/fragment";
+    }
+  } else if ([...target].some((ch) => ["/", "\\", "?", "#"].includes(ch))) {
+    return "target 不允许 path/query/fragment";
+  }
+  return null;
+}
+
 function handleSetConfig(
   instanceId: string,
   cfg: Record<string, unknown>,
@@ -477,26 +503,40 @@ function handleSetConfig(
   if (disks !== undefined) {
     if (
       !Array.isArray(disks) ||
-      !disks.every((x) => typeof x === "string" && x.length > 0 && x.length <= 64)
+      !disks.every((x) =>
+        typeof x === "string" && x.length > 0 && x.length <= 64
+      )
     ) {
-      return json({ error: "disks 必须为非空字符串数组（单个 <= 64 字符）" }, 400);
+      return json(
+        { error: "disks 必须为非空字符串数组（单个 <= 64 字符）" },
+        400,
+      );
     }
     next.disks = disks as string[];
   }
   if (pings !== undefined) {
-    if (
-      !Array.isArray(pings) ||
-      !pings.every((ping) => {
-        if (typeof ping !== "object" || ping === null) return false;
-        const p = ping as Record<string, unknown>;
-        return typeof p.name === "string" && p.name.length > 0 &&
-          ["http", "tcp", "icmp"].includes(String(p.type)) &&
-          typeof p.target === "string" && p.target.length > 0 &&
-          (p.interval === undefined ||
-            (Number.isInteger(p.interval) && Number(p.interval) >= 1));
-      })
-    ) {
+    if (!Array.isArray(pings)) {
       return json({ error: "pings 格式非法" }, 400);
+    }
+    for (let index = 0; index < pings.length; index++) {
+      const ping = pings[index];
+      if (typeof ping !== "object" || ping === null) {
+        return json({ error: `Ping 第 ${index + 1} 行格式非法` }, 400);
+      }
+      const p = ping as Record<string, unknown>;
+      if (
+        typeof p.name !== "string" || p.name.length === 0 ||
+        !["http", "tcp", "icmp"].includes(String(p.type)) ||
+        typeof p.target !== "string" || p.target.length === 0 ||
+        (p.interval !== undefined &&
+          (!Number.isInteger(p.interval) || Number(p.interval) < 1))
+      ) {
+        return json({ error: `Ping 第 ${index + 1} 行格式非法` }, 400);
+      }
+      const targetError = pingTargetError(String(p.type), p.target);
+      if (targetError) {
+        return json({ error: `Ping 第 ${index + 1} 行 ${targetError}` }, 400);
+      }
     }
     next.pings = pings as PingTarget[];
   }
@@ -533,7 +573,8 @@ function handleSetConfig(
   }
   if (Object.keys(cf).length) next.ext = { cf };
   if (
-    intervals === undefined && report_interval === undefined && reset_day === undefined &&
+    intervals === undefined && report_interval === undefined &&
+    reset_day === undefined &&
     interfaces === undefined && disks === undefined && pings === undefined &&
     report_gpu === undefined &&
     report_errors === undefined && report_self === undefined &&
@@ -825,6 +866,9 @@ const PAGE = `<!doctype html>
     color: var(--text); font: inherit; font-size: 12.5px; padding: 4px 10px; }
   .rpt-detail pre.code { max-height: 480px; overflow: auto; }
   /* 配置分组与逐项编辑 */
+  .cfg-section-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; margin: 16px 2px -2px; }
+  .cfg-section-title { color: var(--text); font-size: 13px; font-weight: 650; }
+  .cfg-section-note { color: var(--text3); font-size: 11.5px; }
   .cfg-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
     gap: 12px; margin-top: 14px; }
   .cfg-group { background: var(--card-2); border-radius: 10px; padding: 12px 14px; }
@@ -846,21 +890,33 @@ const PAGE = `<!doctype html>
   .cfg-item textarea { width: 100%; min-height: 76px; resize: vertical; background: var(--fill);
     border: 0.5px solid var(--sep); border-radius: 6px; color: var(--text); font: 11.5px ui-monospace;
     padding: 6px 8px; }
-  .cfg-item input:focus, .cfg-item select:focus, .ping-row input:focus {
+  .cfg-item input:focus, .cfg-item select:focus, .ping-row input:focus, .ping-row select:focus {
     outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px rgba(10,132,255,.3); }
   .cfg-item input:disabled, .cfg-item select:disabled { opacity: .3; }
   .cfg-item input.wide { min-width: 0; }
   .topology .cfg-item .cur { max-width: 360px; }
   .cfg-pings { grid-column: 1 / -1; }
-  .ping-row { display: grid; grid-template-columns: 104px minmax(0,1fr) 72px 26px; gap: 6px;
+  .ping-toggle { grid-template-columns: minmax(0,1fr) auto; }
+  .ping-head, .ping-row { display: grid;
+    grid-template-columns: 84px minmax(110px,.55fr) minmax(180px,1fr) 82px 28px; gap: 6px;
+    align-items: center; }
+  .ping-head { margin-top: 8px; color: var(--text3); font-size: 11px; padding: 0 1px; }
+  .ping-row {
     margin-top: 6px; align-items: center; }
-  .ping-row input { background: var(--fill); border: 0.5px solid var(--sep); border-radius: 6px;
+  .ping-row input, .ping-row select { background: var(--fill); border: 0.5px solid var(--sep); border-radius: 6px;
     color: var(--text); font: inherit; font-size: 12.5px; padding: 4px 8px; min-width: 0; }
-  .ping-row input:disabled { opacity: .3; }
+  .ping-row input:disabled, .ping-row select:disabled { opacity: .3; }
+  .ping-empty { color: var(--text3); font-size: 12px; padding: 10px 0 2px; }
   .ping-del { background: none; border: none; color: var(--text3); cursor: pointer;
     font-size: 13px; padding: 0; text-align: center; }
   .ping-del:hover { color: var(--red); }
+  .ping-del:disabled, .ping-add:disabled { cursor: default; opacity: .3; }
   .ping-add { margin-top: 8px; }
+  @media (max-width: 680px) {
+    .ping-head { display: none; }
+    .ping-row { grid-template-columns: 78px minmax(90px,1fr) 74px 28px; }
+    .ping-row .ping-target { grid-column: 1 / -1; grid-row: 2; }
+  }
   .cfg-foot { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
   .cfg-status { color: var(--orange); font-size: 12px; }
   .cfg-hint { color: var(--text3); font-size: 11.5px; margin-left: auto; }
@@ -1499,19 +1555,46 @@ function cfgGroup(title, rows) {
   return g;
 }
 
+function cfgPingTargetError(kind, target) {
+  if (target.trim() !== target) return 'target 首尾不能有空白';
+  if (kind === 'http') {
+    var url;
+    try { url = new URL(target); } catch (_) { return 'HTTP target 必须是合法 URL'; }
+    if (!['http:', 'https:'].includes(url.protocol) || !url.hostname)
+      return 'HTTP target 只允许 http(s)://host[:port]';
+    if (url.pathname !== '/' || url.search || url.hash)
+      return 'target 不允许 path/query/fragment';
+  } else {
+    for (var i = 0; i < target.length; i++) {
+      if ([47, 92, 63, 35].includes(target.charCodeAt(i)))
+        return 'target 不允许 path/query/fragment';
+    }
+  }
+  return null;
+}
+
 function cfgEditForm(s, st) {
   var cf = st.config || {};          // static.config.*：当前生效配置
   var iv = cf.intervals || {};
   var global = cf.global || {};
   var collectIv = global.intervals || iv;
   var wrap = el('div');
-  var groups = el('div', 'cfg-groups');
-  wrap.append(groups);
   var items = [];
-  function group(title) {
+  function section(title, note) {
+    var root = el('section', 'cfg-section');
+    var head = el('div', 'cfg-section-head');
+    head.append(el('span', 'cfg-section-title', title), el('span', 'cfg-section-note', note));
+    var sectionGroups = el('div', 'cfg-groups');
+    root.append(head, sectionGroups);
+    wrap.append(root);
+    return { root: root, groups: sectionGroups };
+  }
+  var readSection = section('只读信息', '来自 Agent 当前上报，不能在此页面修改');
+  var editSection = section('可修改配置', '仅作用于当前 Reporter，勾选后随上报响应下发');
+  function group(sectionGroups, title) {
     var g = el('div', 'cfg-group');
     g.append(el('h3', null, title));
-    groups.append(g);
+    sectionGroups.append(g);
     return g;
   }
   function editRow(g, label, curText, input, apply) {
@@ -1532,7 +1615,8 @@ function cfgEditForm(s, st) {
   }
   function plainRow(g, label, curText) {
     var row = el('div', 'cfg-item plain');
-    row.append(el('span', 'lab', label), el('span', 'cur', curText));
+    var cur = el('span', 'cur', curText); cur.title = String(curText);
+    row.append(el('span', 'lab', label), cur);
     g.append(row);
   }
   function numInput(cur, min, max) {
@@ -1543,29 +1627,42 @@ function cfgEditForm(s, st) {
   }
   function sec(v) { return v != null ? v + ' s' : '–'; }
 
-  var gIdentity = group('Reporter 实例（连接信息只读）');
+  var gIdentity = group(readSection.groups, 'Reporter 实例');
   plainRow(gIdentity, 'Reporter ID', s.reporter_id || 'primary');
   plainRow(gIdentity, '协议 protocol', s.protocol || 'probe');
   plainRow(gIdentity, '服务器 server_id', s.server_id);
+  plainRow(gIdentity, '配置版本 config_version', fmtVer(s.config_version));
   plainRow(gIdentity, '当前接收入口', location.origin + '/report');
   plainRow(gIdentity, '线路权限', '当前接入 · 可下发');
   plainRow(gIdentity, '认证 secret', '••••••（不展示）');
   plainRow(gIdentity, 'net_static_path', '本地私有，协议不回传');
 
-  var gCollect = group('全局实际采集（只读）');
+  var gCollect = group(readSection.groups, '全局实际采集');
   [['collect', '采样 collect'], ['ping', '探测 ping'], ['slow', '慢变 slow'],
    ['gpu', 'GPU gpu'], ['ip', '公网 IP ip'], ['diskio', '磁盘 IO diskio']]
     .forEach(function (def) { plainRow(gCollect, def[1], sec(collectIv[def[0]])); });
   plainRow(gCollect, 'GPU worker enable_gpu', global.enable_gpu == null
     ? '–' : (global.enable_gpu ? '开' : '关'));
-  plainRow(gCollect, 'Ping worker', Array.isArray(global.ping_names)
-    ? (global.ping_names.join(', ') || '（无）') : '–');
+  var globalPings = Array.isArray(global.pings) ? global.pings : [];
+  var globalPingText = globalPings.map(function (p) {
+    return p.target + ' @ ' + (p.interval ?? collectIv.ping) + 's';
+  }).join('; ');
+  plainRow(gCollect, 'Ping worker', globalPings.length
+    ? globalPings.length + ' 组 · ' + globalPingText : '（无）');
   plainRow(gCollect, '网卡并集', global.all_interfaces ? '全部默认物理网卡'
     : ((global.interfaces || []).join(', ') || '–'));
   plainRow(gCollect, '磁盘并集', global.all_disks ? '全部卷 / 物理盘'
     : ((global.disks || []).join(', ') || '–'));
 
-  var gDemand = group('本 Reporter 采集需求（参与全局聚合）');
+  var gStatic = group(readSection.groups, '静态信息');
+  plainRow(gStatic, 'static 刷新周期', '600 s（固定）');
+  plainRow(gStatic, 'static 采集于', st.ts ? new Date(st.ts).toLocaleString('zh-CN') : '–');
+  plainRow(gStatic, 'agent 版本', 'v' + (st.agent_version || s.agent_version || '?'));
+  (st.disks || []).forEach(function (disk) {
+    plainRow(gStatic, '卷 ' + (disk.mount_point || disk.id), fmtB(disk.used) + ' / ' + fmtB(disk.total));
+  });
+
+  var gDemand = group(editSection.groups, '本 Reporter 采集需求（参与全局聚合）');
   [['collect', '同步采样 collect'], ['ping', 'Ping 默认 ping'], ['slow', '慢指标 slow'],
    ['gpu', 'GPU gpu'], ['ip', '公网 IP ip'], ['diskio', '磁盘 IO diskio']]
     .forEach(function (def) {
@@ -1579,14 +1676,13 @@ function cfgEditForm(s, st) {
         p.intervals[def[0]] = v;
       });
     });
-  var gReport = group('Reporter 上报策略');
+  var gReport = group(editSection.groups, 'Reporter 上报策略');
   editRow(gReport, '上报间隔 report_interval', sec(iv.report), numInput(iv.report, 1),
     function (p, inp) {
       var v = Number(inp.value);
       if (!Number.isInteger(v) || v < 1) throw 'report_interval 必须 >= 1';
       p.report_interval = v;
     });
-  plainRow(gReport, '配置版本 config_version', fmtVer(s.config_version));
   editRow(gReport, '流量重置日 reset_day',
     cf.reset_day != null ? (cf.reset_day === 0 ? '不重置' : '每月 ' + cf.reset_day + ' 号') : '–',
     numInput(cf.reset_day, 0, 31),
@@ -1596,7 +1692,7 @@ function cfgEditForm(s, st) {
       p.reset_day = v;
     });
 
-  var gBool = group('Reporter 输出开关');
+  var gBool = group(editSection.groups, 'Reporter 输出开关');
   [['report_gpu', 'enable_gpu', 'GPU 输出 report_gpu'],
    ['report_errors', 'report_errors', '错误上报 report_errors'],
    ['report_self', 'report_self', '自身占用 report_self']].forEach(function (def) {
@@ -1611,7 +1707,7 @@ function cfgEditForm(s, st) {
 
   if ((s.protocol || 'probe') === 'cf') {
     var cfExt = ((cf.ext || {}).cf) || {};
-    var gCf = group('CF 扩展 ext.cf');
+    var gCf = group(editSection.groups, 'CF 扩展 ext.cf');
     [['cf_correction', '流量校正 correction', cfExt.correction],
      ['cf_batch', '批量 samples batch', cfExt.batch]].forEach(function (def) {
       var sel = el('select');
@@ -1624,7 +1720,7 @@ function cfgEditForm(s, st) {
     });
   }
 
-  var gIface = group('网卡 interfaces');
+  var gIface = group(editSection.groups, '网卡 interfaces');
   var ifInp = el('input'); ifInp.type = 'text'; ifInp.className = 'wide';
   ifInp.placeholder = 'eth*, ens*（留空 = 清空）';
   if (Array.isArray(cf.interfaces) && cf.interfaces.length) ifInp.value = cf.interfaces.join(', ');
@@ -1634,7 +1730,7 @@ function cfgEditForm(s, st) {
     p.interfaces = inp.value.split(',').map(function (x) { return x.trim(); }).filter(Boolean);
   });
 
-  var gDisk = group('磁盘 disks');
+  var gDisk = group(editSection.groups, '磁盘 disks');
   var diskInp = el('input'); diskInp.type = 'text'; diskInp.className = 'wide';
   diskInp.placeholder = 'C:*, 0 C:, nvme*（留空 = 全部）';
   if (Array.isArray(cf.disks) && cf.disks.length) diskInp.value = cf.disks.join(', ');
@@ -1643,44 +1739,99 @@ function cfgEditForm(s, st) {
     p.disks = inp.value.split(',').map(function (x) { return x.trim(); }).filter(Boolean);
   });
 
-  var gPing = group('当前 Reporter Ping（type name target interval）');
-  var pingInp = el('textarea');
-  pingInp.value = (Array.isArray(cf.pings) ? cf.pings : []).map(function (p) {
-    return [p.type || 'tcp', p.name, p.target, p.interval || iv.ping].join(' ');
-  }).join(String.fromCharCode(10));
-  editRow(gPing, '整组更新', (cf.pings || []).length + ' 项', pingInp, function (p, inp) {
-    p.pings = inp.value.split(/\r?\n/).map(function (line) { return line.trim(); })
-      .filter(Boolean).map(function (line) {
-        var parts = line.split(/\s+/);
-        if (parts.length !== 4 || !['http', 'tcp', 'icmp'].includes(parts[0]))
-          throw 'Ping 每行格式：type name target interval';
-        var interval = Number(parts[3]);
-        if (!Number.isInteger(interval) || interval < 1) throw 'Ping interval 必须 >= 1';
-        return { type: parts[0], name: parts[1], target: parts[2], interval: interval };
-      });
-  });
-  if (Array.isArray(cf.pings) && cf.pings.length) {
-    cf.pings.forEach(function (p) {
-      plainRow(gPing, (p.type || 'tcp') + ' · ' + p.name,
-        p.target + (p.interval != null ? ' · ' + sec(p.interval) : ''));
-    });
-  } else {
-    plainRow(gPing, 'pings', '（当前 Reporter 不输出探测结果）');
-  }
+  var gPing = group(editSection.groups, '当前 Reporter Ping');
+  gPing.classList.add('cfg-pings');
+  var pingToggle = el('div', 'cfg-item ping-toggle');
+  var pingLab = el('label', 'lab');
+  var pingCb = el('input'); pingCb.type = 'checkbox';
+  var pingCur = el('span', 'cur');
+  pingLab.append(pingCb, el('span', null, '更新整组 Ping'));
+  pingToggle.append(pingLab, pingCur);
+  gPing.append(pingToggle);
 
-  var gStatic = group('静态（只读）');
-  plainRow(gStatic, 'static 刷新周期', '600 s（固定）');
-  plainRow(gStatic, 'static 采集于', st.ts ? new Date(st.ts).toLocaleString('zh-CN') : '–');
-  plainRow(gStatic, 'agent 版本', 'v' + (st.agent_version || s.agent_version || '?'));
-  (st.disks || []).forEach(function (disk) {
-    plainRow(gStatic, '卷 ' + (disk.mount_point || disk.id), fmtB(disk.used) + ' / ' + fmtB(disk.total));
+  var pingEditor = el('div');
+  var pingHead = el('div', 'ping-head');
+  ['type', 'name', 'target', 'interval', ''].forEach(function (label) {
+    pingHead.append(el('span', null, label));
   });
+  var pingRows = el('div');
+  var pingEmpty = el('div', 'ping-empty', '暂无 Ping；勾选更新后可添加');
+  var pingAdd = el('button', 'btn ping-add', '＋ 添加 Ping'); pingAdd.type = 'button';
+  pingEditor.append(pingHead, pingRows, pingEmpty, pingAdd);
+  gPing.append(pingEditor);
+
+  function setPingEnabled(enabled) {
+    pingToggle.classList.toggle('on', enabled);
+    pingRows.querySelectorAll('input, select, button').forEach(function (control) {
+      control.disabled = !enabled;
+    });
+    pingAdd.disabled = !enabled;
+  }
+  function updatePingState() {
+    var count = pingRows.children.length;
+    pingCur.textContent = count + ' 项';
+    pingEmpty.style.display = count ? 'none' : '';
+  }
+  function addPingRow(value) {
+    value = value || {};
+    var row = el('div', 'ping-row');
+    var type = el('select'); type.setAttribute('aria-label', 'Ping 类型');
+    ['http', 'tcp', 'icmp'].forEach(function (kind) {
+      var opt = el('option', null, kind); opt.value = kind; type.append(opt);
+    });
+    type.value = ['http', 'tcp', 'icmp'].includes(value.type) ? value.type : 'tcp';
+    var name = el('input'); name.type = 'text'; name.placeholder = 'name';
+    name.setAttribute('aria-label', 'Ping 名称'); name.value = value.name || '';
+    var target = el('input', 'ping-target'); target.type = 'text'; target.placeholder = 'host[:port] 或 http(s)://host（无 path）';
+    target.setAttribute('aria-label', 'Ping 目标'); target.value = value.target || '';
+    var interval = numInput(value.interval != null ? value.interval : (iv.ping || 1), 1);
+    interval.setAttribute('aria-label', 'Ping 间隔（秒）');
+    var del = el('button', 'ping-del', '×'); del.type = 'button'; del.title = '删除此 Ping';
+    del.onclick = function () { row.remove(); updatePingState(); };
+    row.append(type, name, target, interval, del);
+    row.pingControls = { type: type, name: name, target: target, interval: interval };
+    pingRows.append(row);
+    setPingEnabled(pingCb.checked);
+    updatePingState();
+    return name;
+  }
+  (Array.isArray(cf.pings) ? cf.pings : []).forEach(addPingRow);
+  updatePingState();
+  setPingEnabled(false);
+  pingCb.onchange = function () {
+    setPingEnabled(pingCb.checked);
+    if (pingCb.checked) {
+      var first = pingRows.querySelector('input');
+      (first || pingAdd).focus();
+    }
+  };
+  pingAdd.onclick = function () { addPingRow({}).focus(); };
+  items.push({ cb: pingCb, apply: function (payload) {
+    var names = new Set();
+    payload.pings = Array.from(pingRows.children).map(function (row, index) {
+      var controls = row.pingControls;
+      var type = controls.type.value;
+      var name = controls.name.value.trim();
+      var target = controls.target.value.trim();
+      var interval = Number(controls.interval.value);
+      var line = 'Ping 第 ' + (index + 1) + ' 行';
+      if (!['http', 'tcp', 'icmp'].includes(type)) throw line + ' type 非法';
+      if (!name) throw line + ' name 不能为空';
+      if (!target) throw line + ' target 不能为空';
+      var targetError = cfgPingTargetError(type, target);
+      if (targetError) throw line + ' ' + targetError;
+      if (!Number.isInteger(interval) || interval < 1) throw line + ' interval 必须 >= 1';
+      if (names.has(name)) throw 'Ping name 重复：' + name;
+      names.add(name);
+      return { type: type, name: name, target: target, interval: interval };
+    });
+  } });
 
   var foot = el('div', 'cfg-foot');
   var btn = el('button', 'btn primary', '下发配置'); btn.type = 'button';
   var status = el('span', 'cfg-status');
   foot.append(btn, status, el('span', 'cfg-hint', '勾选「更新」的项才会下发，随下次上报便车生效'));
-  wrap.append(foot);
+  editSection.root.append(foot);
   wrap.addEventListener('focusin', function () { cfgFormActive = true; });
 
   btn.onclick = function () {
@@ -1721,7 +1872,7 @@ function reporterTopology(data) {
       id: s.reporter_id || 'primary', protocol: s.protocol || 'probe',
       report_interval: (cf.intervals || {}).report, report_gpu: cf.enable_gpu,
       report_errors: cf.report_errors, report_self: cf.report_self,
-      ping_names: Array.isArray(cf.pings) ? cf.pings.map(function (p) { return p.name; }) : []
+      pings: Array.isArray(cf.pings) ? cf.pings : []
     }];
     groups.append(cfgGroup(s.server_id + ' · via ' + reporterTag(s), routes.map(function (r) {
       var current = r.id === (s.reporter_id || 'primary')
@@ -1729,15 +1880,16 @@ function reporterTopology(data) {
       var state = current
         ? '当前接入 · ' + (s.online ? '在线' : '离线') + ' · 可下发'
         : '已配置 · 外部线路 · 只读';
+      var routePings = Array.isArray(r.pings) ? r.pings : [];
       var details = ['report ' + (r.report_interval ?? '–') + 's',
         'collect ' + (((r.intervals || {}).collect) ?? '–') + 's',
         'GPU ' + (r.report_gpu == null ? '–' : (r.report_gpu ? '开' : '关')),
-        'Ping ' + (Array.isArray(r.ping_names) ? r.ping_names.length : '–') + ' 组'];
+        'Ping ' + routePings.length + ' 组'];
       return [(r.id || 'primary') + ' / ' + (r.protocol || 'probe'), state + ' · ' + details.join(' · ')];
     })));
   });
   card.append(groups, el('div', 'note',
-    'Reporter 清单来自 static.config.reporters，只包含 ID、协议和输出策略；不会回传 secret、worker_url、其他线路的 server_id/config_version。新增、删除线路仍只能改本地 TOML。'));
+    'Reporter 清单来自 static.config.reporters，包含 ID、协议、输出策略和完整 Ping 配置；不会回传 secret、worker_url、其他线路的 server_id/config_version。新增、删除线路仍只能改本地 TOML。'));
   return card;
 }
 
@@ -1916,31 +2068,41 @@ var EXAMPLE_JSON5 = \`{
         "enable_gpu": true,                 // 是否实际启动 GPU worker
         "interfaces": [], "all_interfaces": true, // Reporter 网卡需求并集；true 表示实际采全部默认物理网卡
         "disks": [], "all_disks": true,     // Reporter 磁盘需求并集；true 表示实际采全部
-        "ping_names": ["primary/ct", "primary/cu"] // 去重后的逻辑任务名；不含目标地址
+        "pings": [                           // target URI + 规范化端点去重；全局 worker 没有 Reporter 逻辑 name/type
+          { "target": "tcp://gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 },
+          { "target": "https://example.com:443", "interval": 60 },
+          { "target": "icmp://1.1.1.1", "interval": 60 }
+        ]
       },
-      "reporters": [                        // 本机全部 Reporter 的脱敏拓扑/输出策略
+      "reporters": [                        // 本机全部 Reporter 的脱敏拓扑/输出策略；当前线路是 primary/probe
         {
-          "id": "primary", "protocol": "cf", "report_interval": 30, "reset_day": 1,
+          "id": "primary", "protocol": "probe", "report_interval": 30, "reset_day": 1,
+          "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
+          "interfaces": [], "disks": [], "report_gpu": true, "report_errors": true, "report_self": true,
+          "pings": [
+            { "name": "ct", "type": "tcp", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 },
+            { "name": "health", "type": "http", "target": "https://example.com", "interval": 60 },
+            { "name": "edge", "type": "icmp", "target": "1.1.1.1", "interval": 60 }
+          ]
+        },
+        {
+          "id": "cf-upstream", "protocol": "cf", "report_interval": 30, "reset_day": 1,
           "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
           "interfaces": [], "disks": [], "report_gpu": true, "report_errors": true, "report_self": false,
-          "ping_names": ["ct", "cu"]
+          "pings": [
+            { "name": "ct", "type": "tcp", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 }
+          ]
         },
         {
           "id": "komari", "protocol": "komari", "report_interval": 1, "reset_day": 12,
           "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
           "interfaces": [], "disks": [], "report_gpu": true, "report_errors": true, "report_self": false,
-          "ping_names": []
-        },
-        {
-          "id": "local-demo", "protocol": "probe", "report_interval": 1, "reset_day": 1,
-          "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
-          "interfaces": [], "disks": [], "report_gpu": true, "report_errors": true, "report_self": true,
-          "ping_names": ["ct", "cu"]
+          "pings": []
         }
       ],                                     // 不含 secret/worker_url/server_id/config_version
       "reset_day": 1,                       // 月流量账期重置日 0-31；0 = 不重置
       "intervals": {                        // 各间隔（秒），完全独立无关系约束
-        "collect": 1, "report": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10
+        "collect": 1, "report": 30, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10
       },
       "interfaces": [],                     // 当前 Reporter 网卡白名单；空 = 所有非虚拟网卡
       "disks": [],                          // 当前 Reporter 卷/物理盘 glob；空 = 全部
@@ -1949,9 +2111,9 @@ var EXAMPLE_JSON5 = \`{
       "report_self": true,                  // 是否上报探针自身占用 kind:"self"
       "pings": [                            // 探测目标组
         { "name": "ct", "type": "tcp", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 },
-        { "name": "cu", "type": "tcp", "target": "gd-cu-dualstack.ip.zstaticcdn.com:80", "interval": 30 }
-      ],
-      "ext": { "cf": { "correction": true, "batch": true } }   // 当前为 probe 时不生效
+        { "name": "health", "type": "http", "target": "https://example.com", "interval": 60 },
+        { "name": "edge", "type": "icmp", "target": "1.1.1.1", "interval": 60 }
+      ]                                      // probe 没有协议扩展，因此不带 ext.cf
     }
   },
 
@@ -1995,7 +2157,7 @@ var EXAMPLE_JSON5 = \`{
   // 错误事件：采集/上报失败记录，空数组 = 无错误；同源同文去重
   "errors": [
     { "ts": 1754300055000, "source": "gpu", "msg": "nvidia-smi exit 1" },
-    { "ts": 1754300058000, "source": "ping:cu", "msg": "dns resolve failed" },
+    { "ts": 1754300058000, "source": "ping:health", "msg": "dns resolve failed" },
     { "ts": 1754300059000, "source": "reporter", "msg": "connection refused" }
   ]
 }\`;
@@ -2041,7 +2203,7 @@ var CONFIG_EXAMPLE_JSON5 = \`{
       "pings": [
         // 与 primary/ct 相同：只采一次（30s），本路仍用 ct-local 名称接收结果
         { "name": "ct-local", "type": "tcp", "target": "GD-CT-DUALSTACK.IP.ZSTATICCDN.COM", "interval": 60 },
-        { "name": "health", "type": "http", "target": "https://example.com/health", "interval": 60 },
+        { "name": "health", "type": "http", "target": "https://example.com", "interval": 60 },
         { "name": "edge", "type": "icmp", "target": "1.1.1.1", "interval": 60 }
       ]
     }
@@ -2062,15 +2224,12 @@ var RESPONSE_EXAMPLE_JSON5 = \`// 无配置变更时：200 OK，body 为 {} 或�
     "reset_day": 15,                // 可选；账期重置日 1-31；0 = 不重置
     "interfaces": ["eth*"],         // 可选；网卡白名单（glob）
     "disks": ["nvme*"],             // 可选；卷/物理盘 glob；空 = 全部
-    "pings": [                      // 可选；整组替换当前 Reporter 的 Ping 需求
+    "pings": [                      // 可选；整组替换；target 只能是端点，不能带 path/query/fragment
       { "name": "edge", "type": "icmp", "target": "1.1.1.1", "interval": 60 }
     ],
     "report_gpu": true,             // 可选；也会参与全局 GPU worker 的 OR 聚合
     "report_errors": false,         // 可选；是否上报 errors 错误事件
-    "report_self": true,            // 可选；是否上报探针自身资源占用 kind:"self"
-    "ext": {                        // 可选；协议扩展，只写出现的子项
-      "cf": { "correction": true, "batch": true }
-    }
+    "report_self": true             // 可选；是否上报探针自身资源占用 kind:"self"
   },
   "next": {                         // 可选；对下一次上报的指令
     "static": true                  // 为 true 时 agent 下次上报强制带 static（一次性）
@@ -2095,11 +2254,12 @@ function annotatedCard(text, commentChar, notes) {
 function renderExample() {
   var app = document.getElementById('app');
   app.textContent = '';
-  document.getElementById('summary').textContent = 'POST /report 请求与响应（JSON5 注释版）';
+  document.getElementById('summary').textContent = 'probe 原生协议 · POST /report 请求与响应';
   app.append(
     annotatedCard(EXAMPLE_JSON5, '//', [
-      '此例按 local-demo / probe Reporter 展示。请求头：X-Secret（认证）、X-Agent-Version，以及用于多路隔离的 X-Reporter-Id / X-Reporter-Protocol（百分号编码；旧服务端可忽略）。',
+      '此例是 primary / probe 原生 Reporter。请求头：X-Secret（认证）、X-Agent-Version、X-Reporter-Id: primary、X-Reporter-Protocol: probe（Reporter id 会百分号编码；旧服务端可忽略新增头）。',
       'static.config.global 是实际采集事实；static.config.reporters 是全线路脱敏摘要；同级 reset_day/intervals/... 仍是当前 Reporter 视角。',
+      'CF / Komari 只在 reporters 脱敏拓扑中出现；它们自己的 wire 报文请看「协议预览」，probe 请求不携带 ext.cf。',
       '上报失败时 agent 有界保留（10 条）待重发——只覆盖短暂抖动，长断网历史不补发；服务端收到延迟记录按 ts 去重排序即可。',
     ]),
     annotatedCard(RESPONSE_EXAMPLE_JSON5, '//', [
@@ -2172,3 +2332,12 @@ function connect() {
 window.addEventListener('resize', function () { charts.forEach(function (c) { c.redraw(); }); });
 connect();
 </script></body></html>`;
+
+// PAGE 是 TypeScript 模板字符串，内嵌 JS 的反斜杠需要双重转义。
+// 启动时直接解析实际将要发送的脚本，避免服务正常监听但浏览器静默卡在“连接中”。
+const pageScriptStart = PAGE.indexOf("<script>");
+const pageScriptEnd = PAGE.indexOf("</script>", pageScriptStart);
+if (pageScriptStart < 0 || pageScriptEnd < 0) {
+  throw new Error("demo PAGE is missing its inline script");
+}
+new Function(PAGE.slice(pageScriptStart + "<script>".length, pageScriptEnd));

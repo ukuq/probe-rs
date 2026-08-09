@@ -137,7 +137,7 @@ mod tests {
                 report_errors: true,
                 report_self: true,
                 pings: vec![],
-                ext: Default::default(),
+                ext: None,
             },
         }
     }

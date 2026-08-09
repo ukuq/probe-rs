@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::model::{
-    CollectionIntervals, ExtConfig, GlobalConfigSummary, Intervals, PingKind, PingTarget,
-    RemoteConfig, ReporterConfig, ReporterSummary, StaticConfig,
+    CollectionIntervals, ExtConfig, GlobalConfigSummary, GlobalPingTarget, Intervals, PingKind,
+    PingTarget, RemoteConfig, ReporterConfig, ReporterSummary, StaticConfig,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,7 +71,7 @@ impl ReporterSpec {
             report_errors: self.report_errors,
             report_self: self.report_self,
             pings: self.pings.iter().map(|ping| ping.target.clone()).collect(),
-            ext: self.ext.clone(),
+            ext: (self.protocol == "cf").then(|| self.ext.clone()),
         }
     }
 }
@@ -204,13 +204,20 @@ impl LocalConfig {
                 .reporters
                 .iter()
                 .any(|reporter| reporter.disks.is_empty()),
-            ping_names: {
+            pings: {
                 let mut tasks = std::collections::BTreeMap::new();
                 for reporter in &self.reporters {
                     for ping in &reporter.pings {
+                        let interval = ping.interval.unwrap_or(reporter.intervals.ping);
                         tasks
                             .entry(ping_task_key(ping).expect("validated ping target"))
-                            .or_insert_with(|| format!("{}/{}", reporter.id, ping.name));
+                            .and_modify(|task: &mut GlobalPingTarget| {
+                                task.interval = task.interval.min(interval);
+                            })
+                            .or_insert_with(|| GlobalPingTarget {
+                                target: global_ping_uri(ping).expect("validated ping target"),
+                                interval,
+                            });
                     }
                 }
                 tasks.into_values().collect()
@@ -240,11 +247,7 @@ impl LocalConfig {
                 report_gpu: spec.report_gpu,
                 report_errors: spec.report_errors,
                 report_self: spec.report_self,
-                ping_names: spec
-                    .pings
-                    .into_iter()
-                    .map(|ping| ping.target.name)
-                    .collect(),
+                pings: spec.pings.into_iter().map(|ping| ping.target).collect(),
             })
             .collect()
     }
@@ -304,6 +307,12 @@ fn ping_task_key(ping: &PingTarget) -> Result<String> {
             if !matches!(url.scheme(), "http" | "https") {
                 bail!("HTTP Ping 只支持 http/https: {}", ping.target);
             }
+            if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+                bail!(
+                    "HTTP Ping target 不允许 path/query/fragment: {}",
+                    ping.target
+                );
+            }
             let host = url
                 .host_str()
                 .ok_or_else(|| anyhow::anyhow!("HTTP Ping 缺少 host: {}", ping.target))?
@@ -315,6 +324,16 @@ fn ping_task_key(ping: &PingTarget) -> Result<String> {
             Ok(format!("http:{}://{host}:{port}", url.scheme()))
         }
         PingKind::Tcp => {
+            if ping
+                .target
+                .chars()
+                .any(|ch| matches!(ch, '/' | '\\' | '?' | '#'))
+            {
+                bail!(
+                    "TCP Ping target 不允许 path/query/fragment: {}",
+                    ping.target
+                );
+            }
             let (host, port) = crate::worker::ping::split_host_port(&ping.target)?;
             Ok(format!(
                 "tcp:{}:{port}",
@@ -323,13 +342,56 @@ fn ping_task_key(ping: &PingTarget) -> Result<String> {
         }
         PingKind::Icmp => {
             let host = ping.target.trim().trim_matches(['[', ']']);
-            if host.is_empty() || host.contains('/') {
+            if host.is_empty() || host.chars().any(|ch| matches!(ch, '/' | '\\' | '?' | '#')) {
                 bail!("非法 ICMP host: {}", ping.target);
             }
             Ok(format!(
                 "icmp:{}",
                 host.trim_end_matches('.').to_ascii_lowercase()
             ))
+        }
+    }
+}
+
+/// 全局只读摘要使用 URI 自带类型，Reporter 私有配置仍保留独立 type 字段。
+fn global_ping_uri(ping: &PingTarget) -> Result<String> {
+    let authority_host = |host: &str| {
+        let host = host
+            .trim_matches(['[', ']'])
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host
+        }
+    };
+    match ping.kind {
+        PingKind::Http => {
+            let url = reqwest::Url::parse(&ping.target)
+                .with_context(|| format!("非法 HTTP Ping URL: {}", ping.target))?;
+            let host = url
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("HTTP Ping 缺少 host: {}", ping.target))?;
+            let port = url
+                .port_or_known_default()
+                .ok_or_else(|| anyhow::anyhow!("HTTP Ping 缺少 port: {}", ping.target))?;
+            Ok(format!(
+                "{}://{}:{port}",
+                url.scheme(),
+                authority_host(host)
+            ))
+        }
+        PingKind::Tcp => {
+            let (host, port) = crate::worker::ping::split_host_port(&ping.target)?;
+            Ok(format!("tcp://{}:{port}", authority_host(&host)))
+        }
+        PingKind::Icmp => {
+            let host = ping.target.trim().trim_matches(['[', ']']);
+            if host.is_empty() {
+                bail!("非法 ICMP host: {}", ping.target);
+            }
+            Ok(format!("icmp://{}", authority_host(host)))
         }
     }
 }
@@ -761,13 +823,26 @@ mod tests {
         let roundtrip: LocalConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(roundtrip, cfg);
 
+        let native_receipt = komari.static_config(cfg.global_summary(), cfg.reporter_summaries());
+        assert!(native_receipt.ext.is_none());
+        assert!(!serde_json::to_string(&native_receipt)
+            .unwrap()
+            .contains("\"ext\""));
+
         let receipt = cf.static_config(cfg.global_summary(), cfg.reporter_summaries());
-        assert_eq!(receipt.global.ping_names.len(), 1);
+        assert!(receipt.ext.is_some());
+        assert_eq!(receipt.global.pings.len(), 1);
+        assert_eq!(receipt.global.pings[0].target, "tcp://example.com:80");
+        assert_eq!(receipt.global.pings[0].interval, 10);
         assert_eq!(receipt.reporters.len(), 3);
         assert_eq!(receipt.reporters[1].id, "komari-a");
-        assert_eq!(receipt.reporters[1].ping_names, ["same-host"]);
+        assert_eq!(receipt.reporters[1].pings[0].name, "same-host");
+        assert_eq!(receipt.reporters[1].pings[0].target, "EXAMPLE.com:80");
         assert!(receipt.reporters[2].report_gpu); // CF 缺省值已展开
         let json = serde_json::to_string(&receipt).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value["global"]["pings"][0].get("name").is_none());
+        assert!(value["global"]["pings"][0].get("type").is_none());
         for private in [
             "sec",
             "token",
@@ -783,16 +858,14 @@ mod tests {
     }
 
     #[test]
-    fn ping_task_key_normalizes_endpoint_and_ignores_http_path() {
-        let key = |kind, target: &str| {
-            ping_task_key(&PingTarget {
-                name: "test".into(),
-                kind,
-                target: target.into(),
-                interval: None,
-            })
-            .unwrap()
+    fn ping_task_key_normalizes_endpoint_and_rejects_paths() {
+        let target = |kind, target: &str| PingTarget {
+            name: "test".into(),
+            kind,
+            target: target.into(),
+            interval: None,
         };
+        let key = |kind, value: &str| ping_task_key(&target(kind, value)).unwrap();
 
         assert_eq!(
             key(PingKind::Tcp, "EXAMPLE.com"),
@@ -803,18 +876,58 @@ mod tests {
             key(PingKind::Icmp, "example.com")
         );
         assert_eq!(
-            key(PingKind::Http, "https://EXAMPLE.com/health?a=1"),
-            key(PingKind::Http, "https://example.com:443/other")
+            key(PingKind::Http, "https://EXAMPLE.com"),
+            key(PingKind::Http, "https://example.com:443/")
         );
         // HTTP and HTTPS on the same numeric port are not the same probe:
         // TLS handshake and request semantics differ.
         assert_ne!(
-            key(PingKind::Http, "http://example.com:443/a"),
-            key(PingKind::Http, "https://example.com:443/a")
+            key(PingKind::Http, "http://example.com:443"),
+            key(PingKind::Http, "https://example.com:443")
         );
         assert_ne!(
             key(PingKind::Tcp, "example.com:80"),
             key(PingKind::Icmp, "example.com")
+        );
+
+        for (kind, value) in [
+            (PingKind::Http, "https://example.com/health"),
+            (PingKind::Http, "https://example.com?ready=1"),
+            (PingKind::Http, "https://example.com#status"),
+            (PingKind::Tcp, "example.com/status"),
+            (PingKind::Tcp, "example.com\\status"),
+            (PingKind::Icmp, "example.com?ready=1"),
+        ] {
+            assert!(
+                ping_task_key(&target(kind, value)).is_err(),
+                "带 path/query/fragment 的 target 应被拒绝: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn global_ping_uri_contains_kind_and_normalized_endpoint() {
+        let target = |kind, target: &str| PingTarget {
+            name: "test".into(),
+            kind,
+            target: target.into(),
+            interval: None,
+        };
+        assert_eq!(
+            global_ping_uri(&target(PingKind::Tcp, "EXAMPLE.com")).unwrap(),
+            "tcp://example.com:80"
+        );
+        assert_eq!(
+            global_ping_uri(&target(PingKind::Http, "https://EXAMPLE.com")).unwrap(),
+            "https://example.com:443"
+        );
+        assert_eq!(
+            global_ping_uri(&target(PingKind::Icmp, "EXAMPLE.com.")).unwrap(),
+            "icmp://example.com"
+        );
+        assert_eq!(
+            global_ping_uri(&target(PingKind::Tcp, "[2001:DB8::1]:443")).unwrap(),
+            "tcp://[2001:db8::1]:443"
         );
     }
 

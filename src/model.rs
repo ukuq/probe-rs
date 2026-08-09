@@ -69,8 +69,9 @@ pub struct StaticConfig {
     pub report_errors: bool,
     pub report_self: bool,
     pub pings: Vec<PingTarget>,
-    /// 协议扩展（ext.*）
-    pub ext: ExtConfig,
+    /// 当前 Reporter 的协议扩展；原生 probe 没有扩展时不出现在 wire 中。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<ExtConfig>,
 }
 
 /// 一条 = 一次 collect tick，只含 fast 字段，ts 即 tick 测量时刻
@@ -213,8 +214,7 @@ pub struct GpuRecord {
     pub temp: Option<f64>,
 }
 
-/// 探测目标：key（唯一键）+ url/host + 独立间隔（缺省跟随 intervals.ping）
-/// target 以 http(s):// 开头 → HTTP 探测；否则 TCP（host[:port]，默认 80）
+/// 探测目标：逻辑名称 + 显式类型 + url/host + 独立间隔（缺省跟随 intervals.ping）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PingTarget {
@@ -224,6 +224,14 @@ pub struct PingTarget {
     pub target: String,
     #[serde(default)]
     pub interval: Option<u64>,
+}
+
+/// 去重后的全局实际 Ping worker 配置；逻辑名称仅属于各 Reporter，不进入这里。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GlobalPingTarget {
+    /// 带协议的规范化采集端点，如 tcp://host:80、https://host:443、icmp://host。
+    pub target: String,
+    pub interval: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -339,8 +347,9 @@ pub struct GlobalConfigSummary {
     /// 所有 Reporter 磁盘选择的并集；任一路为空时 all_disks=true。
     pub disks: Vec<String>,
     pub all_disks: bool,
-    /// 聚合后的路由作用域名称（reporter/name）；目标地址只在所属 Reporter 回执中出现。
-    pub ping_names: Vec<String>,
+    /// 按 type + 规范化目标聚合后的实际 Ping worker 配置；无逻辑名称和独立 type，
+    /// 类型编码进 target URI，周期取各路最小值。
+    pub pings: Vec<GlobalPingTarget>,
 }
 
 /// 一条 Reporter 的脱敏输出策略摘要。
@@ -356,8 +365,8 @@ pub struct ReporterSummary {
     pub report_gpu: bool,
     pub report_errors: bool,
     pub report_self: bool,
-    /// 此 Reporter 实际选中的全局 Ping 名称。
-    pub ping_names: Vec<String>,
+    /// 此 Reporter 的原始 Ping 配置，包含 type/name/target/interval。
+    pub pings: Vec<PingTarget>,
 }
 
 /// 服务端通过上报响应下发的远端配置（config 一级内，config_version 必填，

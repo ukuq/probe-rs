@@ -47,10 +47,10 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
         "enable_gpu": true,
         "interfaces": [], "all_interfaces": true,
         "disks": [], "all_disks": true,
-        "ping_names": ["primary/ct"]
+        "pings": [ { "target": "tcp://gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 } ]
       },
       "reporters": [
-        { "id": "primary", "protocol": "probe", "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 }, "report_interval": 60, "reset_day": 1, "interfaces": ["eth*"], "disks": [], "report_gpu": true, "report_errors": true, "report_self": false, "ping_names": ["ct"] }
+        { "id": "primary", "protocol": "probe", "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 }, "report_interval": 60, "reset_day": 1, "interfaces": ["eth*"], "disks": [], "report_gpu": true, "report_errors": true, "report_self": false, "pings": [ { "name": "ct", "type": "tcp", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 } ] }
       ],
       "reset_day": 1,
       "intervals": { "collect": 1, "report": 60, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
@@ -59,8 +59,7 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
       "enable_gpu": true,
       "report_errors": true,
       "report_self": false,
-      "pings": [ { "name": "ct", "type": "tcp", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 } ],
-      "ext": { "cf": { "correction": true, "batch": true } }
+      "pings": [ { "name": "ct", "type": "tcp", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 } ]
     }
   },
 
@@ -84,7 +83,7 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
   ],
 
   "async": [
-    { "kind": "ping", "ts": 1754300058000, "name": "telecom", "rtt": 32, "loss": 0 },
+    { "kind": "ping", "ts": 1754300058000, "name": "ct", "rtt": 32, "loss": 0 },
     { "kind": "slow", "ts": 1754300055000, "disk_used": 53687091200, "disks": [ { "id": "/dev/sda1", "name": "sda1", "mount_point": "/", "file_system": "ext4", "total": 107374182400, "used": 53687091200 } ], "tcp_conn": 120, "udp_conn": 8, "processes": 230 },
     { "kind": "gpu",  "ts": 1754300050000, "name": "NVIDIA A100 80GB", "usage": 42.5 },
     { "kind": "diskio", "ts": 1754300056000, "read_bps": 1048576, "write_bps": 524288, "read_iops": 40, "write_iops": 18, "await_ms": 1.8, "usage": 3.2, "disks": [ { "name": "sda", "read_bps": 1048576, "write_bps": 524288, "read_iops": 40, "write_iops": 18, "await_ms": 1.8, "usage": 3.2 } ] }
@@ -92,7 +91,7 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
 
   "errors": [
     { "ts": 1754300055000, "source": "gpu", "msg": "nvidia-smi exit 1" },
-    { "ts": 1754300058000, "source": "ping:cu", "msg": "dns resolve failed" }
+    { "ts": 1754300058000, "source": "ping:ct", "msg": "dns resolve failed" }
   ]
 }
 ```
@@ -135,8 +134,8 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `global` | object | Agent 全局实际采集摘要：`{intervals, enable_gpu, interfaces, all_interfaces, disks, all_disks, ping_names}`；周期为各 Reporter 最小值，GPU 为 OR，选择项为并集 |
-| `reporters` | array | 本机全部 Reporter 的脱敏摘要，字段见下；不含连接凭据、地址及其他线路身份 |
+| `global` | object | Agent 全局实际采集摘要：`{intervals, enable_gpu, interfaces, all_interfaces, disks, all_disks, pings}`；周期为各 Reporter 最小值，GPU 为 OR，选择项为并集；Ping 是无 name/type 的 `{target,interval}`，类型编码在规范化 URI target（如 `tcp://host:80`、`https://host:443`、`icmp://host`）中，并取各路最小 interval |
+| `reporters` | array | 本机全部 Reporter 的脱敏摘要，字段见下；不含连接凭据、上报地址及其他线路身份，但会包含 Ping target |
 | `reset_day` | number | 0-31 |
 | `intervals` | object | {collect, report, ping, slow, gpu, ip, diskio}（秒） |
 | `interfaces` | string[] | 网卡白名单（glob）；空 = 所有非虚拟网卡 |
@@ -144,12 +143,12 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
 | `enable_gpu` | boolean | 当前 Reporter 是否输出 GPU（沿用 wire 字段名）；任一 Reporter 开启即启动全局 GPU worker |
 | `report_errors` | boolean | 是否上报 errors 错误事件 |
 | `report_self` | boolean | 是否上报探针自身占用 kind:"self" |
-| `pings` | array | 当前 Reporter 的探测需求：`[{name, type: http|tcp|icmp, target, interval?}]` |
-| `ext` | object | 协议扩展 `{cf: {correction, batch}}`（仅 cf 协议生效） |
+| `pings` | array | 当前 Reporter 的探测需求：`[{name, type: http|tcp|icmp, target, interval?}]`；HTTP target 仅允许 `http(s)://host[:port]`，所有类型均不允许 path/query/fragment |
+| `ext` | object | 协议扩展；仅对应协议存在扩展时携带。当前 `{cf: {correction, batch}}` 只出现在 cf Reporter 的回执中，probe 不携带 |
 
-`reporters[]` 每项包含：`id`、`protocol`、`intervals`、`report_interval`、`reset_day`、`interfaces`、`disks`、`report_gpu`、`report_errors`、`report_self`、`ping_names`。`ping_names` 只列该 Reporter 自己的逻辑名称。
+`reporters[]` 每项包含：`id`、`protocol`、`intervals`、`report_interval`、`reset_day`、`interfaces`、`disks`、`report_gpu`、`report_errors`、`report_self`、`pings`。`pings` 保留该 Reporter 自己的原始 `name`、`type`、`target` 和可选 `interval`。
 
-安全边界：摘要不会回传 `secret`、`worker_url`，也不会回传其他线路的 `server_id` / `config_version`；`global.ping_names` 只含名称。当前上报线路仍由请求头 `X-Reporter-Id` / `X-Reporter-Protocol` 标识，同级旧字段仍表示当前 Reporter 的完整有效配置。
+安全边界：摘要不会回传 `secret`、`worker_url`，也不会回传其他线路的 `server_id` / `config_version`；Ping 的 `target` 属于配置核对信息，会按原值回传。当前上报线路仍由请求头 `X-Reporter-Id` / `X-Reporter-Protocol` 标识，同级旧字段仍表示当前 Reporter 的完整有效配置。
 
 ## dynamic 记录字段（每条 = 一次 collect tick）
 
@@ -181,7 +180,7 @@ kind 按数据语义划分（DESIGN.md §2.3"机制同类、语义分流"）：s
 | `self` | `cpu_usage`, `mem_rss` | 探针自身 CPU（单核 %）与常驻内存（字节）；始终随 slow worker 采集，`report_self=true` 的 Reporter 才输出 |
 | `diskio` | `read_bps`, `write_bps`, `read_iops`, `write_iops`, `await_ms`, `usage`, `disks` | `disks` 为逐物理盘 IO；上层字段为当前 Reporter 选中盘的聚合，usage 取最大；首轮差值无前值为 null |
 
-Ping 聚合规则：机器内部按“类型 + 规范化目标”去重，TCP 使用小写 host + 有效端口，ICMP 使用小写 host，HTTP 使用 scheme + 小写 host + 有效端口并忽略 path/query（HTTP 与 HTTPS 不合并）。重复任务的实际周期取所有 Reporter 需求的最小值；每轮 DNS 只在计时前解析一次，4 次采样与重试复用解析结果，因此 RTT 不含 DNS。结果与错误在出口映射回各 Reporter 自己的 `name`，不会串到未声明该任务的线路。
+Ping 聚合规则：机器内部按“类型 + 规范化目标”去重，TCP 使用小写 host + 有效端口，ICMP 使用小写 host，HTTP 使用 scheme + 小写 host + 有效端口（HTTP 与 HTTPS 不合并）。HTTP target 仅允许 `http(s)://host[:port]`（根 `/` 等价可接受），所有类型均禁止 path/query/fragment。重复任务的实际周期取所有 Reporter 需求的最小值；每轮 DNS 只在计时前解析一次，4 次采样与重试复用解析结果，因此 RTT 不含 DNS。结果与错误在出口映射回各 Reporter 自己的 `name`，不会串到未声明该任务的线路；`global.pings` 是无 name/type 的实际 worker 配置，规范化 URI target 自带探测类型。
 
 约定：
 - 异步记录**仅当对应源的快照 ts 更新时才产生**（同一份异步数据不会重复出现）；worker 失败 = 快照 ts 停滞；
@@ -232,7 +231,7 @@ Ping 聚合规则：机器内部按“类型 + 规范化目标”去重，TCP �
 | `reset_day` | 账期重置日 1-31；0 = 不重置 |
 | `interfaces` | 可选；网卡白名单（glob 数组） |
 | `disks` | 可选；卷/物理盘白名单（glob 数组） |
-| `pings` | 可选；整组替换当前 Reporter 的 Ping 需求；`type` 必须为 http/tcp/icmp |
+| `pings` | 可选；整组替换当前 Reporter 的 Ping 需求；`type` 必须为 http/tcp/icmp，target 不允许 path/query/fragment |
 | `report_gpu` | 可选；当前 Reporter 是否输出 GPU（布尔），同时参与机器级 GPU worker 的 OR 聚合 |
 | `report_errors` | 可选；是否上报 errors 错误事件（布尔，缺省 true） |
 | `report_self` | 可选；是否上报探针自身资源占用 kind:"self"（布尔，缺省 false） |

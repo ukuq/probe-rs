@@ -94,6 +94,7 @@ diskio = 10
 
 # Same type + normalized endpoint as another Reporter is collected once.
 # The effective task interval is the minimum requested by its consumers.
+# Targets are endpoints only: path, query, and fragment are not allowed.
 [[reporters.pings]]
 name = "ct-local"
 type = "tcp"
@@ -103,7 +104,7 @@ interval = 30
 [[reporters.pings]]
 name = "homepage"
 type = "http"
-target = "https://example.com/health"
+target = "https://example.com"
 interval = 60
 
 [[reporters.pings]]
