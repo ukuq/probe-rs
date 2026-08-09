@@ -199,7 +199,7 @@ ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最
 
 | 项 | 约束 |
 |---|---|
-| `intervals.collect` | 采样间隔（秒），>= 1 |
+| `intervals.collect` | 采样间隔（秒），>= 1；CF 的 0 输入兼容映射为 1 |
 | `intervals.report` | 上报间隔（秒），>= 1；与 collect 无任何关系约束 |
 | `intervals.ping` | 探测默认间隔（秒），`[[pings]]` 组未设 interval 时生效，缺省 30 |
 | `intervals.slow` | 慢变指标采集间隔（秒），缺省 60 |

@@ -6,8 +6,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{watch, Notify};
-use tokio::time::{interval, interval_at, Interval};
+use tokio::sync::watch;
+use tokio::time::{interval, interval_at, Interval, MissedTickBehavior};
 
 use crate::buffer::Buffers;
 use crate::collector::{self, net, CpuMonitor};
@@ -36,13 +36,15 @@ pub struct Scheduler {
     slow_rx: watch::Receiver<Option<SlowBlock>>,
     self_rx: watch::Receiver<Option<SelfRecord>>,
     diskio_rx: watch::Receiver<Option<crate::model::DiskIoRecord>>,
-    shutdown: Arc<Notify>,
+    shutdown_rx: watch::Receiver<bool>,
     agent_version: String,
     /// komari 模式：发往 WS worker 的通道（其余协议为 None）
     komari_tx: Option<watch::Sender<KomariOut>>,
 
     cpu: CpuMonitor,
     prev_net: Option<(net::NetBytes, Instant)>,
+    /// 最近一次独立 collect 快照；CF 空上报周期复用，避免缺字段被服务端写成 0。
+    last_dynamic: Option<DynamicRecord>,
     last_static: Option<Instant>,
     /// CF 模式：static 缓存（CF metrics 每次上报都带 static 字段）
     static_cache: Option<crate::model::StaticInfo>,
@@ -69,7 +71,7 @@ impl Scheduler {
         slow_rx: watch::Receiver<Option<SlowBlock>>,
         self_rx: watch::Receiver<Option<SelfRecord>>,
         diskio_rx: watch::Receiver<Option<crate::model::DiskIoRecord>>,
-        shutdown: Arc<Notify>,
+        shutdown_rx: watch::Receiver<bool>,
         agent_version: String,
         komari_tx: Option<watch::Sender<KomariOut>>,
     ) -> Self {
@@ -86,11 +88,12 @@ impl Scheduler {
             slow_rx,
             self_rx,
             diskio_rx,
-            shutdown,
+            shutdown_rx,
             agent_version,
             komari_tx,
             cpu: CpuMonitor::new(),
             prev_net: None,
+            last_dynamic: None,
             last_static: None,
             static_cache: None,
             last_ping_ts: std::collections::HashMap::new(),
@@ -103,7 +106,9 @@ impl Scheduler {
 
     pub async fn run(mut self) {
         let initial = *self.intervals_rx.borrow();
-        let mut collect_ticker = ticker(initial.collect);
+        // 启动即采集一次，再立即上报；之后两个 ticker 仍完全独立。
+        self.on_collect();
+        let mut collect_ticker = ticker_from_next(initial.collect);
         let mut report_ticker = ticker(initial.report);
         tracing::info!(
             collect = initial.collect,
@@ -130,10 +135,12 @@ impl Scheduler {
                     if r.is_err() { return; }
                     self.last_static = None;
                 }
-                _ = self.shutdown.notified() => {
-                    tracing::info!("收到退出信号，scheduler 停止");
-                    return;
-                }
+                r = self.shutdown_rx.changed() => {
+                    if r.is_err() || *self.shutdown_rx.borrow() {
+                        tracing::info!("收到退出信号，scheduler 停止");
+                        return;
+                    }
+                },
             }
         }
     }
@@ -169,7 +176,7 @@ impl Scheduler {
             self.netstatic.query_monthly(&filter, period_start, now_ms);
 
         // fast 记录：只含快变字段，ts 即 tick 测量时刻
-        self.buffers.push_dynamic(DynamicRecord {
+        let dynamic = DynamicRecord {
             ts: now_ms,
             cpu_usage,
             mem_used: Some(mem_used),
@@ -181,7 +188,9 @@ impl Scheduler {
             net_tx_speed,
             net_rx_monthly: Some(net_rx_monthly),
             net_tx_monthly: Some(net_tx_monthly),
-        });
+        };
+        self.last_dynamic = Some(dynamic.clone());
+        self.buffers.push_dynamic(dynamic);
 
         // 异步记录：快照 ts 更新才摘取（新鲜度去重），每条 ts 为各自真实测量时刻
         {
@@ -394,21 +403,15 @@ impl Scheduler {
             let diskio_fresh = diskio.as_ref().filter(|d| now - d.ts <= max_age);
             crate::reporter_cf::build_metrics(
                 &st,
-                dynamic.last(),
+                dynamic.last().or(self.last_dynamic.as_ref()),
                 slow.as_ref(),
                 &gpus,
                 &pings,
                 diskio_fresh,
+                &cfg.pings,
             )
         };
-        let samples = if cfg.ext.cf.batch {
-            dynamic
-                .iter()
-                .map(crate::reporter_cf::build_sample)
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let samples = crate::reporter_cf::build_samples(&dynamic, cfg.ext.cf.batch);
 
         // 校正确认是独立请求（CF 服务端见到 correction 字段会把整个请求
         // 当确认、丢弃 metrics）——先于主上报发出，成功后停止重传
@@ -476,11 +479,15 @@ impl Scheduler {
 
 /// 首次立即触发（启动即采集/上报）
 fn ticker(secs: u64) -> Interval {
-    interval(Duration::from_secs(secs.max(1)))
+    let mut ticker = interval(Duration::from_secs(secs.max(1)));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    ticker
 }
 
 /// 从下一个周期开始触发（配置变更重建时不立即补一发）
 fn ticker_from_next(secs: u64) -> Interval {
     let d = Duration::from_secs(secs.max(1));
-    interval_at(tokio::time::Instant::now() + d, d)
+    let mut ticker = interval_at(tokio::time::Instant::now() + d, d);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    ticker
 }

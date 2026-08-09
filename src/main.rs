@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 use crate::config::SharedConfig;
 
@@ -49,13 +49,14 @@ async fn main() -> Result<()> {
     let (shared, intervals_rx, config_rx) = SharedConfig::new(local.clone(), config_path.clone());
     let buffers = Arc::new(buffer::Buffers::new());
     let net = netstatic::NetStatic::load(&net_static_path);
-    let shutdown = Arc::new(Notify::new());
+    // watch 保留最新退出状态；即使任务当时正在采集/上报，返回 select 后也不会漏信号。
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // netstatic 采样 task：每 2s 采样，每 10min 落盘
     {
         let net = net.clone();
         let shared = Arc::clone(&shared);
-        let shutdown = Arc::clone(&shutdown);
+        let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(net.sample_interval());
             loop {
@@ -65,7 +66,9 @@ async fn main() -> Result<()> {
                         net.sample(&filter);
                         net.flush_if_due();
                     }
-                    _ = shutdown.notified() => break,
+                    r = shutdown_rx.changed() => {
+                        if r.is_err() || *shutdown_rx.borrow() { break; }
+                    },
                 }
             }
         });
@@ -198,15 +201,14 @@ async fn main() -> Result<()> {
         slow_rx,
         self_rx,
         diskio_rx,
-        Arc::clone(&shutdown),
+        shutdown_rx,
         AGENT_VERSION.to_string(),
         komari_tx,
     );
 
-    let shutdown_trigger = Arc::clone(&shutdown);
     tokio::spawn(async move {
         wait_for_signal().await;
-        shutdown_trigger.notify_waiters();
+        shutdown_tx.send_replace(true);
     });
 
     sched.run().await;

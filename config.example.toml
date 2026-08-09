@@ -30,7 +30,7 @@ report_errors = true
 report_self = false
 
 # 注意：标量字段必须放在 [intervals] 段之前，否则会被解析进 intervals 表（agent 报错拒绝）
-# 各间隔完全独立，无任何关系约束；report < collect 时多余上报只是空数组心跳
+# 各间隔完全独立且均 >=1；CF 安装参数 collect_interval=0 会兼容映射为 1 秒
 [intervals]
 # 采样间隔（秒）
 collect = 10
@@ -65,5 +65,5 @@ diskio = 10
 [ext.cf]
 # 是否执行流量校正回路（应用 + 回传确认），缺省 true
 correction = true
-# 上报形状：true = samples[] 批量（带 ts，WS 回放用）；false = 单条 metrics（省 D1 写入），缺省 true
+# 上报形状：true = 发送 samples[]；false = 只发单条 metrics，缺省 true
 batch = true

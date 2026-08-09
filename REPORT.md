@@ -199,7 +199,7 @@ kind 按数据语义划分（DESIGN.md §2.3"机制同类、语义分流"）：s
 |---|---|
 | `config_version` | 与 agent 当前版本**不等**才应用（幂等；人类可读时间戳无可靠大小语义，故用不等判断） |
 | `reset_day` | 账期重置日 1-31；0 = 不重置 |
-| `intervals.collect` | 采样间隔（秒），>= 1 |
+| `intervals.collect` | 采样间隔（秒），>= 1；CF 的 0 输入兼容映射为 1 |
 | `intervals.report` | 上报间隔（秒），>= 1；与 collect 无任何关系约束 |
 | `intervals.ping` | 探测间隔（秒），>= 1；`[[pings]]` 组未设 interval 时的默认 |
 | `intervals.slow` | 慢变指标采集间隔（秒），>= 1，缺省 60 |

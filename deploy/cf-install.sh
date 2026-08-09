@@ -31,7 +31,7 @@ usage() {
   -id=               CF 后台分配的服务器 UUID（必填）
   -secret=           API_SECRET（必填）
   -url=              上报地址，形如 https://<worker>/update（必填）
-  -collect_interval= 采样间隔秒（0 = 实时，按 1s 处理；缺省 0）
+  -collect_interval= 采样间隔秒（0 兼容映射为 1 秒；缺省 0）
   -interval=         上报间隔秒（缺省 60）
   -reset_day=        月流量账期重置日 1-31，0 = 不重置（缺省 1）
   -ct= -cu= -cm= -bd=  电信/联通/移动/BGP 探测节点 host[:port]
@@ -91,7 +91,7 @@ done
 [ -n "$SECRET" ] || die "缺少 -secret="
 [ -n "$URL" ] || die "缺少 -url="
 command -v systemctl >/dev/null || die "仅支持 systemd 系统"
-# collect_interval=0 按 1s（实时）；其余非法值兜底；前导零剥掉（08 不是合法 TOML 整数）
+# 内部采集与上报严格分离，collect 至少 1 秒；0 映射为实时 1 秒，前导零需剥掉
 case "$COLLECT" in ''|*[!0-9]*) COLLECT=1 ;; esac
 case "$REPORT" in ''|*[!0-9]*) REPORT=60 ;; esac
 case "$RESET_DAY" in ''|*[!0-9]*) RESET_DAY=1 ;; esac

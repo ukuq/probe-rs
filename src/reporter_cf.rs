@@ -4,7 +4,7 @@
 //! - 顶层 {id, secret, metrics, samples[]}；id/secret 复用本地 server_id/secret
 //! - ram/swap/disk 单位 MB（字节 ÷ 2^20）；load_avg 为空格分隔字符串
 //! - GPU → gpu_info:[{id,name,info}]（只有占用率；显存/温度 CF 无落点，丢弃）
-//! - ping 按组名落 ping_ct/cu/cm/bd + loss_*（bgp 视作 bd 别名）；rtt<0（失败）= 字段缺席
+//! - ping 按组名落 ping_ct/cu/cm/bd + loss_*（bgp 视作 bd 别名）；未配置=false，失败=null
 //! - errors / self / virtualization / cpu_physical_cores：CF 无落点，CF 模式下不产生
 //! - 配置下发：响应头 X-Agent-Config-Md5 + URL-encoded body → 合成 RemoteConfig
 //!   （config_version 直接取 MD5 头，缺失时取原始配置串，== 幂等语义不变）
@@ -16,7 +16,9 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::model::{DiskIoRecord, DynamicRecord, GpuRecord, PingRecord, SlowBlock, StaticInfo};
+use crate::model::{
+    DiskIoRecord, DynamicRecord, GpuRecord, PingRecord, PingTarget, SlowBlock, StaticInfo,
+};
 
 /// 一次 /update 请求体
 #[derive(Debug, Serialize)]
@@ -90,22 +92,15 @@ pub struct CfMetrics {
     pub ip_v4: serde_json::Value,
     /// 公网 IPv6；数值 0 = 不可达
     pub ip_v6: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ping_ct: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ping_cu: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ping_cm: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ping_bd: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub loss_ct: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub loss_cu: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub loss_cm: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub loss_bd: Option<u32>,
+    /// CF 用 false 表示该线路未配置、null 表示已配置但尚无成功测量。
+    pub ping_ct: serde_json::Value,
+    pub ping_cu: serde_json::Value,
+    pub ping_cm: serde_json::Value,
+    pub ping_bd: serde_json::Value,
+    pub loss_ct: serde_json::Value,
+    pub loss_cu: serde_json::Value,
+    pub loss_cm: serde_json::Value,
+    pub loss_bd: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -194,6 +189,7 @@ pub fn build_metrics(
     gpus: &[GpuRecord],
     pings: &HashMap<String, PingRecord>,
     diskio: Option<&DiskIoRecord>,
+    ping_targets: &[PingTarget],
 ) -> CfMetrics {
     let disk = diskio.and_then(|d| {
         let any = d.read_bps.is_some() || d.write_bps.is_some() || d.read_iops.is_some();
@@ -206,14 +202,29 @@ pub fn build_metrics(
             util: d.usage.map(round2),
         })
     });
-    let ping = |names: &[&str]| -> Option<&PingRecord> {
+    let enabled = |names: &[&str]| -> bool {
+        ping_targets
+            .iter()
+            .any(|target| names.contains(&target.name.as_str()))
+    };
+    let ping = |names: &[&str]| -> serde_json::Value {
+        if !enabled(names) {
+            return false.into();
+        }
         names
             .iter()
             .find_map(|n| pings.get(*n))
             .filter(|r| r.rtt >= 0)
+            .map_or(serde_json::Value::Null, |r| r.rtt.into())
     };
-    let ping_loss = |names: &[&str]| -> Option<u32> {
-        names.iter().find_map(|n| pings.get(*n)).map(|r| r.loss)
+    let ping_loss = |names: &[&str]| -> serde_json::Value {
+        if !enabled(names) {
+            return false.into();
+        }
+        names
+            .iter()
+            .find_map(|n| pings.get(*n))
+            .map_or(serde_json::Value::Null, |r| r.loss.into())
     };
     let gpu_info = if gpus.is_empty() {
         None
@@ -267,10 +278,10 @@ pub fn build_metrics(
             .clone()
             .map(serde_json::Value::String)
             .unwrap_or_else(|| 0.into()),
-        ping_ct: ping(&["ct"]).map(|r| r.rtt),
-        ping_cu: ping(&["cu"]).map(|r| r.rtt),
-        ping_cm: ping(&["cm"]).map(|r| r.rtt),
-        ping_bd: ping(&["bd", "bgp"]).map(|r| r.rtt),
+        ping_ct: ping(&["ct"]),
+        ping_cu: ping(&["cu"]),
+        ping_cm: ping(&["cm"]),
+        ping_bd: ping(&["bd", "bgp"]),
         loss_ct: ping_loss(&["ct"]),
         loss_cu: ping_loss(&["cu"]),
         loss_cm: ping_loss(&["cm"]),
@@ -297,6 +308,14 @@ pub fn build_sample(d: &DynamicRecord) -> CfSample {
     }
 }
 
+/// 本地 batch 开关可以显式关闭批量回放。
+pub fn build_samples(dynamic: &[DynamicRecord], batch: bool) -> Vec<CfSample> {
+    if !batch {
+        return Vec::new();
+    }
+    dynamic.iter().map(build_sample).collect()
+}
+
 /// CF 配置推送（解析自 URL-encoded body）
 #[derive(Debug, Clone, PartialEq)]
 pub struct CfPush {
@@ -318,7 +337,8 @@ pub fn synthesize_remote(
 ) -> crate::model::RemoteConfig {
     let intervals =
         (push.collect.is_some() || push.report.is_some()).then(|| crate::model::Intervals {
-            collect: push.collect.unwrap_or(cur.collect),
+            // 项目内部采集/上报严格分离，采集间隔至少 1 秒；兼容 CF 的 0 输入。
+            collect: push.collect.unwrap_or(cur.collect).max(1),
             report: push.report.unwrap_or(cur.report),
             ping: cur.ping,
             slow: cur.slow,
@@ -348,10 +368,13 @@ pub fn synthesize_remote(
         config_version: push.version.clone(),
         reset_day: push.reset_day,
         intervals,
-        interfaces: push
-            .interface
-            .clone()
-            .map(|s| if s.is_empty() { vec![] } else { vec![s] }),
+        interfaces: push.interface.as_ref().map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        }),
         enable_gpu: None,
         report_errors: None,
         report_self: None,
@@ -547,7 +570,15 @@ mod tests {
                 loss: 100,
             },
         );
-        let m = build_metrics(&st, Some(&d), Some(&slow), &[], &pings, None);
+        let ping_targets = ["ct", "cu", "bgp"]
+            .into_iter()
+            .map(|name| PingTarget {
+                name: name.into(),
+                target: "example.com".into(),
+                interval: None,
+            })
+            .collect::<Vec<_>>();
+        let m = build_metrics(&st, Some(&d), Some(&slow), &[], &pings, None, &ping_targets);
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["cpu"], 12.35);
         assert_eq!(v["agent_version"], "1.3.8_probe-rs_0.1.0");
@@ -560,14 +591,18 @@ mod tests {
         assert_eq!(v["ping_ct"], 42);
         assert_eq!(v["ping_bd"], 6); // bgp → bd
         assert_eq!(v["loss_bd"], 25);
-        assert!(v.get("ping_cu").is_none()); // rtt=-1 失败 → 字段缺席
+        assert!(v["ping_cu"].is_null()); // 已配置但失败 → null
         assert_eq!(v["loss_cu"], 100); // loss 仍上报
+        assert_eq!(v["ping_cm"], false); // 未配置 → false（CF 的禁用语义）
+        assert_eq!(v["loss_cm"], false);
         assert_eq!(v["tcp_conn"], 1);
         assert!(v.get("gpu_info").is_none()); // 无 GPU → 缺席
         let s = build_sample(&d);
         let sv = serde_json::to_value(&s).unwrap();
         assert_eq!(sv["ts"], 1000);
         assert_eq!(sv["metrics"]["net_in_speed"], 11_200);
+        assert!(build_samples(std::slice::from_ref(&d), false).is_empty());
+        assert_eq!(build_samples(&[d], true).len(), 1);
     }
 
     #[test]
@@ -578,7 +613,7 @@ mod tests {
         let r = parse_response_body(body, Some("5f4dcc3b"));
         let p = r.push.unwrap();
         assert_eq!(p.version, "5f4dcc3b");
-        assert_eq!(p.collect, Some(1)); // 0 钳到 1
+        assert_eq!(p.collect, Some(1)); // CF 的 0 输入兼容映射为内部 1 秒
         assert_eq!(p.report, Some(60));
         assert_eq!(p.reset_day, Some(15));
         assert_eq!(
@@ -588,6 +623,21 @@ mod tests {
         assert_eq!(p.custom[1].as_deref(), Some("")); // 空值保留语义：该组清空
         assert_eq!(p.interface.as_deref(), Some("eth0"));
         assert!(r.correction.is_none());
+    }
+
+    #[test]
+    fn synthesize_remote_maps_collect_zero_and_splits_interfaces() {
+        let push = CfPush {
+            version: "v1".into(),
+            collect: Some(0),
+            report: Some(60),
+            reset_day: None,
+            custom: [None, None, None, None],
+            interface: Some("eth0, eth1,,bond*".into()),
+        };
+        let remote = synthesize_remote(&push, &crate::model::Intervals::default());
+        assert_eq!(remote.intervals.unwrap().collect, 1);
+        assert_eq!(remote.interfaces.unwrap(), vec!["eth0", "eth1", "bond*"]);
     }
 
     #[test]

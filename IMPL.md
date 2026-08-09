@@ -170,9 +170,9 @@ agent 可切换为 CF-Server-Monitor 的 `POST /update` 协议（适配官方服
 
 **配置**：`protocol = "cf"`（🔒 本地，重启生效）；`server_id` 填 CF 后台分配的 UUID，`secret` 填 `API_SECRET`，`worker_url` 填 `https://<worker>/update`。
 
-**上报映射**（reporter_cf.rs）：顶层 `{id, secret, metrics, samples[]}`；ram/swap/disk 字节→MB；load 转空格字符串；GPU → `gpu_info:[{id,name,info}]`（显存/温度丢弃）；ping 按组名落 `ping_ct/cu/cm/bd` + `loss_*`（bgp 是 bd 别名，rtt=-1 字段缺席）；`ip_v4/v6` 不可达报 `"0"`；`dynamic[]` → `samples[]`（`ext.cf.batch=false` 时只发单条 metrics）。errors/self/virtualization 无落点，CF 模式下不产生。
+**上报映射**（reporter_cf.rs）：顶层 `{id, secret, metrics, samples[]}`；ram/swap/disk 字节→MB；load 转空格字符串；GPU → `gpu_info:[{id,name,info}]`（显存/温度丢弃）；ping 按组名落 `ping_ct/cu/cm/bd` + `loss_*`（bgp 是 bd 别名，未配置为 `false`，已配置但失败为 `null`）；`ip_v4/v6` 不可达报数值 `0`；`dynamic[]` → `samples[]`（`ext.cf.batch=false` 时只发单条 metrics）。空上报周期复用最近一次独立采集快照，避免 CF 将缺失动态字段写成假 0，但不会由 report 触发采集。errors/self/virtualization 无落点，CF 模式下不产生。
 
-**配置下发**：请求头 `X-Agent-Config-Schema: 3` + `X-Agent-Config-Md5`（复用 `config_version` 字段存 MD5，空 = `none`）。响应 204 = 无变更；200 + URL-encoded body → 解析 collect_interval/report_interval/reset_day/custom_ct/cu/cm/bd/interface，合成 `RemoteConfig`（config_version 取响应头 MD5）走 `apply_remote` 同一条热应用管线。CF 未覆盖的字段（ping/slow/gpu/ip 子间隔、enable_gpu、report_*、ext.*）保持现值，仅本地可改。
+**配置下发**：请求头 `X-Agent-Config-Schema: 3` + `X-Agent-Config-Md5`（复用 `config_version` 字段存 MD5，空 = `none`）。响应 204 = 无变更；200 + URL-encoded body → 解析 collect_interval/report_interval/reset_day/custom_ct/cu/cm/bd/interface，合成 `RemoteConfig`（config_version 取响应头 MD5）走 `apply_remote` 同一条热应用管线。`collect=0` 兼容映射为内部 1 秒采集，保持采集/上报分离；逗号分隔的 interface 拆成多个过滤项。CF 未覆盖的字段（ping/slow/gpu/ip 子间隔、enable_gpu、report_*、ext.*）保持现值，仅本地可改。
 
 **流量校正**：响应尾部 `rx_correction/tx_correction`（GB，覆盖当月累计）。netstatic 记账期偏移（offset = 校正字节 − 原始月累计，period_start 匹配才生效，翻页自动失效），立即落盘；校正确认用**独立请求**回传（CF 服务端见到 correction 字段会把整个请求当确认、丢弃 metrics），服务端清空后停止。`ext.cf.correction = false` 时整个回路忽略。`update=1`（自升级）永远忽略。
 

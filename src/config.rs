@@ -319,6 +319,9 @@ mod tests {
         let mut cfg = base_config();
         cfg.intervals.collect = 0;
         assert!(cfg.validate().is_err());
+
+        cfg.protocol = "cf".into();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
