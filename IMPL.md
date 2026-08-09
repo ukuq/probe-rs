@@ -210,7 +210,8 @@ Windows 使用同一套 CF 协议逻辑；CF 一键安装默认启用 GPU 采集
 对接 komari 面板的 WS v2 JSON-RPC（`/api/clients/v2/rpc?token=<secret>`，worker_url 填面板地址）。
 
 - **上行**：`agent.report`（最新值快照，字节单位；无 ts/批量语义，断线期间数据不保留）+ `agent.basicInfo`（连接建立与 static 刷新时）；errors 事件拼进 report 的 `message` 字段
-- **下行**：不执行任何服务端调用，但**友好回绝**（不干等）：exec → POST task/result "Remote control is disabled."(exit -1)；terminal → 拨终端 WS 发说明即关闭（否则面板空转 30s）；ping 任务 → 回 agent.pingResult value=-1。我们从不调 agent.pull 声明能力
-- komari 的月流量由面板自算；ping 为服务端任务制，我们的 `[[pings]]` 在该模式下无落点；无配置下发通道（配置仅本地）
+- **下行**：不执行远程控制调用，但**友好回绝**（不干等）：exec → POST task/result "Remote control is disabled."(exit -1)；terminal → 拨终端 WS 发说明即关闭（否则面板空转 30s）。我们从不调 agent.pull 声明远控能力
+- **Ping**：收到 `agent.ping` 后按 `type + target` 写入该 Komari Reporter 的 `ext.komari.learned_pings`；最多 5 个，按 `last_seen_at` LRU 淘汰。下发请求本身不探测，只读取全局 Ping worker 快照；首轮无缓存回 `-1`，配置热重建后后续任务返回新鲜缓存（最大年龄为本地 ping 周期的 2 倍，且至少 10s）。HTTP 裸 host 自动补 `http://`，path/query/fragment 仍拒绝
+- komari 的月流量由面板自算；自动学习目标跟随该 Reporter 的 `intervals.ping`，与其他 Reporter 目标统一去重聚合；无面板配置下发通道（仅 Ping 目标发现会写本地 TOML）
 - **保活**：komari 服务端读超时 11s 且只有数据帧续期（ping 无效）→ 心跳为每 5s 重发最新 report 文本帧
 - 映射见 reporter_komari.rs（纯函数）；WS 机械（重连/心跳/下行忽略）在 worker/komari.rs

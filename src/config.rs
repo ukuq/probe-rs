@@ -6,9 +6,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::model::{
-    CollectionIntervals, ExtConfig, GlobalConfigSummary, GlobalPingTarget, Intervals, PingKind,
-    PingTarget, RemoteConfig, ReporterConfig, ReporterSummary, StaticConfig,
+    CollectionIntervals, ExtConfig, GlobalConfigSummary, GlobalPingTarget, Intervals,
+    KomariLearnedPing, PingKind, PingTarget, RemoteConfig, ReporterConfig, ReporterSummary,
+    StaticConfig,
 };
+
+pub const KOMARI_LEARNED_PING_LIMIT: usize = 5;
+const KOMARI_PING_TOUCH_PERSIST_MS: i64 = 60_000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +46,12 @@ pub struct ReporterSpec {
 pub struct ScopedPingTarget {
     pub task_id: String,
     pub target: PingTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KomariPingRegistration {
+    pub task_id: String,
+    pub interval: u64,
 }
 
 impl ReporterSpec {
@@ -140,6 +150,8 @@ impl LocalConfig {
             validate_patterns("disks", &reporter.disks)?;
             validate_pings(&reporter.pings)
                 .with_context(|| format!("reporter {} pings 非法", reporter.id))?;
+            validate_komari_pings(reporter)
+                .with_context(|| format!("reporter {} Komari Ping 非法", reporter.id))?;
         }
         Ok(())
     }
@@ -161,15 +173,7 @@ impl LocalConfig {
                 report_gpu: r.report_gpu.unwrap_or(r.protocol == "cf"),
                 report_errors: r.report_errors,
                 report_self: r.report_self,
-                pings: r
-                    .pings
-                    .iter()
-                    .cloned()
-                    .map(|target| ScopedPingTarget {
-                        task_id: ping_task_key(&target).expect("validated ping target"),
-                        target,
-                    })
-                    .collect(),
+                pings: reporter_ping_targets(r),
                 ext: r.ext.clone(),
             })
             .collect()
@@ -206,16 +210,17 @@ impl LocalConfig {
                 .any(|reporter| reporter.disks.is_empty()),
             pings: {
                 let mut tasks = std::collections::BTreeMap::new();
-                for reporter in &self.reporters {
-                    for ping in &reporter.pings {
-                        let interval = ping.interval.unwrap_or(reporter.intervals.ping);
+                for reporter in self.reporter_specs() {
+                    for ping in reporter.pings {
+                        let interval = ping.target.interval.unwrap_or(reporter.intervals.ping);
                         tasks
-                            .entry(ping_task_key(ping).expect("validated ping target"))
+                            .entry(ping.task_id)
                             .and_modify(|task: &mut GlobalPingTarget| {
                                 task.interval = task.interval.min(interval);
                             })
                             .or_insert_with(|| GlobalPingTarget {
-                                target: global_ping_uri(ping).expect("validated ping target"),
+                                target: global_ping_uri(&ping.target)
+                                    .expect("validated ping target"),
                                 interval,
                             });
                     }
@@ -296,6 +301,44 @@ impl LocalConfig {
                 diskio: a.diskio.min(b.diskio),
             })
             .unwrap_or_default()
+    }
+}
+
+fn reporter_ping_targets(reporter: &ReporterConfig) -> Vec<ScopedPingTarget> {
+    let mut targets: Vec<_> = reporter
+        .pings
+        .iter()
+        .cloned()
+        .map(|target| ScopedPingTarget {
+            task_id: ping_task_key(&target).expect("validated ping target"),
+            target,
+        })
+        .collect();
+    if reporter.protocol != "komari" {
+        return targets;
+    }
+
+    let mut configured: std::collections::HashSet<_> = targets
+        .iter()
+        .map(|target| target.task_id.clone())
+        .collect();
+    for learned in &reporter.ext.komari.learned_pings {
+        let mut target = learned_ping_target(learned);
+        let task_id = ping_task_key(&target).expect("validated Komari Ping target");
+        if configured.insert(task_id.clone()) {
+            target.name = format!("komari:{task_id}");
+            targets.push(ScopedPingTarget { task_id, target });
+        }
+    }
+    targets
+}
+
+fn learned_ping_target(learned: &KomariLearnedPing) -> PingTarget {
+    PingTarget {
+        name: "komari:auto".to_string(),
+        kind: learned.kind,
+        target: learned.target.clone(),
+        interval: None,
     }
 }
 
@@ -444,6 +487,34 @@ fn validate_pings(pings: &[PingTarget]) -> Result<()> {
     Ok(())
 }
 
+fn validate_komari_pings(reporter: &ReporterConfig) -> Result<()> {
+    let learned = &reporter.ext.komari.learned_pings;
+    if reporter.protocol != "komari" && !learned.is_empty() {
+        bail!("ext.komari.learned_pings 只允许用于 protocol=\"komari\"");
+    }
+    if learned.len() > KOMARI_LEARNED_PING_LIMIT {
+        bail!(
+            "自动学习目标最多 {} 个，当前 {} 个",
+            KOMARI_LEARNED_PING_LIMIT,
+            learned.len()
+        );
+    }
+    let mut keys = std::collections::HashSet::new();
+    for ping in learned {
+        if ping.target.trim().is_empty() {
+            bail!("自动学习 Ping target 不能为空");
+        }
+        if ping.last_seen_at < 0 {
+            bail!("自动学习 Ping last_seen_at 不能为负数");
+        }
+        let key = ping_task_key(&learned_ping_target(ping))?;
+        if !keys.insert(key) {
+            bail!("自动学习 Ping target 重复");
+        }
+    }
+    Ok(())
+}
+
 /// 共享运行时配置：本地配置 + intervals 变更通知（scheduler 重建 ticker）
 /// + 全量变更通知（supervisor 重建 worker；本地热加载与远端下发共用）
 pub struct SharedConfig {
@@ -507,6 +578,103 @@ impl SharedConfig {
                 false
             }
         });
+    }
+
+    /// 记录 Komari 面板下发的 Ping 目标。这里只修改该 Reporter 的本地采集需求；
+    /// 真正探测由全局 Ping worker 在配置通知后异步完成。
+    pub fn learn_komari_ping(
+        &self,
+        reporter_id: &str,
+        kind: PingKind,
+        target: &str,
+        observed_at: i64,
+    ) -> Result<KomariPingRegistration> {
+        let target = target.trim().to_string();
+        let candidate = PingTarget {
+            name: "komari:auto".to_string(),
+            kind,
+            target: target.clone(),
+            interval: None,
+        };
+        let task_id = ping_task_key(&candidate)?;
+        let observed_at = observed_at.max(0);
+
+        let mut cfg = self.inner.write().expect("config lock poisoned");
+        let reporter_index = cfg
+            .reporters
+            .iter()
+            .position(|reporter| reporter.id == reporter_id)
+            .ok_or_else(|| anyhow::anyhow!("Reporter 不存在: {reporter_id}"))?;
+        let reporter = &cfg.reporters[reporter_index];
+        if reporter.protocol != "komari" {
+            bail!("Reporter {reporter_id} 不是 Komari 协议");
+        }
+        let default_interval = reporter.intervals.ping;
+
+        // 手工 Ping 已经表达同一采集需求时直接复用，不占自动学习的 5 个名额。
+        for configured in &reporter.pings {
+            if ping_task_key(configured)? == task_id {
+                return Ok(KomariPingRegistration {
+                    task_id,
+                    interval: configured.interval.unwrap_or(default_interval),
+                });
+            }
+        }
+
+        let existing = reporter.ext.komari.learned_pings.iter().position(|ping| {
+            ping_task_key(&learned_ping_target(ping)).is_ok_and(|key| key == task_id)
+        });
+        if let Some(index) = existing {
+            // 内存中始终保留精确 LRU；落盘按分钟合并，避免面板高频任务持续写盘。
+            let previous =
+                cfg.reporters[reporter_index].ext.komari.learned_pings[index].last_seen_at;
+            let current = observed_at.max(previous);
+            cfg.reporters[reporter_index].ext.komari.learned_pings[index].last_seen_at = current;
+            if previous / KOMARI_PING_TOUCH_PERSIST_MS != current / KOMARI_PING_TOUCH_PERSIST_MS {
+                if let Err(error) = persist(&self.path, &cfg) {
+                    tracing::warn!(reporter_id, %error, "Komari Ping 最近使用时间落盘失败");
+                }
+            }
+            return Ok(KomariPingRegistration {
+                task_id,
+                interval: default_interval,
+            });
+        }
+
+        let mut next = cfg.clone();
+        let learned = &mut next.reporters[reporter_index].ext.komari.learned_pings;
+        if learned.len() >= KOMARI_LEARNED_PING_LIMIT {
+            let oldest = learned
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, ping)| ping.last_seen_at)
+                .map(|(index, _)| index)
+                .expect("capacity check guarantees an entry");
+            learned.remove(oldest);
+        }
+        learned.push(KomariLearnedPing {
+            kind,
+            target,
+            last_seen_at: observed_at,
+        });
+        next.validate().context("Komari Ping 学习结果非法")?;
+        persist(&self.path, &next).context("Komari Ping 配置落盘失败")?;
+        let full = next.clone();
+        *cfg = next;
+        drop(cfg);
+
+        // 只有目标集合变化才通知，普通 touch 不重建 worker，也不重置 Reporter ticker。
+        self.config_tx.send_replace(full);
+        tracing::info!(
+            reporter_id,
+            kind = ?kind,
+            target = %candidate.target,
+            "Komari Ping 目标已学习"
+        );
+        Ok(KomariPingRegistration {
+            task_id,
+            interval: default_interval,
+        })
     }
 
     #[cfg(test)]
@@ -976,6 +1144,64 @@ diskio = 10
         assert_eq!(komari.reset_day, 12);
         assert_eq!(komari.intervals.collect, 1);
         assert!(komari.report_gpu);
+    }
+
+    #[test]
+    fn komari_learned_pings_are_persisted_and_lru_bounded() {
+        let dir =
+            std::env::temp_dir().join(format!("probe-rs-komari-ping-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut cfg = base_config();
+        let reporter = &mut cfg.reporters[0];
+        reporter.protocol = "komari".into();
+        reporter.worker_url = "https://komari.example.com".into();
+        reporter.pings.clear();
+        persist(&path, &cfg).unwrap();
+        let (shared, _intervals_rx, config_rx) = SharedConfig::new(cfg, path.clone());
+
+        for i in 1..=KOMARI_LEARNED_PING_LIMIT {
+            shared
+                .learn_komari_ping("primary", PingKind::Icmp, &format!("192.0.2.{i}"), i as i64)
+                .unwrap();
+        }
+        assert!(config_rx.has_changed().unwrap());
+        let learned = &shared.get().reporters[0].ext.komari.learned_pings;
+        assert_eq!(learned.len(), KOMARI_LEARNED_PING_LIMIT);
+        assert_eq!(
+            shared.get().effective_pings().len(),
+            KOMARI_LEARNED_PING_LIMIT
+        );
+
+        // 最近再次出现的第一个目标必须保留；加入第六个时淘汰未使用最久的第二个。
+        shared
+            .learn_komari_ping("primary", PingKind::Icmp, "192.0.2.1", 100)
+            .unwrap();
+        shared
+            .learn_komari_ping("primary", PingKind::Icmp, "192.0.2.6", 101)
+            .unwrap();
+        let current = shared.get();
+        let learned = &current.reporters[0].ext.komari.learned_pings;
+        assert_eq!(learned.len(), KOMARI_LEARNED_PING_LIMIT);
+        assert!(learned.iter().any(|ping| ping.target == "192.0.2.1"));
+        assert!(!learned.iter().any(|ping| ping.target == "192.0.2.2"));
+        assert!(learned.iter().any(|ping| ping.target == "192.0.2.6"));
+
+        let on_disk = load(&path).unwrap();
+        assert_eq!(
+            on_disk.reporters[0].ext.komari.learned_pings,
+            current.reporters[0].ext.komari.learned_pings
+        );
+        let toml = std::fs::read_to_string(&path).unwrap();
+        assert!(toml.contains("[[reporters.ext.komari.learned_pings]]"));
+        assert!(shared
+            .learn_komari_ping("primary", PingKind::Http, "https://example.com/health", 102,)
+            .is_err());
+        assert_eq!(
+            shared.get().reporters[0].ext.komari.learned_pings.len(),
+            KOMARI_LEARNED_PING_LIMIT
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

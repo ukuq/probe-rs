@@ -2,7 +2,7 @@
 //!
 //! - agent.report：内层是扁平的指标对象（字节单位、无 ts/批量语义，只报最新值）
 //! - agent.basicInfo：静态信息（连接建立 + 周期刷新时发送）
-//! - komari 的月流量由面板侧自算；ping 是服务端任务制，我们的 [[pings]] 无落点；
+//! - komari 的月流量由面板侧自算；服务端 Ping 任务只读取 Agent 本地采集缓存；
 //!   服务端下行方法（exec/terminal 等）一律忽略（安全：不做远程执行）
 
 use serde_json::{json, Value};

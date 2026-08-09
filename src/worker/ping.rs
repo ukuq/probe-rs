@@ -73,8 +73,10 @@ async fn target_loop(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let ts = crate::model::now_millis();
                 let (rtt, loss, err) = ping_one(&target, kind).await;
+                // PingRecord.ts 表示这一轮测量完成时间，供缓存新鲜度与 Komari
+                // finished_at 使用；DNS/探测耗时较长时不能提前记成开始时间。
+                let ts = crate::model::now_millis();
                 let name = target.name.clone();
                 if rtt < 0 {
                     buffers.push_error(

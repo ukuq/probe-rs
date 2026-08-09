@@ -226,6 +226,19 @@ pub struct PingTarget {
     pub interval: Option<u64>,
 }
 
+/// Komari 面板下发后由 Agent 自动学习的 Ping 目标。
+///
+/// 它没有 Reporter 内的逻辑名称和独立周期：采集周期始终跟随该
+/// Komari Reporter 的 `intervals.ping`，`last_seen_at` 仅用于 LRU 淘汰。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KomariLearnedPing {
+    #[serde(rename = "type")]
+    pub kind: PingKind,
+    pub target: String,
+    pub last_seen_at: i64,
+}
+
 /// 去重后的全局实际 Ping worker 配置；逻辑名称仅属于各 Reporter，不进入这里。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GlobalPingTarget {
@@ -427,6 +440,22 @@ pub struct RemoteCfExt {
 pub struct ExtConfig {
     #[serde(default)]
     pub cf: CfExt,
+    #[serde(default, skip_serializing_if = "KomariExt::is_empty")]
+    pub komari: KomariExt,
+}
+
+/// Komari 专属本地状态。`learned_pings` 由 Agent 管理，不接受面板直接改写。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KomariExt {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub learned_pings: Vec<KomariLearnedPing>,
+}
+
+impl KomariExt {
+    fn is_empty(&self) -> bool {
+        self.learned_pings.is_empty()
+    }
 }
 
 /// CF 协议扩展（ext.cf.*）：仅 protocol="cf" 时生效

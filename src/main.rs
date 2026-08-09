@@ -231,10 +231,13 @@ async fn main() -> Result<()> {
         let komari_tx = if spec.protocol == "komari" {
             let (tx, rx) = watch::channel(worker::komari::KomariOut::default());
             worker::komari::spawn(
+                spec.id.clone(),
                 spec.worker_url.clone(),
                 spec.secret.clone(),
                 rx,
                 Arc::clone(&buffers),
+                Arc::clone(&shared),
+                ping_rx.clone(),
             );
             Some(tx)
         } else {

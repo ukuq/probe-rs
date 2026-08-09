@@ -69,6 +69,14 @@ gpu = 60
 ip = 600
 diskio = 10
 
+# Komari 下发 Ping 目标后，Agent 会在此 Reporter 的 ext.komari 中自动
+# 持久化最多 5 个 learned_pings；它们跟随上面的 ping 周期，由 LRU 淘汰。
+# 该列表由 Agent 管理，通常无需手工填写：
+# [[reporters.ext.komari.learned_pings]]
+# type = "icmp"
+# target = "1.1.1.1"
+# last_seen_at = 1786252800000
+
 [[reporters]]
 id = "local-demo"
 protocol = "probe"
