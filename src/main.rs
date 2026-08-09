@@ -51,10 +51,10 @@ async fn main() -> Result<()> {
         );
         if spec.protocol == "cf" {
             for ping in &spec.pings {
-                if !["ct", "cu", "cm", "bd", "bgp"].contains(&ping.name.as_str()) {
+                if !["ct", "cu", "cm", "bd", "bgp"].contains(&ping.target.name.as_str()) {
                     tracing::warn!(
                         reporter_id = %spec.id,
-                        name = %ping.name,
+                        name = %ping.target.name,
                         "CF has no field for this ping group"
                     );
                 }

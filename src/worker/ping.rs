@@ -1,10 +1,10 @@
 //! 网络探测 worker：每组（key/url/interval）独立 task、独立节奏
 //!
-//! target 推断类型：http(s):// 开头 → HTTP；否则 TCP（host[:port]，默认 80）。
+//! 类型显式配置为 http/tcp/icmp；DNS 始终在 RTT 计时开始前完成。
 //! 快照为 HashMap<key, PingRecord>，每组各自 ts；采集端按 key 新鲜度摘取。
-//! icmp 一期不支持（需 root/CAP_NET_RAW）。
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
@@ -14,7 +14,7 @@ use tokio::time::interval;
 use std::sync::Arc as StdArc;
 
 use crate::buffer::Buffers;
-use crate::model::{Intervals, PingRecord, PingTarget};
+use crate::model::{Intervals, PingKind, PingRecord, PingTarget};
 
 const PING_TIMEOUT: Duration = Duration::from_secs(3);
 const HIGH_LATENCY_MS: i64 = 1000;
@@ -60,20 +60,6 @@ impl PingWorker {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PingKind {
-    Tcp,
-    Http,
-}
-
-fn kind_of(target: &str) -> PingKind {
-    if target.starts_with("http://") || target.starts_with("https://") {
-        PingKind::Http
-    } else {
-        PingKind::Tcp
-    }
-}
-
 /// 单目标循环：interval 缺省时跟随全局 intervals.ping（仅本地配置）
 async fn target_loop(
     target: PingTarget,
@@ -81,7 +67,7 @@ async fn target_loop(
     buffers: StdArc<Buffers>,
     mut intervals_rx: watch::Receiver<Intervals>,
 ) {
-    let kind = kind_of(&target.target);
+    let kind = target.kind;
     let effective = |i: &Intervals| target.interval.unwrap_or(i.ping).max(1);
     let mut ticker = interval(Duration::from_secs(effective(&intervals_rx.borrow())));
     loop {
@@ -112,10 +98,14 @@ async fn target_loop(
 
 /// 单目标一轮：4 次测量（每次带防重传重试），中位数 + 丢包率 + 首个错误文本
 async fn ping_one(target: &PingTarget, kind: PingKind) -> (i64, u32, Option<String>) {
+    let resolved = match resolve_target(&target.target, kind).await {
+        Ok(resolved) => resolved,
+        Err(error) => return (-1, 100, Some(error.to_string())),
+    };
     let mut values: Vec<i64> = Vec::with_capacity(PING_COUNT as usize);
     let mut first_err: Option<String> = None;
     for _ in 0..PING_COUNT {
-        match measure_with_retry(&target.target, kind).await {
+        match measure_with_retry(&resolved).await {
             Ok(ms) => values.push(ms),
             Err(e) => {
                 if first_err.is_none() {
@@ -146,15 +136,15 @@ fn build_result(count: u32, values: &mut [i64]) -> (i64, u32) {
 }
 
 /// 防重传：首次 >1000ms 时重测最多 3 次；TCP 降幅 >800ms 判失败
-async fn measure_with_retry(target: &str, kind: PingKind) -> Result<i64> {
-    let first = measure(target, kind).await?;
+async fn measure_with_retry(target: &ResolvedTarget) -> Result<i64> {
+    let first = measure(target).await?;
     if first <= HIGH_LATENCY_MS {
         return Ok(first);
     }
     for i in 0..HIGH_LATENCY_RETRIES {
-        let second = measure(target, kind).await?;
+        let second = measure(target).await?;
         if second <= HIGH_LATENCY_MS {
-            if kind == PingKind::Tcp && first - second > RETRY_DROP_TCP_MS {
+            if target.kind() == PingKind::Tcp && first - second > RETRY_DROP_TCP_MS {
                 bail!("suspicious retransmission detected in tcp handshake");
             }
             return Ok(second);
@@ -166,14 +156,96 @@ async fn measure_with_retry(target: &str, kind: PingKind) -> Result<i64> {
     Ok(first)
 }
 
-async fn measure(target: &str, kind: PingKind) -> Result<i64> {
-    match kind {
-        PingKind::Tcp => tcp_ping(target).await,
-        PingKind::Http => http_ping(target).await,
+async fn measure(target: &ResolvedTarget) -> Result<i64> {
+    match target {
+        ResolvedTarget::Tcp { addresses } => tcp_ping(addresses).await,
+        ResolvedTarget::Http {
+            url,
+            host,
+            addresses,
+        } => http_ping(url, host, addresses).await,
+        ResolvedTarget::Icmp { address } => icmp_ping(*address).await,
     }
 }
 
-fn split_host_port(target: &str) -> Result<(String, u16)> {
+#[derive(Debug)]
+enum ResolvedTarget {
+    Tcp {
+        addresses: Vec<SocketAddr>,
+    },
+    Http {
+        url: reqwest::Url,
+        host: String,
+        addresses: Vec<SocketAddr>,
+    },
+    Icmp {
+        address: IpAddr,
+    },
+}
+
+impl ResolvedTarget {
+    fn kind(&self) -> PingKind {
+        match self {
+            Self::Tcp { .. } => PingKind::Tcp,
+            Self::Http { .. } => PingKind::Http,
+            Self::Icmp { .. } => PingKind::Icmp,
+        }
+    }
+}
+
+/// Resolve exactly once for one four-sample round. All connection/HTTP/ICMP
+/// timers start after this function returns, so DNS lookup time never enters RTT.
+async fn resolve_target(target: &str, kind: PingKind) -> Result<ResolvedTarget> {
+    match kind {
+        PingKind::Tcp => {
+            let (host, port) = split_host_port(target)?;
+            Ok(ResolvedTarget::Tcp {
+                addresses: resolve_all(&host, port).await?,
+            })
+        }
+        PingKind::Http => {
+            let url = reqwest::Url::parse(target)?;
+            let host = url
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("http target has no host"))?
+                .to_string();
+            let port = url
+                .port_or_known_default()
+                .ok_or_else(|| anyhow::anyhow!("http target has no port"))?;
+            let addresses = resolve_all(&host, port).await?;
+            Ok(ResolvedTarget::Http {
+                url,
+                host,
+                addresses,
+            })
+        }
+        PingKind::Icmp => {
+            let host = target.trim().trim_matches(['[', ']']);
+            let address = resolve_all(host, 0)
+                .await?
+                .into_iter()
+                .next()
+                .expect("resolve_all rejects empty results")
+                .ip();
+            Ok(ResolvedTarget::Icmp { address })
+        }
+    }
+}
+
+async fn resolve_all(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    let mut addresses: Vec<_> =
+        tokio::time::timeout(PING_TIMEOUT, tokio::net::lookup_host((host, port)))
+            .await??
+            .collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    if addresses.is_empty() {
+        bail!("no address for {host}");
+    }
+    Ok(addresses)
+}
+
+pub(crate) fn split_host_port(target: &str) -> Result<(String, u16)> {
     let target = target.trim();
     if target.is_empty() {
         bail!("empty target");
@@ -202,41 +274,58 @@ fn split_host_port(target: &str) -> Result<(String, u16)> {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
         {
-            if let Ok(port) = port.parse::<u16>() {
-                if port >= 1 {
-                    return Ok((host.to_string(), port));
-                }
+            if let Ok(port @ 1..) = port.parse::<u16>() {
+                return Ok((host.to_string(), port));
             }
+            bail!("非法 target 端口: {target}");
         }
     }
     Ok((target.to_string(), DEFAULT_TCP_PORT))
 }
 
-async fn tcp_ping(target: &str) -> Result<i64> {
-    let (host, port) = split_host_port(target)?;
-    let addr = tokio::time::timeout(PING_TIMEOUT, tokio::net::lookup_host((host.as_str(), port)))
-        .await??
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no address"))?;
+async fn tcp_ping(addresses: &[SocketAddr]) -> Result<i64> {
     let start = Instant::now();
-    let stream = tokio::time::timeout(PING_TIMEOUT, tokio::net::TcpStream::connect(addr)).await??;
+    let stream =
+        tokio::time::timeout(PING_TIMEOUT, tokio::net::TcpStream::connect(addresses)).await??;
     drop(stream);
     Ok((start.elapsed().as_millis() as i64).max(1))
 }
 
-async fn http_ping(target: &str) -> Result<i64> {
+async fn http_ping(url: &reqwest::Url, host: &str, addresses: &[SocketAddr]) -> Result<i64> {
     let client = reqwest::Client::builder()
         .timeout(PING_TIMEOUT)
         .pool_max_idle_per_host(0)
+        // Redirects could introduce a second hostname and put its DNS lookup
+        // back inside the measured request. A redirect response is already a
+        // successful reachability result, so do not follow it.
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, addresses)
         .build()?;
     let start = Instant::now();
-    let resp = client.get(target).send().await?;
+    let resp = client.get(url.clone()).send().await?;
     let ms = (start.elapsed().as_millis() as i64).max(1);
     if resp.status().is_success() || resp.status().is_redirection() {
         Ok(ms)
     } else {
         bail!("http status {}", resp.status())
     }
+}
+
+async fn icmp_ping(address: IpAddr) -> Result<i64> {
+    let ip = address.to_string();
+    let mut command = tokio::process::Command::new("ping");
+    if cfg!(windows) {
+        command.args(["-n", "1", "-w", "3000", &ip]);
+    } else {
+        command.args(["-c", "1", "-W", "3", &ip]);
+    }
+    let start = Instant::now();
+    let output =
+        tokio::time::timeout(PING_TIMEOUT + Duration::from_secs(1), command.output()).await??;
+    if !output.status.success() {
+        bail!("icmp ping exit {}", output.status);
+    }
+    Ok((start.elapsed().as_millis() as i64).max(1))
 }
 
 #[cfg(test)]
@@ -284,10 +373,10 @@ mod tests {
     }
 
     #[test]
-    fn kind_inference() {
-        assert_eq!(kind_of("https://example.com"), PingKind::Http);
-        assert_eq!(kind_of("http://1.2.3.4:8080/health"), PingKind::Http);
-        assert_eq!(kind_of("1.2.3.4:80"), PingKind::Tcp);
-        assert_eq!(kind_of("example.com"), PingKind::Tcp);
+    fn kind_is_explicit() {
+        let target: PingTarget =
+            serde_json::from_str(r#"{"name":"edge","type":"icmp","target":"example.com"}"#)
+                .unwrap();
+        assert_eq!(target.kind, PingKind::Icmp);
     }
 }

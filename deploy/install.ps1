@@ -154,15 +154,6 @@ function Write-InitialConfig {
     else {
         $content = @"
 net_static_path = '$NetStaticPath'
-enable_gpu = false
-
-[intervals]
-collect = 10
-ping = 30
-slow = 60
-gpu = 60
-ip = 600
-diskio = 10
 
 [[reporters]]
 id = "primary"
@@ -172,6 +163,19 @@ secret = "change-me"
 worker_url = "https://monitor.example.com/report"
 report_interval = 60
 reset_day = 1
+interfaces = []
+disks = []
+report_gpu = false
+report_errors = true
+report_self = false
+
+[reporters.intervals]
+collect = 10
+ping = 30
+slow = 60
+gpu = 60
+ip = 600
+diskio = 10
 "@
     }
     [IO.File]::WriteAllText($ConfigPath, $content, $Utf8NoBom)

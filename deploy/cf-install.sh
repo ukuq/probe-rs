@@ -169,14 +169,12 @@ remove_reporter_block() {
 if [ -s "$CONFIG_PATH" ] &&
    grep -q '^[[:space:]]*\[\[reporters\]\]' "$CONFIG_PATH" &&
    ! awk '
+       /^[[:space:]]*\[intervals\][[:space:]]*$/ || /^[[:space:]]*\[\[pings\]\][[:space:]]*$/ { found=1; exit }
        /^[[:space:]]*\[/ { exit }
-       /^[[:space:]]*server_id[[:space:]]*=/ { found=1 }
+       /^[[:space:]]*(server_id|enable_gpu)[[:space:]]*=/ { found=1 }
        END { exit found ? 0 : 1 }
    ' "$CONFIG_PATH"; then
-    # 新 schema 的全局 collector 只有一份。CF 默认需要 GPU，采样周期也按本次安装参数更新；
-    # 全局 Ping 定义保持现状，避免覆盖其他 Reporter 正在使用的目标。
-    sed -i '0,/^[[:space:]]*enable_gpu[[:space:]]*=.*/s//enable_gpu = true/' "$CONFIG_PATH"
-    sed -i "/^[[:space:]]*\[intervals\][[:space:]]*$/,/^[[:space:]]*\[/ s/^[[:space:]]*collect[[:space:]]*=.*/collect = $COLLECT/" "$CONFIG_PATH"
+    # 新 schema 中每路声明需求，实际 worker 配置由所有 Reporter 聚合。
     remove_reporter_block "$CONFIG_PATH" "$REPORTER_ID"
     {
         echo ""
@@ -190,36 +188,38 @@ if [ -s "$CONFIG_PATH" ] &&
         echo "report_interval = $REPORT"
         echo "reset_day = $RESET_DAY"
         echo "interfaces = []"
+        echo "disks = []"
         echo "report_gpu = true"
         echo "report_errors = true"
         echo "report_self = false"
+        echo ""
+        echo "[reporters.intervals]"
+        echo "collect = $COLLECT"
+        echo "ping = 30"
+        echo "slow = 60"
+        echo "gpu = 60"
+        echo "ip = 600"
+        echo "diskio = 10"
+        for pair in "ct:$CT" "cu:$CU" "cm:$CM" "bd:$BD"; do
+            name="${pair%%:*}"; target="${pair#*:}"
+            [ -n "$target" ] || continue
+            echo ""
+            echo "[[reporters.pings]]"
+            echo "name = \"$name\""
+            echo 'type = "tcp"'
+            echo "target = \"$target\""
+            echo "interval = 30"
+        done
         echo ""
         echo "[reporters.ext.cf]"
         echo "correction = true"
         echo "batch = true"
     } >> "$CONFIG_PATH"
-    log "preserved global collectors and upserted CF Reporter '$REPORTER_ID'"
+    log "preserved other Reporters and upserted CF Reporter '$REPORTER_ID'"
 else
     # 缺失配置或旧的根连接 schema 都直接覆盖为新 canonical 格式，不做兼容迁移。
 {
     echo "net_static_path = \"$DATA_DIR/net_static.json\""
-    echo "enable_gpu = true"
-    echo ""
-    echo "[intervals]"
-    echo "collect = $COLLECT"
-    echo "ping = 30"
-    echo "slow = 60"
-    echo "gpu = 60"
-    echo "ip = 600"
-    echo "diskio = 10"
-    for pair in "ct:$CT" "cu:$CU" "cm:$CM" "bd:$BD"; do
-        name="${pair%%:*}"; target="${pair#*:}"
-        [ -n "$target" ] || continue
-        echo ""
-        echo "[[pings]]"
-        echo "name = \"$name\""
-        echo "target = \"$target\""
-    done
     echo ""
     echo "[[reporters]]"
     echo "id = \"$REPORTER_ID\""
@@ -231,9 +231,28 @@ else
     echo "report_interval = $REPORT"
     echo "reset_day = $RESET_DAY"
     echo "interfaces = []"
+    echo "disks = []"
     echo "report_gpu = true"
     echo "report_errors = true"
     echo "report_self = false"
+    echo ""
+    echo "[reporters.intervals]"
+    echo "collect = $COLLECT"
+    echo "ping = 30"
+    echo "slow = 60"
+    echo "gpu = 60"
+    echo "ip = 600"
+    echo "diskio = 10"
+    for pair in "ct:$CT" "cu:$CU" "cm:$CM" "bd:$BD"; do
+        name="${pair%%:*}"; target="${pair#*:}"
+        [ -n "$target" ] || continue
+        echo ""
+        echo "[[reporters.pings]]"
+        echo "name = \"$name\""
+        echo 'type = "tcp"'
+        echo "target = \"$target\""
+        echo "interval = 30"
+    done
     echo ""
     echo "[reporters.ext.cf]"
     echo "correction = true"

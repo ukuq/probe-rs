@@ -45,12 +45,13 @@ deno run --allow-net server.ts 9000   # 指定端口
 ```bash
 curl -X POST localhost:8080/api/config/URL编码后的instance_id \
   -H 'Content-Type: application/json' \
-  -d '{"report_interval":10,"reset_day":1,"report_gpu":true}'
+  -d '{"intervals":{"collect":2,"ping":60,"slow":60,"gpu":60,"ip":600,"diskio":10},"report_interval":10,"reset_day":1,"interfaces":["eth*"],"disks":["nvme*"],"pings":[{"name":"edge","type":"icmp","target":"1.1.1.1","interval":60}],"report_gpu":true}'
 ```
 
-服务端校验基本合法性（report_interval >= 1、reset_day 0-31）→ 下次上报随响应下发 → agent
-原子应用该 Reporter 配置并落盘，面板上的 `cfg v` 版本号随之更新。全局采集周期、GPU worker
-开关和 Ping 定义只能在本地 TOML 修改。
+服务端校验周期、glob 与 Ping 基本格式 → 下次上报随响应下发 → agent 原子应用该 Reporter
+配置并落盘，面板上的 `cfg v` 版本号随之更新。Agent 随后自动重算实际机器级配置：周期取所有
+Reporter 最小值、GPU 取 OR、网卡/磁盘/Ping 取并集。生产服务端允许下发 Ping 时应额外限制目标，
+避免 SSRF/内网探测。
 
 ## 注意
 

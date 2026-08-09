@@ -11,18 +11,17 @@ use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::System::Performance::{
     PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetCounterTimeBase,
-    PdhGetRawCounterArrayW, PdhGetRawCounterValue, PdhOpenQueryW, PDH_CSTATUS_NEW_DATA,
-    PDH_CSTATUS_VALID_DATA, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA, PDH_RAW_COUNTER,
-    PDH_RAW_COUNTER_ITEM_W,
+    PdhGetRawCounterArrayW, PdhOpenQueryW, PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA,
+    PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA, PDH_RAW_COUNTER, PDH_RAW_COUNTER_ITEM_W,
 };
 
-use super::DiskIoCounters;
+use super::{DiskIoCounters, DiskIoDeviceCounters};
 
-const READ_BYTES: &str = r"\PhysicalDisk(_Total)\Disk Read Bytes/sec";
-const WRITE_BYTES: &str = r"\PhysicalDisk(_Total)\Disk Write Bytes/sec";
-const READ_OPS: &str = r"\PhysicalDisk(_Total)\Disk Reads/sec";
-const WRITE_OPS: &str = r"\PhysicalDisk(_Total)\Disk Writes/sec";
-const TOTAL_TIME: &str = r"\PhysicalDisk(_Total)\Avg. Disk sec/Transfer";
+const READ_BYTES: &str = r"\PhysicalDisk(*)\Disk Read Bytes/sec";
+const WRITE_BYTES: &str = r"\PhysicalDisk(*)\Disk Write Bytes/sec";
+const READ_OPS: &str = r"\PhysicalDisk(*)\Disk Reads/sec";
+const WRITE_OPS: &str = r"\PhysicalDisk(*)\Disk Writes/sec";
+const TOTAL_TIME: &str = r"\PhysicalDisk(*)\Avg. Disk sec/Transfer";
 const DISK_TIME: &str = r"\PhysicalDisk(*)\% Disk Time";
 
 static QUERY: OnceLock<Mutex<Option<PdhDiskQuery>>> = OnceLock::new();
@@ -111,21 +110,21 @@ impl PdhDiskQuery {
         let status = unsafe { PdhCollectQueryData(self.query as PDH_HQUERY) };
         check_status("PdhCollectQueryData", status)?;
 
-        let read_bytes = raw_value(self.read_bytes)?;
-        let write_bytes = raw_value(self.write_bytes)?;
-        let read_ops = raw_value(self.read_ops)?;
-        let write_ops = raw_value(self.write_ops)?;
-        let total_time = raw_value(self.total_time)?;
-        let disk_times = raw_array(self.disk_time)?;
+        let read_bytes: HashMap<_, _> = raw_array(self.read_bytes)?.into_iter().collect();
+        let write_bytes: HashMap<_, _> = raw_array(self.write_bytes)?.into_iter().collect();
+        let read_ops: HashMap<_, _> = raw_array(self.read_ops)?.into_iter().collect();
+        let write_ops: HashMap<_, _> = raw_array(self.write_ops)?.into_iter().collect();
+        let total_times: HashMap<_, _> = raw_array(self.total_time)?.into_iter().collect();
+        let disk_times: HashMap<_, _> = raw_array(self.disk_time)?.into_iter().collect();
 
         let mut io_ms_per_dev = HashMap::new();
         let mut total_fallback = None;
-        for (name, raw) in disk_times {
+        for (name, raw) in &disk_times {
             let elapsed = ticks_to_ms(raw.FirstValue, self.disk_time_base);
             if name.eq_ignore_ascii_case("_Total") {
                 total_fallback = Some(elapsed);
             } else {
-                io_ms_per_dev.insert(name, elapsed);
+                io_ms_per_dev.insert(name.clone(), elapsed);
             }
         }
         // 极少数系统只公开 _Total；保留利用率指标，仍限制到 100%。
@@ -135,13 +134,55 @@ impl PdhDiskQuery {
             }
         }
 
+        let raw = |map: &HashMap<String, PDH_RAW_COUNTER>, name: &str| {
+            map.get(name)
+                .map_or(0, |value| nonnegative(value.FirstValue))
+        };
+        let mut devices = std::collections::BTreeMap::new();
+        for name in read_bytes
+            .keys()
+            .filter(|name| !name.eq_ignore_ascii_case("_Total"))
+        {
+            devices.insert(
+                name.clone(),
+                DiskIoDeviceCounters {
+                    read_bytes: raw(&read_bytes, name),
+                    write_bytes: raw(&write_bytes, name),
+                    read_ops: raw(&read_ops, name),
+                    write_ops: raw(&write_ops, name),
+                    total_time_ms: total_times.get(name).map_or(0, |value| {
+                        ticks_to_ms(value.FirstValue, self.total_time_base)
+                    }),
+                    io_time_ms: disk_times
+                        .get(name)
+                        .map(|value| ticks_to_ms(value.FirstValue, self.disk_time_base)),
+                },
+            );
+        }
+        let sum = |pick: fn(&DiskIoDeviceCounters) -> u64| devices.values().map(pick).sum();
         Ok(DiskIoCounters {
-            read_bytes: nonnegative(read_bytes.FirstValue),
-            write_bytes: nonnegative(write_bytes.FirstValue),
-            read_ops: nonnegative(read_ops.FirstValue),
-            write_ops: nonnegative(write_ops.FirstValue),
-            total_time_ms: ticks_to_ms(total_time.FirstValue, self.total_time_base),
+            read_bytes: read_bytes.get("_Total").map_or_else(
+                || sum(|d| d.read_bytes),
+                |value| nonnegative(value.FirstValue),
+            ),
+            write_bytes: write_bytes.get("_Total").map_or_else(
+                || sum(|d| d.write_bytes),
+                |value| nonnegative(value.FirstValue),
+            ),
+            read_ops: read_ops.get("_Total").map_or_else(
+                || sum(|d| d.read_ops),
+                |value| nonnegative(value.FirstValue),
+            ),
+            write_ops: write_ops.get("_Total").map_or_else(
+                || sum(|d| d.write_ops),
+                |value| nonnegative(value.FirstValue),
+            ),
+            total_time_ms: total_times.get("_Total").map_or_else(
+                || sum(|d| d.total_time_ms),
+                |value| ticks_to_ms(value.FirstValue, self.total_time_base),
+            ),
             io_ms_per_dev,
+            devices,
         })
     }
 }
@@ -164,14 +205,6 @@ fn counter_time_base(counter: usize) -> Result<i64, String> {
         return Err(format!("PDH 返回非法时间基数: {time_base}"));
     }
     Ok(time_base)
-}
-
-fn raw_value(counter: usize) -> Result<PDH_RAW_COUNTER, String> {
-    let mut raw = PDH_RAW_COUNTER::default();
-    let status = unsafe { PdhGetRawCounterValue(counter as PDH_HCOUNTER, null_mut(), &mut raw) };
-    check_status("PdhGetRawCounterValue", status)?;
-    check_counter_status(raw.CStatus)?;
-    Ok(raw)
 }
 
 fn raw_array(counter: usize) -> Result<Vec<(String, PDH_RAW_COUNTER)>, String> {
@@ -248,14 +281,6 @@ fn check_status(operation: &str, status: u32) -> Result<(), String> {
 
 fn status_error(operation: &str, status: u32) -> String {
     format!("{operation} 失败，PDH status=0x{status:08x}")
-}
-
-fn check_counter_status(status: u32) -> Result<(), String> {
-    if is_valid_counter_status(status) {
-        Ok(())
-    } else {
-        Err(status_error("PDH counter data", status))
-    }
 }
 
 fn is_valid_counter_status(status: u32) -> bool {

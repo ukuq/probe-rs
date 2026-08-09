@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::scan_file;
+use crate::model::DiskVolume;
 
 const EXCLUDED_MOUNT_PREFIXES: &[&str] = &[
     "/tmp",
@@ -43,9 +44,8 @@ const EXCLUDED_FS_PREFIXES: &[&str] = &[
     "securityfs",
 ];
 
-/// (disk_total, disk_used)，字节
-pub fn collect() -> (u64, u64) {
-    let mut devices: HashMap<String, (u64, u64)> = HashMap::new();
+pub fn collect_volumes() -> Vec<DiskVolume> {
+    let mut devices: HashMap<String, DiskVolume> = HashMap::new();
     let _ = scan_file("/proc/mounts", |line| {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 3 {
@@ -80,15 +80,25 @@ pub fn collect() -> (u64, u64) {
         };
         // 同设备多挂载点取 total 最大的（处理 quota 等情况）
         match devices.get(&device_id) {
-            Some(&(existing_total, _)) if existing_total >= total => {}
+            Some(existing) if existing.total >= total => {}
             _ => {
-                devices.insert(device_id, (total, used));
+                devices.insert(
+                    device_id.clone(),
+                    DiskVolume {
+                        id: device_id,
+                        name: dev.to_string(),
+                        mount_point,
+                        file_system: fs_type,
+                        total,
+                        used,
+                    },
+                );
             }
         }
     });
-    devices
-        .values()
-        .fold((0u64, 0u64), |(t, u), &(dt, du)| (t + dt, u + du))
+    let mut volumes: Vec<_> = devices.into_values().collect();
+    volumes.sort_by(|a, b| a.id.cmp(&b.id));
+    volumes
 }
 
 fn include_mount(dev: &str, mount_point: &str, fs_type: &str, opts: &str) -> bool {

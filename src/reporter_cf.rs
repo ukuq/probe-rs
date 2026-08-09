@@ -329,15 +329,27 @@ pub struct CfPush {
     pub interface: Option<String>,
 }
 
-/// 把 CF 推送合成为 Reporter 远端配置。collect/custom ping 属于本机全局
-/// collection，故绝不由某个上报端修改。
-pub fn synthesize_remote(push: &CfPush, current_report: u64) -> crate::model::RemoteConfig {
+/// 把 CF 推送合成为当前 Reporter 的远端配置；其 collect 需求随后参与全局最小值聚合。
+pub fn synthesize_remote(
+    push: &CfPush,
+    current: &crate::model::Intervals,
+) -> crate::model::RemoteConfig {
     crate::model::RemoteConfig {
         config_version: push.version.clone(),
+        intervals: push.collect.filter(|value| *value >= 1).map(|collect| {
+            crate::model::CollectionIntervals {
+                collect,
+                ping: current.ping,
+                slow: current.slow,
+                gpu: current.gpu,
+                ip: current.ip,
+                diskio: current.diskio,
+            }
+        }),
         report_interval: push
             .report
             .map(|value| value.max(1))
-            .or_else(|| push.collect.is_some().then_some(current_report)),
+            .or_else(|| push.collect.is_some().then_some(current.report)),
         reset_day: push.reset_day,
         interfaces: push.interface.as_ref().map(|s| {
             s.split(',')
@@ -346,6 +358,8 @@ pub fn synthesize_remote(push: &CfPush, current_report: u64) -> crate::model::Re
                 .map(str::to_string)
                 .collect()
         }),
+        disks: None,
+        pings: None,
         report_gpu: None,
         report_errors: None,
         report_self: None,
@@ -470,6 +484,7 @@ mod tests {
             mem_total: 13510758768,
             swap_total: 14682169548,
             disk_total: 80412332032,
+            disks: vec![],
             gpu_name: None,
             virtualization: None,
             boot_time: 1786000000000,
@@ -477,9 +492,12 @@ mod tests {
             ipv6: None,
             agent_version: "0.1.0".into(),
             config: crate::model::StaticConfig {
+                global: Default::default(),
+                reporters: vec![],
                 reset_day: 1,
                 intervals: crate::model::Intervals::default(),
                 interfaces: vec![],
+                disks: vec![],
                 enable_gpu: false,
                 report_errors: true,
                 report_self: true,
@@ -509,6 +527,7 @@ mod tests {
         let slow = SlowBlock {
             ts: 999,
             disk_used: Some(5_000_000_000),
+            disks: vec![],
             tcp_conn: Some(1),
             udp_conn: Some(6),
             processes: Some(14),
@@ -545,6 +564,7 @@ mod tests {
             .into_iter()
             .map(|name| PingTarget {
                 name: name.into(),
+                kind: crate::model::PingKind::Tcp,
                 target: "example.com".into(),
                 interval: None,
             })
@@ -606,7 +626,7 @@ mod tests {
             custom: [None, None, None, None],
             interface: Some("eth0, eth1,,bond*".into()),
         };
-        let remote = synthesize_remote(&push, 30);
+        let remote = synthesize_remote(&push, &crate::model::Intervals::default());
         assert_eq!(remote.report_interval, Some(60));
         assert_eq!(remote.interfaces.unwrap(), vec!["eth0", "eth1", "bond*"]);
     }

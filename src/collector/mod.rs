@@ -48,9 +48,9 @@ pub fn memory() -> (u64, u64, u64, u64) {
     imp::memory()
 }
 
-/// (disk_total, disk_used)，字节
-pub fn disk() -> (u64, u64) {
-    imp::disk()
+/// 逐文件系统卷容量；兼容的 disk_total/disk_used 均由它聚合。
+pub fn disks() -> Vec<crate::model::DiskVolume> {
+    imp::disks()
 }
 
 /// [load1, load5, load15]；Windows 等为 None
@@ -86,10 +86,21 @@ pub struct DiskIoCounters {
     /// 各整盘"io 进行中"总时长（ms）：usage = 各盘差值/间隔的最大值（多盘并行不累加）。
     /// 无此信息的平台（macOS）为空 map → usage 恒 None
     pub io_ms_per_dev: std::collections::HashMap<String, u64>,
+    pub devices: std::collections::BTreeMap<String, DiskIoDeviceCounters>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DiskIoDeviceCounters {
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub read_ops: u64,
+    pub write_ops: u64,
+    pub total_time_ms: u64,
+    pub io_time_ms: Option<u64>,
 }
 
 /// 磁盘 IO 速率（disk_io_diff 的输出，1:1 对应 DiskIoRecord 各指标字段）
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DiskIoRates {
     pub read_bps: Option<f64>,
     pub write_bps: Option<f64>,
@@ -97,6 +108,7 @@ pub struct DiskIoRates {
     pub write_iops: Option<f64>,
     pub await_ms: Option<f64>,
     pub usage: Option<f64>,
+    pub disks: Vec<crate::model::DiskIoDeviceRecord>,
 }
 
 /// 磁盘 IO 累计计数器（整盘合计）；不支持的平台返回 None
@@ -144,6 +156,35 @@ pub fn disk_io_diff(
         write_iops: Some(dwo / dt),
         await_ms,
         usage,
+        disks: cur
+            .devices
+            .iter()
+            .filter_map(|(name, current)| {
+                p.devices.get(name).map(|previous| {
+                    let dr = current.read_bytes.saturating_sub(previous.read_bytes) as f64;
+                    let dw = current.write_bytes.saturating_sub(previous.write_bytes) as f64;
+                    let dro = current.read_ops.saturating_sub(previous.read_ops) as f64;
+                    let dwo = current.write_ops.saturating_sub(previous.write_ops) as f64;
+                    let ops = dro + dwo;
+                    let time = current.total_time_ms.saturating_sub(previous.total_time_ms) as f64;
+                    let usage = current
+                        .io_time_ms
+                        .zip(previous.io_time_ms)
+                        .map(|(cur, prev)| {
+                            (cur.saturating_sub(prev) as f64 / (dt * 1000.0) * 100.0).min(100.0)
+                        });
+                    crate::model::DiskIoDeviceRecord {
+                        name: name.clone(),
+                        read_bps: Some(dr / dt),
+                        write_bps: Some(dw / dt),
+                        read_iops: Some(dro / dt),
+                        write_iops: Some(dwo / dt),
+                        await_ms: Some(if ops > 0.0 { time / ops } else { 0.0 }),
+                        usage,
+                    }
+                })
+            })
+            .collect(),
     }
 }
 

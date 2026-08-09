@@ -27,19 +27,46 @@ interface Intervals {
 
 interface PingTarget {
   name: string;
+  type: "http" | "tcp" | "icmp";
   target: string;
   interval?: number;
 }
 
 interface RemoteConfig {
   config_version: string; // 人类可读的 UTC+8 时间戳；与 agent 当前值不等才应用
+  intervals?: CollectionIntervals;
   report_interval?: number;
   reset_day?: number;
   interfaces?: string[];
+  disks?: string[];
+  pings?: PingTarget[];
   report_gpu?: boolean;
   report_errors?: boolean;
   report_self?: boolean;
   ext?: { cf?: { correction?: boolean; batch?: boolean } };
+}
+
+interface CollectionIntervals {
+  collect: number;
+  ping: number;
+  slow: number;
+  gpu: number;
+  ip: number;
+  diskio: number;
+}
+
+interface ReporterSummary {
+  id: string;
+  protocol: string;
+  intervals: CollectionIntervals;
+  report_interval: number;
+  reset_day: number;
+  interfaces: string[];
+  disks: string[];
+  report_gpu: boolean;
+  report_errors: boolean;
+  report_self: boolean;
+  ping_names: string[];
 }
 
 interface StaticInfo {
@@ -53,6 +80,7 @@ interface StaticInfo {
   mem_total: number;
   swap_total: number;
   disk_total: number;
+  disks: DiskVolume[];
   gpu_name: string | null;
   virtualization: string | null;
   boot_time: number;
@@ -61,9 +89,22 @@ interface StaticInfo {
   agent_version: string;
   /** 当前生效配置（供展示/核对） */
   config: {
+    /** Agent 全局实际采集配置；不包含 Reporter 连接信息 */
+    global?: {
+      intervals: CollectionIntervals;
+      enable_gpu: boolean;
+      interfaces: string[];
+      all_interfaces: boolean;
+      disks: string[];
+      all_disks: boolean;
+      ping_names: string[];
+    };
+    /** 全部 Reporter 的脱敏摘要；不包含地址、密钥、server_id 或配置版本 */
+    reporters?: ReporterSummary[];
     reset_day: number;
     intervals: Intervals;
     interfaces: string[];
+    disks: string[];
     enable_gpu: boolean;
     report_errors: boolean;
     report_self: boolean;
@@ -76,6 +117,7 @@ interface StaticInfo {
 interface SlowBlock {
   ts: number;
   disk_used: number | null;
+  disks: DiskVolume[];
   tcp_conn: number | null;
   udp_conn: number | null;
   processes: number | null;
@@ -109,6 +151,14 @@ interface DynamicRecord {
   net_tx_speed: number | null;
   net_rx_monthly: number | null;
   net_tx_monthly: number | null;
+  net_interfaces: Record<string, {
+    rx: number;
+    tx: number;
+    rx_speed: number;
+    tx_speed: number;
+    rx_monthly: number | null;
+    tx_monthly: number | null;
+  }>;
 }
 
 /** 异步记录：kind 区分来源，每条 ts 为各自真实测量时刻 */
@@ -126,6 +176,7 @@ interface DiskIoRecord {
   write_iops: number | null;
   await_ms: number | null; // 平均等待 ms
   usage: number | null; // IO 利用率 %（各盘取最大）；macOS 为 null
+  disks: Array<Omit<DiskIoRecord, "ts" | "disks"> & { name: string }>;
 }
 
 type AsyncRecord =
@@ -175,6 +226,15 @@ interface RawReport {
   protocol: string;
   server_id: string;
   report: Report;
+}
+
+interface DiskVolume {
+  id: string;
+  name: string;
+  mount_point: string;
+  file_system: string;
+  total: number;
+  used: number;
 }
 
 const PORT = Number(Deno.args[0]) || 8080;
@@ -353,9 +413,12 @@ function handleSetConfig(
   const state = servers.get(instanceId);
   if (!state) return json({ error: "Reporter 实例不存在" }, 404);
   const {
+    intervals,
     report_interval,
     reset_day,
     interfaces,
+    disks,
+    pings,
     report_gpu,
     report_errors,
     report_self,
@@ -363,6 +426,26 @@ function handleSetConfig(
     cf_batch,
   } = cfg;
   const next: Partial<RemoteConfig> = {};
+  if (intervals !== undefined) {
+    const keys: Array<keyof CollectionIntervals> = [
+      "collect",
+      "ping",
+      "slow",
+      "gpu",
+      "ip",
+      "diskio",
+    ];
+    if (
+      typeof intervals !== "object" || intervals === null ||
+      !keys.every((key) =>
+        Number.isInteger((intervals as Record<string, unknown>)[key]) &&
+        (intervals as Record<string, number>)[key] >= 1
+      )
+    ) {
+      return json({ error: "intervals 六个周期都必须是 >=1 的整数" }, 400);
+    }
+    next.intervals = intervals as unknown as CollectionIntervals;
+  }
   if (report_interval !== undefined) {
     if (!Number.isInteger(report_interval) || (report_interval as number) < 1) {
       return json({ error: "report_interval 必须为 >=1 的整数" }, 400);
@@ -390,6 +473,32 @@ function handleSetConfig(
       }, 400);
     }
     next.interfaces = interfaces as string[];
+  }
+  if (disks !== undefined) {
+    if (
+      !Array.isArray(disks) ||
+      !disks.every((x) => typeof x === "string" && x.length > 0 && x.length <= 64)
+    ) {
+      return json({ error: "disks 必须为非空字符串数组（单个 <= 64 字符）" }, 400);
+    }
+    next.disks = disks as string[];
+  }
+  if (pings !== undefined) {
+    if (
+      !Array.isArray(pings) ||
+      !pings.every((ping) => {
+        if (typeof ping !== "object" || ping === null) return false;
+        const p = ping as Record<string, unknown>;
+        return typeof p.name === "string" && p.name.length > 0 &&
+          ["http", "tcp", "icmp"].includes(String(p.type)) &&
+          typeof p.target === "string" && p.target.length > 0 &&
+          (p.interval === undefined ||
+            (Number.isInteger(p.interval) && Number(p.interval) >= 1));
+      })
+    ) {
+      return json({ error: "pings 格式非法" }, 400);
+    }
+    next.pings = pings as PingTarget[];
   }
   if (report_gpu !== undefined) {
     if (typeof report_gpu !== "boolean") {
@@ -424,8 +533,9 @@ function handleSetConfig(
   }
   if (Object.keys(cf).length) next.ext = { cf };
   if (
-    report_interval === undefined && reset_day === undefined &&
-    interfaces === undefined && report_gpu === undefined &&
+    intervals === undefined && report_interval === undefined && reset_day === undefined &&
+    interfaces === undefined && disks === undefined && pings === undefined &&
+    report_gpu === undefined &&
     report_errors === undefined && report_self === undefined &&
     cf_correction === undefined && cf_batch === undefined
   ) {
@@ -733,10 +843,14 @@ const PAGE = `<!doctype html>
   .cfg-item input[type=number], .cfg-item input[type=text], .cfg-item select {
     width: 100%; background: var(--fill); border: 0.5px solid var(--sep); border-radius: 6px;
     color: var(--text); font: inherit; font-size: 12.5px; padding: 4px 8px; }
+  .cfg-item textarea { width: 100%; min-height: 76px; resize: vertical; background: var(--fill);
+    border: 0.5px solid var(--sep); border-radius: 6px; color: var(--text); font: 11.5px ui-monospace;
+    padding: 6px 8px; }
   .cfg-item input:focus, .cfg-item select:focus, .ping-row input:focus {
     outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px rgba(10,132,255,.3); }
   .cfg-item input:disabled, .cfg-item select:disabled { opacity: .3; }
   .cfg-item input.wide { min-width: 0; }
+  .topology .cfg-item .cur { max-width: 360px; }
   .cfg-pings { grid-column: 1 / -1; }
   .ping-row { display: grid; grid-template-columns: 104px minmax(0,1fr) 72px 26px; gap: 6px;
     margin-top: 6px; align-items: center; }
@@ -1388,6 +1502,8 @@ function cfgGroup(title, rows) {
 function cfgEditForm(s, st) {
   var cf = st.config || {};          // static.config.*：当前生效配置
   var iv = cf.intervals || {};
+  var global = cf.global || {};
+  var collectIv = global.intervals || iv;
   var wrap = el('div');
   var groups = el('div', 'cfg-groups');
   wrap.append(groups);
@@ -1432,13 +1548,37 @@ function cfgEditForm(s, st) {
   plainRow(gIdentity, '协议 protocol', s.protocol || 'probe');
   plainRow(gIdentity, '服务器 server_id', s.server_id);
   plainRow(gIdentity, '当前接收入口', location.origin + '/report');
+  plainRow(gIdentity, '线路权限', '当前接入 · 可下发');
   plainRow(gIdentity, '认证 secret', '••••••（不展示）');
   plainRow(gIdentity, 'net_static_path', '本地私有，协议不回传');
 
   var gCollect = group('全局实际采集（只读）');
   [['collect', '采样 collect'], ['ping', '探测 ping'], ['slow', '慢变 slow'],
    ['gpu', 'GPU gpu'], ['ip', '公网 IP ip'], ['diskio', '磁盘 IO diskio']]
-    .forEach(function (def) { plainRow(gCollect, def[1], sec(iv[def[0]])); });
+    .forEach(function (def) { plainRow(gCollect, def[1], sec(collectIv[def[0]])); });
+  plainRow(gCollect, 'GPU worker enable_gpu', global.enable_gpu == null
+    ? '–' : (global.enable_gpu ? '开' : '关'));
+  plainRow(gCollect, 'Ping worker', Array.isArray(global.ping_names)
+    ? (global.ping_names.join(', ') || '（无）') : '–');
+  plainRow(gCollect, '网卡并集', global.all_interfaces ? '全部默认物理网卡'
+    : ((global.interfaces || []).join(', ') || '–'));
+  plainRow(gCollect, '磁盘并集', global.all_disks ? '全部卷 / 物理盘'
+    : ((global.disks || []).join(', ') || '–'));
+
+  var gDemand = group('本 Reporter 采集需求（参与全局聚合）');
+  [['collect', '同步采样 collect'], ['ping', 'Ping 默认 ping'], ['slow', '慢指标 slow'],
+   ['gpu', 'GPU gpu'], ['ip', '公网 IP ip'], ['diskio', '磁盘 IO diskio']]
+    .forEach(function (def) {
+      editRow(gDemand, def[1], sec(iv[def[0]]), numInput(iv[def[0]], 1), function (p, inp) {
+        var v = Number(inp.value);
+        if (!Number.isInteger(v) || v < 1) throw def[0] + ' 必须 >= 1';
+        if (!p.intervals) p.intervals = {
+          collect: Number(iv.collect), ping: Number(iv.ping), slow: Number(iv.slow),
+          gpu: Number(iv.gpu), ip: Number(iv.ip), diskio: Number(iv.diskio)
+        };
+        p.intervals[def[0]] = v;
+      });
+    });
   var gReport = group('Reporter 上报策略');
   editRow(gReport, '上报间隔 report_interval', sec(iv.report), numInput(iv.report, 1),
     function (p, inp) {
@@ -1469,18 +1609,20 @@ function cfgEditForm(s, st) {
     editRow(gBool, def[2], cur, sel, function (p, inp) { p[def[0]] = inp.value === 'true'; });
   });
 
-  var cfExt = ((cf.ext || {}).cf) || {};
-  var gCf = group('CF 扩展 ext.cf（仅 protocol=cf 生效）');
-  [['cf_correction', '流量校正 correction', cfExt.correction],
-   ['cf_batch', '批量 samples batch', cfExt.batch]].forEach(function (def) {
-    var sel = el('select');
-    [['true', '开'], ['false', '关']].forEach(function (o) {
-      var opt = el('option', null, o[1]); opt.value = o[0]; sel.append(opt);
+  if ((s.protocol || 'probe') === 'cf') {
+    var cfExt = ((cf.ext || {}).cf) || {};
+    var gCf = group('CF 扩展 ext.cf');
+    [['cf_correction', '流量校正 correction', cfExt.correction],
+     ['cf_batch', '批量 samples batch', cfExt.batch]].forEach(function (def) {
+      var sel = el('select');
+      [['true', '开'], ['false', '关']].forEach(function (o) {
+        var opt = el('option', null, o[1]); opt.value = o[0]; sel.append(opt);
+      });
+      if (def[2] != null) sel.value = String(def[2]);
+      var cur = def[2] == null ? '–' : (def[2] ? '开' : '关');
+      editRow(gCf, def[1], cur, sel, function (p, inp) { p[def[0]] = inp.value === 'true'; });
     });
-    if (def[2] != null) sel.value = String(def[2]);
-    var cur = def[2] == null ? '–' : (def[2] ? '开' : '关');
-    editRow(gCf, def[1], cur, sel, function (p, inp) { p[def[0]] = inp.value === 'true'; });
-  });
+  }
 
   var gIface = group('网卡 interfaces');
   var ifInp = el('input'); ifInp.type = 'text'; ifInp.className = 'wide';
@@ -1492,10 +1634,35 @@ function cfgEditForm(s, st) {
     p.interfaces = inp.value.split(',').map(function (x) { return x.trim(); }).filter(Boolean);
   });
 
-  var gPing = group('全局探测目标（只读）');
+  var gDisk = group('磁盘 disks');
+  var diskInp = el('input'); diskInp.type = 'text'; diskInp.className = 'wide';
+  diskInp.placeholder = 'C:*, 0 C:, nvme*（留空 = 全部）';
+  if (Array.isArray(cf.disks) && cf.disks.length) diskInp.value = cf.disks.join(', ');
+  var diskCur = Array.isArray(cf.disks) ? (cf.disks.join(', ') || '（全部）') : '–';
+  editRow(gDisk, '卷/物理盘 glob', diskCur, diskInp, function (p, inp) {
+    p.disks = inp.value.split(',').map(function (x) { return x.trim(); }).filter(Boolean);
+  });
+
+  var gPing = group('当前 Reporter Ping（type name target interval）');
+  var pingInp = el('textarea');
+  pingInp.value = (Array.isArray(cf.pings) ? cf.pings : []).map(function (p) {
+    return [p.type || 'tcp', p.name, p.target, p.interval || iv.ping].join(' ');
+  }).join(String.fromCharCode(10));
+  editRow(gPing, '整组更新', (cf.pings || []).length + ' 项', pingInp, function (p, inp) {
+    p.pings = inp.value.split(/\r?\n/).map(function (line) { return line.trim(); })
+      .filter(Boolean).map(function (line) {
+        var parts = line.split(/\s+/);
+        if (parts.length !== 4 || !['http', 'tcp', 'icmp'].includes(parts[0]))
+          throw 'Ping 每行格式：type name target interval';
+        var interval = Number(parts[3]);
+        if (!Number.isInteger(interval) || interval < 1) throw 'Ping interval 必须 >= 1';
+        return { type: parts[0], name: parts[1], target: parts[2], interval: interval };
+      });
+  });
   if (Array.isArray(cf.pings) && cf.pings.length) {
     cf.pings.forEach(function (p) {
-      plainRow(gPing, p.name, p.target + (p.interval != null ? ' · ' + sec(p.interval) : ''));
+      plainRow(gPing, (p.type || 'tcp') + ' · ' + p.name,
+        p.target + (p.interval != null ? ' · ' + sec(p.interval) : ''));
     });
   } else {
     plainRow(gPing, 'pings', '（当前 Reporter 不输出探测结果）');
@@ -1505,6 +1672,9 @@ function cfgEditForm(s, st) {
   plainRow(gStatic, 'static 刷新周期', '600 s（固定）');
   plainRow(gStatic, 'static 采集于', st.ts ? new Date(st.ts).toLocaleString('zh-CN') : '–');
   plainRow(gStatic, 'agent 版本', 'v' + (st.agent_version || s.agent_version || '?'));
+  (st.disks || []).forEach(function (disk) {
+    plainRow(gStatic, '卷 ' + (disk.mount_point || disk.id), fmtB(disk.used) + ' / ' + fmtB(disk.total));
+  });
 
   var foot = el('div', 'cfg-foot');
   var btn = el('button', 'btn primary', '下发配置'); btn.type = 'button';
@@ -1539,32 +1709,46 @@ function cfgEditForm(s, st) {
 
 /* ---- 配置视图 ---- */
 function reporterTopology(data) {
-  var card = el('div', 'card');
+  var card = el('div', 'card topology');
   var head = el('div', 'card-head');
   head.append(el('span', 'name', '多路上报拓扑'),
-    el('span', 'meta', '按 server_id 汇总当前 Demo 已观察到的 Reporter'));
+    el('span', 'meta', '当前接入可下发；外部线路只读，不推断在线状态'));
   card.append(head);
-  var byServer = {};
-  data.forEach(function (s) { (byServer[s.server_id] = byServer[s.server_id] || []).push(s); });
   var groups = el('div', 'cfg-groups');
-  Object.keys(byServer).sort().forEach(function (serverId) {
-    var routes = byServer[serverId].slice().sort(function (a, b) {
-      return String(a.reporter_id).localeCompare(String(b.reporter_id));
-    });
-    groups.append(cfgGroup(serverId, routes.map(function (s) {
-      return [s.reporter_id || 'primary', (s.protocol || 'probe') + ' · ' + (s.online ? '在线' : '离线')
-        + ' · report ' + ((((s.static || {}).config || {}).intervals || {}).report ?? '–') + 's'];
+  data.forEach(function (s) {
+    var cf = ((s.static || {}).config) || {};
+    var routes = Array.isArray(cf.reporters) && cf.reporters.length ? cf.reporters : [{
+      id: s.reporter_id || 'primary', protocol: s.protocol || 'probe',
+      report_interval: (cf.intervals || {}).report, report_gpu: cf.enable_gpu,
+      report_errors: cf.report_errors, report_self: cf.report_self,
+      ping_names: Array.isArray(cf.pings) ? cf.pings.map(function (p) { return p.name; }) : []
+    }];
+    groups.append(cfgGroup(s.server_id + ' · via ' + reporterTag(s), routes.map(function (r) {
+      var current = r.id === (s.reporter_id || 'primary')
+        && (r.protocol || 'probe') === (s.protocol || 'probe');
+      var state = current
+        ? '当前接入 · ' + (s.online ? '在线' : '离线') + ' · 可下发'
+        : '已配置 · 外部线路 · 只读';
+      var details = ['report ' + (r.report_interval ?? '–') + 's',
+        'collect ' + (((r.intervals || {}).collect) ?? '–') + 's',
+        'GPU ' + (r.report_gpu == null ? '–' : (r.report_gpu ? '开' : '关')),
+        'Ping ' + (Array.isArray(r.ping_names) ? r.ping_names.length : '–') + ' 组'];
+      return [(r.id || 'primary') + ' / ' + (r.protocol || 'probe'), state + ' · ' + details.join(' · ')];
     })));
   });
   card.append(groups, el('div', 'note',
-    '这里只列出向本 Demo 上报的实例；发往外部 CF/Komari 面板的线路不会向本服务泄露连接地址或密钥。新增、删除 Reporter 属于本地安全配置，不能远端下发。'));
+    'Reporter 清单来自 static.config.reporters，只包含 ID、协议和输出策略；不会回传 secret、worker_url、其他线路的 server_id/config_version。新增、删除线路仍只能改本地 TOML。'));
   return card;
 }
 
 function renderConfig(data) {
   var app = document.getElementById('app');
   app.textContent = '';
-  document.getElementById('summary').textContent = data.length + ' 路 Reporter';
+  var configured = data.reduce(function (n, s) {
+    var rs = ((((s.static || {}).config) || {}).reporters);
+    return n + (Array.isArray(rs) && rs.length ? rs.length : 1);
+  }, 0);
+  document.getElementById('summary').textContent = data.length + ' 路接入 · ' + configured + ' 路已配置';
   if (!data.length) { app.append(el('div', 'empty', '暂无服务器数据')); return; }
   app.append(reporterTopology(data));
   data.forEach(function (s) {
@@ -1590,9 +1774,14 @@ function renderConfig(data) {
     if (s.pending_config) {
       var p = s.pending_config;
       var rows = [['config_version', fmtVer(s.config_version) + ' → ' + fmtVer(p.config_version)]];
+      if (p.intervals) rows.push(['intervals', Object.keys(p.intervals).map(function (k) {
+        return k + '=' + p.intervals[k] + 's';
+      }).join(', ')]);
       if (p.report_interval != null) rows.push(['report_interval', p.report_interval + 's']);
       if (p.reset_day != null) rows.push(['reset_day', String(p.reset_day)]);
       if (p.interfaces) rows.push(['interfaces', p.interfaces.join(', ') || '(空)']);
+      if (p.disks) rows.push(['disks', p.disks.join(', ') || '(全部)']);
+      if (p.pings) rows.push(['pings', p.pings.length + ' 项']);
       if (p.report_gpu != null) rows.push(['report_gpu', String(p.report_gpu)]);
       if (p.report_errors != null) rows.push(['report_errors', String(p.report_errors)]);
       if (p.report_self != null) rows.push(['report_self', String(p.report_self)]);
@@ -1710,6 +1899,9 @@ var EXAMPLE_JSON5 = \`{
     "mem_total": 17179869184,               // 字节
     "swap_total": 1073741824,
     "disk_total": 107374182400,
+    "disks": [                              // 当前 Reporter 选中的逐卷容量
+      { "id": "/dev/sda1", "name": "sda1", "mount_point": "/", "file_system": "ext4", "total": 107374182400, "used": 53687091200 }
+    ],
     "gpu_name": "NVIDIA A100 80GB",         // 可选；无 GPU 为 null
     "virtualization": "kvm",                // 可选；物理机为 null
     "boot_time": 1754300000000,             // ms 时间戳
@@ -1717,18 +1909,49 @@ var EXAMPLE_JSON5 = \`{
     "ipv6": "2001:db8::10",                 // 可选；无 v6 出口为 null
     "agent_version": "0.1.3-beta.1",
     "config": {                             // 当前生效配置（供服务端展示/核对）
+      "global": {                           // Agent 全局实际采集；与任何 Reporter 的上报周期无关
+        "intervals": {
+          "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10
+        },
+        "enable_gpu": true,                 // 是否实际启动 GPU worker
+        "interfaces": [], "all_interfaces": true, // Reporter 网卡需求并集；true 表示实际采全部默认物理网卡
+        "disks": [], "all_disks": true,     // Reporter 磁盘需求并集；true 表示实际采全部
+        "ping_names": ["primary/ct", "primary/cu"] // 去重后的逻辑任务名；不含目标地址
+      },
+      "reporters": [                        // 本机全部 Reporter 的脱敏拓扑/输出策略
+        {
+          "id": "primary", "protocol": "cf", "report_interval": 30, "reset_day": 1,
+          "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
+          "interfaces": [], "disks": [], "report_gpu": true, "report_errors": true, "report_self": false,
+          "ping_names": ["ct", "cu"]
+        },
+        {
+          "id": "komari", "protocol": "komari", "report_interval": 1, "reset_day": 12,
+          "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
+          "interfaces": [], "disks": [], "report_gpu": true, "report_errors": true, "report_self": false,
+          "ping_names": []
+        },
+        {
+          "id": "local-demo", "protocol": "probe", "report_interval": 1, "reset_day": 1,
+          "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
+          "interfaces": [], "disks": [], "report_gpu": true, "report_errors": true, "report_self": true,
+          "ping_names": ["ct", "cu"]
+        }
+      ],                                     // 不含 secret/worker_url/server_id/config_version
       "reset_day": 1,                       // 月流量账期重置日 0-31；0 = 不重置
       "intervals": {                        // 各间隔（秒），完全独立无关系约束
-        "collect": 10, "report": 60, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10
+        "collect": 1, "report": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10
       },
-      "interfaces": ["eth*"],               // 网卡白名单（glob）；空 = 所有非虚拟网卡
+      "interfaces": [],                     // 当前 Reporter 网卡白名单；空 = 所有非虚拟网卡
+      "disks": [],                          // 当前 Reporter 卷/物理盘 glob；空 = 全部
       "enable_gpu": true,                   // 当前 Reporter 是否输出 GPU（wire 字段沿用旧名）
       "report_errors": true,                // 是否上报 errors 错误事件
-      "report_self": false,                 // 是否上报探针自身占用 kind:"self"
+      "report_self": true,                  // 是否上报探针自身占用 kind:"self"
       "pings": [                            // 探测目标组
-        { "name": "ct", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 }
+        { "name": "ct", "type": "tcp", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 },
+        { "name": "cu", "type": "tcp", "target": "gd-cu-dualstack.ip.zstaticcdn.com:80", "interval": 30 }
       ],
-      "ext": { "cf": { "correction": true, "batch": true } }   // 协议扩展（仅 cf 协议生效）
+      "ext": { "cf": { "correction": true, "batch": true } }   // 当前为 probe 时不生效
     }
   },
 
@@ -1745,7 +1968,10 @@ var EXAMPLE_JSON5 = \`{
       "net_rx_speed": 102400,               // 字节/秒；首轮无前值为 null
       "net_tx_speed": 51200,
       "net_rx_monthly": 858993459200,       // 账期累计（字节），客户端自算
-      "net_tx_monthly": 429496729600
+      "net_tx_monthly": 429496729600,
+      "net_interfaces": {                   // 逐网卡值；上方兼容字段为选中网卡求和
+        "eth0": { "rx": 1073741824, "tx": 536870912, "rx_speed": 102400, "tx_speed": 51200, "rx_monthly": 858993459200, "tx_monthly": 429496729600 }
+      }
     }
   ],
 
@@ -1753,14 +1979,17 @@ var EXAMPLE_JSON5 = \`{
   "async": [
     { "kind": "ping", "ts": 1754300058000, "name": "ct", "rtt": 32, "loss": 0 },
     // 探测结果；name = [[pings]] 组 key；rtt = -1 表示探测失败
-    { "kind": "slow", "ts": 1754300055000, "disk_used": 53687091200, "tcp_conn": 120, "udp_conn": 8, "processes": 230 },
+    { "kind": "slow", "ts": 1754300055000, "disk_used": 53687091200,
+      "disks": [{ "id": "/dev/sda1", "name": "sda1", "mount_point": "/", "file_system": "ext4", "total": 107374182400, "used": 53687091200 }],
+      "tcp_conn": 120, "udp_conn": 8, "processes": 230 },
     // 系统慢指标（每台机器必有）；disk_used 与 disk_total 同口径；TCP 全状态计数
     { "kind": "gpu", "ts": 1754300050000, "name": "NVIDIA A100 80GB", "usage": 42.5, "mem_total": 85899345920, "mem_used": 10737418240, "temp": 55 },
     // 可选硬件指标（仅部分机器）；多卡时每卡一条；mem/temp 仅 nvidia 路径有，macOS 为 null；无 GPU 时整个 kind 不出现
     { "kind": "self", "ts": 1754300055000, "cpu_usage": 1.2, "mem_rss": 13631488 },
     // 探针自身资源占用；report_self=true 时才有（默认 false）
-    { "kind": "diskio", "ts": 1754300056000, "read_bps": 1048576, "write_bps": 524288, "read_iops": 40, "write_iops": 18, "await_ms": 1.8, "usage": 3.2 }
-    // 磁盘 IO（整盘合计）；usage 仅 Linux 有，macOS 为 null
+    { "kind": "diskio", "ts": 1754300056000, "read_bps": 1048576, "write_bps": 524288, "read_iops": 40, "write_iops": 18, "await_ms": 1.8, "usage": 3.2,
+      "disks": [{ "name": "sda", "read_bps": 1048576, "write_bps": 524288, "read_iops": 40, "write_iops": 18, "await_ms": 1.8, "usage": 3.2 }] }
+    // 磁盘 IO；disks 为逐物理盘，上层字段为当前 Reporter 选中盘的聚合
   ],
 
   // 错误事件：采集/上报失败记录，空数组 = 无错误；同源同文去重
@@ -1772,50 +2001,49 @@ var EXAMPLE_JSON5 = \`{
 }\`;
 
 var CONFIG_EXAMPLE_JSON5 = \`{
-  // ===== 全局实际采集 / 异步 worker（只接受本地配置） =====
+  // 根级只保留真正的机器级持久化设置；实际 worker 参数由 reporters 聚合计算
   "net_static_path": "/var/lib/probe-rs/net_static.json",   // netstatic 流量时序落盘路径
-  "enable_gpu": true,               // 是否实际启动 GPU worker
-  "intervals": {                    // 这里只放采集周期，不含 report
-    "collect": 1,                   // 同步采样间隔（秒）
-    "ping": 30,                     // [[pings]] 未设 interval 时的默认值
-    "slow": 60,                     // 慢变指标 + 探针自身占用采集间隔
-    "gpu": 60,                      // GPU 采集间隔
-    "ip": 600,                      // 公网 IP 查询间隔
-    "diskio": 10                    // 磁盘 IO 采集间隔
-  },
-  "pings": [                        // 全局实际探测任务；name 唯一
-    { "name": "ct", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 },
-    { "name": "cu", "target": "gd-cu-dualstack.ip.zstaticcdn.com:80", "interval": 30 }
-  ],
 
-  // ===== 所有连接都是独立 Reporter；不存在特殊的根部 primary 配置 =====
+  // 所有连接都是独立 Reporter；每路声明采集需求和自己的输出策略
   "reporters": [
     {
       "id": "primary", "protocol": "cf",                // id 只需在本文件内唯一
       "server_id": "cf-panel-uuid", "secret": "cf-api-secret",
       "worker_url": "https://cf.example.com/update", "config_version": "",
       "report_interval": 30,        // 此 Reporter 自己的上报周期
-      "reset_day": 1, "interfaces": [],
-      "report_gpu": true,           // 只过滤输出；不会启停全局 GPU worker
+      "reset_day": 1, "interfaces": [], "disks": [], // 空数组 = 全部默认物理网卡/全部磁盘
+      "intervals": {                // 该 Reporter 的采集需求；六项均 >= 1 秒
+        "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10
+      },
+      "report_gpu": true,           // 任一路为 true 即启动全局 GPU worker；本路同时输出 GPU
       "report_errors": true, "report_self": false,
-      "ping_names": ["ct", "cu"], // 缺席 = 全部全局 Ping；[] = 一个也不输出
+      "pings": [                    // type + 规范化目标去重；重复任务的实际周期取最小值
+        { "name": "ct", "type": "tcp", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 },
+        { "name": "cu", "type": "tcp", "target": "gd-cu-dualstack.ip.zstaticcdn.com:80", "interval": 30 }
+      ],
       "ext": { "cf": { "correction": true, "batch": true } }
     },
     {
       "id": "komari", "protocol": "komari",
       "server_id": "srv-01", "secret": "komari-token",
       "worker_url": "https://komari.example.com", "config_version": "",
-      "report_interval": 1, "reset_day": 12, "interfaces": [],
-      "report_gpu": true, "report_errors": true, "report_self": false,
-      "ping_names": []
+      "report_interval": 1, "reset_day": 12, "interfaces": [], "disks": [],
+      "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
+      "report_gpu": true, "report_errors": true, "report_self": false, "pings": []
     },
     {
       "id": "local-demo", "protocol": "probe",
       "server_id": "srv-01", "secret": "change-me",
       "worker_url": "http://127.0.0.1:8080/report", "config_version": "",
-      "report_interval": 1, "reset_day": 1, "interfaces": [],
-      "report_gpu": true, "report_errors": true, "report_self": true
-      // ping_names 缺席，因此本路输出全部全局 Ping
+      "report_interval": 1, "reset_day": 1, "interfaces": ["Ethernet*"], "disks": ["C:*"],
+      "intervals": { "collect": 2, "ping": 60, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
+      "report_gpu": true, "report_errors": true, "report_self": true,
+      "pings": [
+        // 与 primary/ct 相同：只采一次（30s），本路仍用 ct-local 名称接收结果
+        { "name": "ct-local", "type": "tcp", "target": "GD-CT-DUALSTACK.IP.ZSTATICCDN.COM", "interval": 60 },
+        { "name": "health", "type": "http", "target": "https://example.com/health", "interval": 60 },
+        { "name": "edge", "type": "icmp", "target": "1.1.1.1", "interval": 60 }
+      ]
     }
   ]
 }\`;
@@ -1827,10 +2055,17 @@ var RESPONSE_EXAMPLE_JSON5 = \`// 无配置变更时：200 OK，body 为 {} 或�
 {
   "config": {                       // 配置收在一级；信封后续可扩展其他指令（如动作类）
     "config_version": "2026-08-06T16:00:00.000+08:00",   // 与 agent 当前版本不等才应用（幂等）
+    "intervals": {                  // 可选；只改当前 Reporter 的采集需求
+      "collect": 2, "ping": 60, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10
+    },
     "report_interval": 30,          // 可选；只改当前 Reporter 的上报周期，>= 1
     "reset_day": 15,                // 可选；账期重置日 1-31；0 = 不重置
     "interfaces": ["eth*"],         // 可选；网卡白名单（glob）
-    "report_gpu": true,             // 可选；只控制当前 Reporter 是否输出 GPU
+    "disks": ["nvme*"],             // 可选；卷/物理盘 glob；空 = 全部
+    "pings": [                      // 可选；整组替换当前 Reporter 的 Ping 需求
+      { "name": "edge", "type": "icmp", "target": "1.1.1.1", "interval": 60 }
+    ],
+    "report_gpu": true,             // 可选；也会参与全局 GPU worker 的 OR 聚合
     "report_errors": false,         // 可选；是否上报 errors 错误事件
     "report_self": true,            // 可选；是否上报探针自身资源占用 kind:"self"
     "ext": {                        // 可选；协议扩展，只写出现的子项
@@ -1863,12 +2098,13 @@ function renderExample() {
   document.getElementById('summary').textContent = 'POST /report 请求与响应（JSON5 注释版）';
   app.append(
     annotatedCard(EXAMPLE_JSON5, '//', [
-      '请求头：X-Secret（认证）、X-Agent-Version，以及用于多路隔离的 X-Reporter-Id / X-Reporter-Protocol（百分号编码；旧服务端可忽略）。',
+      '此例按 local-demo / probe Reporter 展示。请求头：X-Secret（认证）、X-Agent-Version，以及用于多路隔离的 X-Reporter-Id / X-Reporter-Protocol（百分号编码；旧服务端可忽略）。',
+      'static.config.global 是实际采集事实；static.config.reporters 是全线路脱敏摘要；同级 reset_day/intervals/... 仍是当前 Reporter 视角。',
       '上报失败时 agent 有界保留（10 条）待重发——只覆盖短暂抖动，长断网历史不补发；服务端收到延迟记录按 ts 去重排序即可。',
     ]),
     annotatedCard(RESPONSE_EXAMPLE_JSON5, '//', [
-      'agent 行为：整体校验（config_version 不等才应用、report_interval >= 1、reset_day 0-31），全部通过才应用并落盘、立即生效；任何一项非法则整体拒绝并记录日志。',
-      '🔒 全局 intervals / enable_gpu / pings 以及连接身份只接受本地配置；远端响应只修改产生该响应的 Reporter。',
+      'agent 行为：整体校验（版本、周期、glob、Ping），全部通过才应用当前 Reporter 并落盘；随后重新计算全局最小周期、GPU OR、网卡/磁盘/Ping 并集。',
+      '🔒 连接身份与 net_static_path 只接受本地配置；远端只能修改产生该响应的 Reporter。允许下发 Ping 时，服务端应自行限制目标，避免 SSRF/内网探测。',
     ]));
 }
 
@@ -1877,8 +2113,8 @@ function renderConfigExample() {
   app.textContent = '';
   document.getElementById('summary').textContent = 'agent 本地配置（JSON5 注释版）';
   app.append(annotatedCard(CONFIG_EXAMPLE_JSON5, '//', [
-    '实际配置文件为 TOML（仓库根目录 config.example.toml），此处以 JSON5 等价展示。全局采集配置只接受本地修改；Reporter 输出策略可由本地或所属上报端修改。',
-    'reporters[] 等价于多个 [[reporters]]，包括惯例命名为 primary 的首路。每路有独立周期、游标、ACK、重试和远端配置版本，采集 worker 全局只运行一份。',
+    '实际配置文件为 TOML（仓库根目录 config.example.toml），此处以 JSON5 等价展示。旧的根级 intervals / enable_gpu / pings 不再兼容。',
+    'reporters[] 等价于多个 [[reporters]]。每路有独立上报周期、游标、ACK、重试和远端配置版本；采集 worker 全局只运行一份，并由全部 Reporter 的需求自动聚合。',
   ]));
 }
 

@@ -186,15 +186,11 @@ remove_reporter_block() {
 if [ -s "$CONFIG_PATH" ] &&
    grep -q '^[[:space:]]*\[\[reporters\]\]' "$CONFIG_PATH" &&
    ! awk '
+       /^[[:space:]]*\[intervals\][[:space:]]*$/ || /^[[:space:]]*\[\[pings\]\][[:space:]]*$/ { found=1; exit }
        /^[[:space:]]*\[/ { exit }
-       /^[[:space:]]*server_id[[:space:]]*=/ { found=1 }
+       /^[[:space:]]*(server_id|enable_gpu)[[:space:]]*=/ { found=1 }
        END { exit found ? 0 : 1 }
    ' "$CONFIG_PATH"; then
-    # --gpu 表示需要实际 GPU worker；已有多路配置中只允许把全局开关打开，
-    # 不因某一路未传 --gpu 而关闭其他 Reporter 正在使用的采集。
-    if [ "$ENABLE_GPU" = true ]; then
-        sed -i '0,/^[[:space:]]*enable_gpu[[:space:]]*=.*/s//enable_gpu = true/' "$CONFIG_PATH"
-    fi
     remove_reporter_block "$CONFIG_PATH" "$REPORTER_ID"
     cat >> "$CONFIG_PATH" <<EOF
 
@@ -208,25 +204,24 @@ config_version = ""
 report_interval = $INTERVAL
 reset_day = $RESET_DAY
 interfaces = $INTERFACES_TOML
+disks = []
 report_gpu = $ENABLE_GPU
 report_errors = true
 report_self = false
-ping_names = []
-EOF
-    log "preserved global collectors and upserted Komari Reporter '$REPORTER_ID'"
-else
-    # 缺失配置或旧的根连接 schema 都直接覆盖为新 canonical 格式，不做兼容迁移。
-cat > "$CONFIG_PATH" <<EOF
-net_static_path = "$DATA_DIR/net_static.json"
-enable_gpu = $ENABLE_GPU
 
-[intervals]
+[reporters.intervals]
 collect = 1
 ping = 30
 slow = 60
 gpu = 60
 ip = 600
 diskio = 10
+EOF
+    log "preserved other Reporters and upserted Komari Reporter '$REPORTER_ID'"
+else
+    # 缺失配置或旧的根连接 schema 都直接覆盖为新 canonical 格式，不做兼容迁移。
+cat > "$CONFIG_PATH" <<EOF
+net_static_path = "$DATA_DIR/net_static.json"
 
 [[reporters]]
 id = "$REPORTER_ID"
@@ -238,10 +233,18 @@ config_version = ""
 report_interval = $INTERVAL
 reset_day = $RESET_DAY
 interfaces = $INTERFACES_TOML
+disks = []
 report_gpu = $ENABLE_GPU
 report_errors = true
 report_self = false
-ping_names = []
+
+[reporters.intervals]
+collect = 1
+ping = 30
+slow = 60
+gpu = 60
+ip = 600
+diskio = 10
 EOF
     log "wrote a fresh canonical config with Komari Reporter '$REPORTER_ID'"
 fi

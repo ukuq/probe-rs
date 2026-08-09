@@ -34,7 +34,8 @@ pub fn spawn(
             tokio::select! {
                 _ = ticker.tick() => {
                     let ts = crate::model::now_millis();
-                    let (_, disk_used) = collector::disk();
+                    let disks = collector::disks();
+                    let disk_used = disks.iter().map(|disk| disk.used).sum();
                     let (tcp_conn, udp_conn) = match collector::connections() {
                         Ok((tcp, udp)) => (Some(tcp), Some(udp)),
                         Err(e) => {
@@ -47,6 +48,7 @@ pub fn spawn(
                     slow_tx.send_replace(Some(SlowBlock {
                         ts,
                         disk_used: Some(disk_used),
+                        disks,
                         tcp_conn,
                         udp_conn,
                         processes,

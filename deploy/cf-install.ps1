@@ -113,6 +113,7 @@ function ConvertTo-TomlString {
 }
 
 function New-CfReporterBlock {
+    $effectiveCollect = [Math]::Max(1, $CollectInterval)
     $lines = New-Object 'System.Collections.Generic.List[string]'
     $lines.Add("[[reporters]]")
     $lines.Add(("id = {0}" -f (ConvertTo-TomlString $ReporterId)))
@@ -124,9 +125,35 @@ function New-CfReporterBlock {
     $lines.Add("report_interval = $ReportInterval")
     $lines.Add("reset_day = $ResetDay")
     $lines.Add("interfaces = []")
+    $lines.Add("disks = []")
     $lines.Add("report_gpu = true")
     $lines.Add("report_errors = true")
     $lines.Add("report_self = false")
+    $lines.Add("")
+    $lines.Add("[reporters.intervals]")
+    $lines.Add("collect = $effectiveCollect")
+    $lines.Add("ping = 30")
+    $lines.Add("slow = 60")
+    $lines.Add("gpu = 60")
+    $lines.Add("ip = 600")
+    $lines.Add("diskio = 10")
+
+    foreach ($probe in @(
+            @{ Name = "ct"; Target = $Ct },
+            @{ Name = "cu"; Target = $Cu },
+            @{ Name = "cm"; Target = $Cm },
+            @{ Name = "bd"; Target = $Bd }
+        )) {
+        if (-not [string]::IsNullOrWhiteSpace($probe.Target)) {
+            $lines.Add("")
+            $lines.Add("[[reporters.pings]]")
+            $lines.Add(("name = {0}" -f (ConvertTo-TomlString $probe.Name)))
+            $lines.Add('type = "tcp"')
+            $lines.Add(("target = {0}" -f (ConvertTo-TomlString $probe.Target)))
+            $lines.Add("interval = 30")
+        }
+    }
+
     $lines.Add("")
     $lines.Add("[reporters.ext.cf]")
     $lines.Add("correction = true")
@@ -148,28 +175,20 @@ function Remove-ReporterBlock {
 }
 
 function Write-CfConfig {
-    $effectiveCollect = [Math]::Max(1, $CollectInterval)
     if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) {
         $existing = [IO.File]::ReadAllText($ConfigPath)
         $firstReporter = [regex]::Match($existing, '(?m)^[ \t]*\[\[reporters\]\][ \t]*\r?$')
         if ($firstReporter.Success) {
             $global = $existing.Substring(0, $firstReporter.Index)
-            # Presence of a root connection identifies the deliberately unsupported legacy schema.
-            if ($global -notmatch '(?m)^[ \t]*server_id[ \t]*=') {
+            # The new root only contains net_static_path. Legacy root collector
+            # fields are deliberately not migrated: write a fresh config below.
+            if ($global -notmatch '(?m)^[ \t]*(server_id|enable_gpu)[ \t]*=' -and
+                $global -notmatch '(?m)^[ \t]*\[\[?\s*(intervals|pings)') {
                 $updated = Remove-ReporterBlock $existing $ReporterId
-                $updated = ([regex]::new(
-                        '(?m)^[ \t]*enable_gpu[ \t]*=.*$'
-                    )).Replace($updated, 'enable_gpu = true', 1)
-                $updated = ([regex]::new(
-                        '(?ms)(^[ \t]*\[intervals\][ \t]*\r?$.*?^[ \t]*collect[ \t]*=[ \t]*)\d+'
-                    )).Replace($updated, {
-                        param($match)
-                        return $match.Groups[1].Value + $effectiveCollect
-                    }, 1)
                 $content = $updated.TrimEnd() + [Environment]::NewLine + [Environment]::NewLine +
                     (New-CfReporterBlock) + [Environment]::NewLine
                 [IO.File]::WriteAllText($ConfigPath, $content, $Utf8NoBom)
-                Write-Host "Preserved canonical global config and upserted CF Reporter '$ReporterId'."
+                Write-Host "Preserved other Reporters and upserted CF Reporter '$ReporterId'."
                 return
             }
         }
@@ -177,30 +196,6 @@ function Write-CfConfig {
 
     $lines = New-Object 'System.Collections.Generic.List[string]'
     $lines.Add(("net_static_path = {0}" -f (ConvertTo-TomlString $NetStaticPath)))
-    $lines.Add("enable_gpu = true")
-    $lines.Add("")
-    $lines.Add("[intervals]")
-    $lines.Add("collect = $effectiveCollect")
-    $lines.Add("ping = 30")
-    $lines.Add("slow = 60")
-    $lines.Add("gpu = 60")
-    $lines.Add("ip = 600")
-    $lines.Add("diskio = 10")
-
-    foreach ($probe in @(
-            @{ Name = "ct"; Target = $Ct },
-            @{ Name = "cu"; Target = $Cu },
-            @{ Name = "cm"; Target = $Cm },
-            @{ Name = "bd"; Target = $Bd }
-        )) {
-        if (-not [string]::IsNullOrWhiteSpace($probe.Target)) {
-            $lines.Add("")
-            $lines.Add("[[pings]]")
-            $lines.Add(("name = {0}" -f (ConvertTo-TomlString $probe.Name)))
-            $lines.Add(("target = {0}" -f (ConvertTo-TomlString $probe.Target)))
-        }
-    }
-
     $lines.Add("")
     $lines.Add((New-CfReporterBlock))
     [IO.File]::WriteAllLines($ConfigPath, $lines, $Utf8NoBom)

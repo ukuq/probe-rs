@@ -40,6 +40,8 @@ pub struct StaticInfo {
     pub mem_total: u64,
     pub swap_total: u64,
     pub disk_total: u64,
+    /// 当前 Reporter 选中的逐卷容量快照；disk_total 为这些卷的合计。
+    pub disks: Vec<DiskVolume>,
     pub gpu_name: Option<String>,
     pub virtualization: Option<String>,
     /// 毫秒时间戳
@@ -55,9 +57,14 @@ pub struct StaticInfo {
 /// 字段顺序与「配置样例」保持一致
 #[derive(Debug, Clone, Serialize)]
 pub struct StaticConfig {
+    /// Agent 全局实际采集配置的脱敏摘要。
+    pub global: GlobalConfigSummary,
+    /// 本机全部 Reporter 的脱敏摘要；不包含 server_id、secret、worker_url、config_version。
+    pub reporters: Vec<ReporterSummary>,
     pub reset_day: u8,
     pub intervals: Intervals,
     pub interfaces: Vec<String>,
+    pub disks: Vec<String>,
     pub enable_gpu: bool,
     pub report_errors: bool,
     pub report_self: bool,
@@ -82,17 +89,29 @@ pub struct DynamicRecord {
     pub net_tx_speed: Option<u64>,
     pub net_rx_monthly: Option<u64>,
     pub net_tx_monthly: Option<u64>,
-    /// 内部逐网卡快照：多 Reporter 在出口按各自 interfaces 聚合，不进入任何协议报文。
-    #[serde(skip)]
+    /// 当前 Reporter 选中的逐网卡快照；兼容合计字段由这些网卡求和。
     pub net_interfaces: BTreeMap<String, NetInterfaceSample>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct NetInterfaceSample {
     pub rx: u64,
     pub tx: u64,
     pub rx_speed: u64,
     pub tx_speed: u64,
+    pub rx_monthly: Option<u64>,
+    pub tx_monthly: Option<u64>,
+}
+
+/// 文件系统卷容量。Windows 通常按盘符，Linux 按去重后的块设备/挂载点。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DiskVolume {
+    pub id: String,
+    pub name: String,
+    pub mount_point: String,
+    pub file_system: String,
+    pub total: u64,
+    pub used: u64,
 }
 
 /// 慢变指标块：由 slow worker 测量，ts 为真实测量时刻
@@ -100,6 +119,8 @@ pub struct NetInterfaceSample {
 pub struct SlowBlock {
     pub ts: i64,
     pub disk_used: Option<u64>,
+    /// 当前 Reporter 选中的逐卷容量；disk_used 为这些卷的合计。
+    pub disks: Vec<DiskVolume>,
     pub tcp_conn: Option<u64>,
     pub udp_conn: Option<u64>,
     pub processes: Option<u64>,
@@ -130,6 +151,19 @@ pub struct DiskIoRecord {
     /// 平均等待，毫秒
     pub await_ms: Option<f64>,
     /// IO 利用率 %（0-100，各盘取最大）；macOS 为 null
+    pub usage: Option<f64>,
+    /// 当前 Reporter 选中的逐物理盘 IO；上方字段为这些盘的聚合值。
+    pub disks: Vec<DiskIoDeviceRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiskIoDeviceRecord {
+    pub name: String,
+    pub read_bps: Option<f64>,
+    pub write_bps: Option<f64>,
+    pub read_iops: Option<f64>,
+    pub write_iops: Option<f64>,
+    pub await_ms: Option<f64>,
     pub usage: Option<f64>,
 }
 
@@ -185,9 +219,19 @@ pub struct GpuRecord {
 #[serde(deny_unknown_fields)]
 pub struct PingTarget {
     pub name: String,
+    #[serde(rename = "type")]
+    pub kind: PingKind,
     pub target: String,
     #[serde(default)]
     pub interval: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PingKind {
+    Http,
+    Tcp,
+    Icmp,
 }
 
 /// 全局实际采集/异步 worker 周期。上报周期不属于这里。
@@ -261,22 +305,59 @@ pub struct ReporterConfig {
     pub worker_url: String,
     #[serde(default, deserialize_with = "de_config_version")]
     pub config_version: String,
+    /// 此 Reporter 对 collector/async worker 的采集需求；全局实际周期取各路最小值。
+    pub intervals: CollectionIntervals,
     pub report_interval: u64,
     #[serde(default = "default_reset_day")]
     pub reset_day: u8,
     #[serde(default)]
     pub interfaces: Vec<String>,
+    /// 磁盘卷/物理盘 glob；空 = 全部。
+    #[serde(default)]
+    pub disks: Vec<String>,
     #[serde(default)]
     pub report_gpu: Option<bool>,
     #[serde(default = "default_true")]
     pub report_errors: bool,
     #[serde(default)]
     pub report_self: bool,
-    /// 缺席 = 上报全部全局 ping；空数组 = 不上报 ping。
+    /// 此 Reporter 自己的 Ping 任务；不同 Reporter 可安全使用同名任务。
     #[serde(default)]
-    pub ping_names: Option<Vec<String>>,
+    pub pings: Vec<PingTarget>,
     #[serde(default)]
     pub ext: ExtConfig,
+}
+
+/// Agent 全局 collector/async worker 配置摘要。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GlobalConfigSummary {
+    pub intervals: CollectionIntervals,
+    pub enable_gpu: bool,
+    /// 所有 Reporter 网卡选择的并集；任一路为空时 all_interfaces=true。
+    pub interfaces: Vec<String>,
+    pub all_interfaces: bool,
+    /// 所有 Reporter 磁盘选择的并集；任一路为空时 all_disks=true。
+    pub disks: Vec<String>,
+    pub all_disks: bool,
+    /// 聚合后的路由作用域名称（reporter/name）；目标地址只在所属 Reporter 回执中出现。
+    pub ping_names: Vec<String>,
+}
+
+/// 一条 Reporter 的脱敏输出策略摘要。
+#[derive(Debug, Clone, Serialize)]
+pub struct ReporterSummary {
+    pub id: String,
+    pub protocol: String,
+    pub intervals: CollectionIntervals,
+    pub report_interval: u64,
+    pub reset_day: u8,
+    pub interfaces: Vec<String>,
+    pub disks: Vec<String>,
+    pub report_gpu: bool,
+    pub report_errors: bool,
+    pub report_self: bool,
+    /// 此 Reporter 实际选中的全局 Ping 名称。
+    pub ping_names: Vec<String>,
 }
 
 /// 服务端通过上报响应下发的远端配置（config 一级内，config_version 必填，
@@ -286,12 +367,20 @@ pub struct RemoteConfig {
     /// 版本字符串；不等才应用（>= 语义对人类可读时间戳不可靠）
     #[serde(deserialize_with = "de_config_version")]
     pub config_version: String,
+    /// 修改当前 Reporter 的采集需求；全局 worker 会重新聚合。
+    #[serde(default)]
+    pub intervals: Option<CollectionIntervals>,
     #[serde(default)]
     pub report_interval: Option<u64>,
     #[serde(default)]
     pub reset_day: Option<u8>,
     #[serde(default)]
     pub interfaces: Option<Vec<String>>,
+    #[serde(default)]
+    pub disks: Option<Vec<String>>,
+    /// 修改当前 Reporter 的 Ping 任务。服务端应避免使用内网敏感目标。
+    #[serde(default)]
+    pub pings: Option<Vec<PingTarget>>,
     #[serde(default)]
     pub report_gpu: Option<bool>,
     /// 是否上报 errors 错误事件（默认 true）

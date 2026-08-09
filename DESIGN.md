@@ -10,15 +10,12 @@
 ```
 ┌─────────────────────────────────────────────────┐
 │ shared collectors                               │
-│  └─ collect ticker (intervals.collect)          │
+│  └─ collect ticker (所有 Reporter 需求的最小值) │
 │       └─ sync collectors → shared event log     │
 ├─────────────────────────────────────────────────┤
 │ async workers（各自独立节奏，只发布最新快照）      │
-│  ├─ ping worker      (每组 [[pings]] 独立间隔)  │
-│  ├─ slow worker      (intervals.slow)           │
-│  ├─ gpu worker       (intervals.gpu)            │
-│  ├─ public-ip worker (intervals.ip)      │
-│  ├─ diskio worker    (intervals.diskio)  │
+│  ├─ ping worker      (type+目标聚合后的独立间隔)│
+│  ├─ slow/gpu/ip/diskio（各路需求取最小值）      │
 │  └─ netstatic        (2s 采样 / 10min 落盘)      │
 ├─────────────────────────────────────────────────┤
 │ [[reporters]]（每路独立）                        │
@@ -34,6 +31,7 @@
 2. **采集与上报分离**：全局采集频率与每个 Reporter 的上报频率完全解耦，二者没有任何关系约束；每路按自己的游标读取共享事件，互不 drain 对方的数据。
 3. **动态数据用数组**：每次采集追加一条带 `ts` 的记录，上报时整体携带并清空。
 4. **异步只发快照**：异步 worker 只保留最近一次测量（带真实测量 ts）；采集端按 ts 新鲜度摘取——快照 ts 变了才带入记录，同一份异步数据不会重复出现，失败表现为 ts 停滞。
+5. **需求聚合、出口分流**：每个 Reporter 声明自己的采集周期、Ping、网卡和磁盘需求；机器级周期取最小值，GPU 取 OR，网卡/磁盘/Ping 取并集。内部逐项采集，出口再按 Reporter 过滤并重算合计。
 
 ## 2. 指标分类
 
@@ -52,13 +50,15 @@
 | `cpu_physical_cores` | 物理核数 | 可选 |
 | `mem_total` | /proc/meminfo | 字节 |
 | `swap_total` | /proc/meminfo | 字节 |
-| `disk_total` | statfs 去重求和 | 字节，扩容会变，靠周期刷新 |
+| `disk_total` / `disks` | statfs 去重 | 当前 Reporter 选中卷的合计与逐卷 `{id,name,mount_point,file_system,total,used}`；扩容靠周期刷新 |
 | `gpu_name` | nvidia-smi 等 | |
 | `virtualization` | systemd-detect-virt 等 | |
 | `boot_time` | /proc/stat btime | 毫秒时间戳 |
 | `ipv4` / `ipv6` | cloudflare trace | 公网 IP，会变，靠周期刷新 |
 | `agent_version` | 编译注入 | |
-| `config` | 当前 Reporter 视角的生效配置 | static.config.*：intervals 中采集周期来自全局、report 来自本 Reporter；其余为本 Reporter 的输出策略，供服务端展示/核对 |
+| `config` | 全局采集摘要 + Reporter 拓扑 + 当前 Reporter 生效配置 | `global` 是实际 collector/async worker 配置；`reporters[]` 是全部线路的脱敏输出策略；同级 intervals/reset_day/... 保持当前 Reporter 视角，供服务端展示/核对 |
+
+`static.config.reporters[]` 只带 `id/protocol`、采集需求与输出策略，不带 `secret`、`worker_url`、其他线路的 `server_id/config_version`。接收端只能给产生当前请求的 Reporter 下发配置；Agent 原子应用该路后重新聚合机器级实际配置，避免多路直接争用一份全局配置。
 
 ### 2.2 动态-同步（dynamic，每个 collect tick 内联采集）
 
@@ -73,11 +73,12 @@
 | `net_rx` / `net_tx` | /proc/net/dev | 字节，开机起累计 |
 | `net_rx_speed` / `net_tx_speed` | 计数器差值 ÷ 时间差 | 字节/秒，主采集内计算，不经过 netstatic |
 | `net_rx_monthly` / `net_tx_monthly` | netstatic 现查 | 字节，账期累计，见 §5 |
+| `net_interfaces` | 逐网卡计数器 + netstatic | 当前 Reporter 选中的逐网卡累计、速率与账期流量；兼容合计字段由其求和 |
 （异步数据不进 dynamic，见 §2.3 与 §3 的 `async[]`）
 
-网卡过滤：默认排除 `br/cni/docker/podman/flannel/lo/veth/virbr/vmbr/tap/fwbr/fwpr` 前缀的虚拟网卡；本地配置可用 glob 指定白名单（如 `eth*`）。
+网卡过滤：内部采集全部默认物理网卡；每个 Reporter 用 glob（如 `eth*`）独立筛选，空数组表示全部。默认排除 `br/cni/docker/podman/flannel/lo/veth/virbr/vmbr/tap/fwbr/fwpr` 前缀的虚拟网卡。
 
-磁盘口径：遍历挂载点 statfs，排除虚拟/网络文件系统（tmpfs/overlay/nfs 等）与 `/tmp`、`/var/lib/docker` 等路径前缀，按设备 ID 去重（ZFS 按 pool 名截断），跨设备求和。
+磁盘口径：遍历挂载点 statfs，排除虚拟/网络文件系统（tmpfs/overlay/nfs 等）与 `/tmp`、`/var/lib/docker` 等路径前缀，按设备 ID 去重（ZFS 按 pool 名截断）。内部保留逐卷/逐物理盘；每个 Reporter 用 `disks` glob 筛选，再重算容量和 IO 兼容合计。Windows 容量通常按盘符，IO 使用 `PhysicalDisk(*)` 逐物理盘计数器。
 
 ### 2.3 动态-异步（async worker，只发布最新快照）
 
@@ -93,10 +94,10 @@
 
 | worker | 节奏 | 采集内容 | 快照 |
 |---|---|---|---|
-| ping | 每组 `[[pings]]` 独立 interval（缺省 `intervals.ping`） | 每组 key + target + interval；target 以 http(s):// 开头 → HTTP，否则 TCP（host[:port]，默认 80）；一轮 4 次取中位数 + 丢包率 | `HashMap<key, PingRecord>` |
-| slow | `intervals.slow`（缺省 60s） | disk_used / tcp_conn / udp_conn / processes | `SlowBlock` |
+| ping | 聚合后每目标独立 interval | 显式 `http/tcp/icmp`；每轮 DNS 先解析一次，4 次测量与重试复用 IP；一轮取中位数 + 丢包率 | `HashMap<task_id, PingRecord>` |
+| slow | 实际 `intervals.slow` | 逐卷 disks + disk_used / tcp_conn / udp_conn / processes | `SlowBlock` |
 | gpu | `intervals.gpu`（缺省 60s） | GPU 名称 + 使用率（nvidia-smi；macOS 走 system_profiler + ioreg，可本地开关） | `Vec<GpuRecord>` |
-| diskio | `intervals.diskio`（缺省 10s） | 整盘 IO 速率/iops/await/util（Linux /proc/diskstats；macOS ioreg，无 util） | `DiskIoRecord` |
+| diskio | 实际 `intervals.diskio` | 逐物理盘 IO 速率/iops/await/usage + 聚合值（Linux /proc/diskstats；Windows PDH；macOS ioreg） | `DiskIoRecord` |
 | public-ip | `intervals.ip`（缺省 600s） | 公网 IPv4/IPv6（cloudflare trace，强制 tcp4/tcp6 分流） | `(ipv4, ipv6)`，供 static |
 | netstatic | 2s 采样 / 10min 落盘 | 每网卡流量 delta 时序，见 §5 | 可查询时序 |
 
@@ -108,6 +109,8 @@
 - 主采集永不阻塞于异步 worker。
 
 ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最多 3 次；TCP 探测若重测降幅 >800ms，判定为 SYN 重传污染，本次记为失败。
+
+Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端口，ICMP 为小写 host；HTTP 为 scheme + 小写 host + 有效端口，忽略 path/query，但 HTTP 与 HTTPS 不合并。重复任务周期取最小值（而非最大公约数）：最小值直接满足每个消费者要求且不会产生比任何一路更密的额外采样。结果与错误在出口恢复为该 Reporter 自己的逻辑名称。
 
 ## 3. 上报模型
 
@@ -183,9 +186,12 @@ ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最
 {
   "config": {
     "config_version": "2026-08-06T16:00:00.000+08:00",
+    "intervals": { "collect": 2, "ping": 60, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
     "report_interval": 60,
     "reset_day": 15,
     "interfaces": ["eth*"],
+    "disks": ["nvme*"],
+    "pings": [ { "name": "edge", "type": "icmp", "target": "1.1.1.1", "interval": 60 } ],
     "report_gpu": true,
     "report_errors": true,
     "report_self": false
@@ -195,15 +201,18 @@ ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最
 
 | 项 | 约束 |
 |---|---|
+| `intervals` | 当前 Reporter 的六项采集需求，均 >= 1；应用后参与机器级最小值聚合 |
 | `report_interval` | 当前 Reporter 上报间隔（秒），>= 1；与全局 collect 无任何关系约束 |
 | `reset_day` | 月流量账期重置日，1-31；0 = 不重置（永久累计） |
 | `interfaces` | 当前 Reporter 的网卡白名单（glob 数组） |
-| `report_gpu` | 当前 Reporter 是否输出 GPU |
+| `disks` | 当前 Reporter 的卷/物理盘白名单（glob 数组） |
+| `pings` | 当前 Reporter 的整组 Ping 需求（显式 type/target/interval） |
+| `report_gpu` | 当前 Reporter 是否输出 GPU，并参与机器级 GPU worker 的 OR 聚合 |
 | `report_errors` | 当前 Reporter 是否输出错误事件 |
 | `report_self` | 当前 Reporter 是否输出探针自身指标 |
 | `config_version` | 配置版本（人类可读的 UTC+8 时间戳字符串），幂等机制，见下 |
 
-响应信封把配置收在 `config` 一级（除 config_version 外均可选，出现的才应用），另有 `next` 一级放对下一次上报的指令（如 `next.static`）。响应只能修改产生它的 Reporter。🔒 连接身份与全局实际采集配置 `intervals` / `enable_gpu` / `pings` / `net_static_path` 只接受本地 TOML，不允许任何上报端修改，因此多路下发不会争用同一份采集配置。
+响应信封把配置收在 `config` 一级（除 config_version 外均可选，出现的才应用），另有 `next` 一级放对下一次上报的指令（如 `next.static`）。响应只能修改产生它的 Reporter；机器级实际配置没有可直接写入口，而是每次从全部 Reporter 重新聚合，因此多路下发不会互相覆盖。🔒 连接身份与 `net_static_path` 仍只接受本地 TOML。允许远端 Ping 时，服务端必须自行限制目标范围。
 
 ### 4.2 下发机制
 
@@ -211,7 +220,7 @@ ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最
 - agent 上报时带当前 `config_version`；服务端比对，不一致才下发。
 - **幂等**：version 与本地一致则不应用。
 - **原子**：整个配置对象全部校验通过才应用 + 落盘本地配置文件；任何一项非法（零值间隔、reset_day 越界等）整体拒绝，agent 日志记录原因。
-- 应用后立即生效（只重建所属 Reporter ticker、重算该路账期），无需重启。
+- 应用后立即生效：重建所属 Reporter ticker，并按需调整共享 ticker、Ping/GPU worker；无需重启。
 
 ## 5. 流量统计（netstatic）
 
@@ -283,7 +292,7 @@ ping 防重传规则（沿用 komari/cfsm）：单次延迟 >1000ms 时重测最
 | 月流量计算位置 | **客户端自算，服务端只存展示值** | 统计与重置不依赖服务端 |
 | 流量统计底层 | **时序明细（非 KV 状态机）** | 按网卡存 delta，配置变更后新增增量始终正确；reset_day/interfaces 变更可重算 |
 | 实时网速来源 | **主采集计数器差值** | 比 netstatic 2s 粒度更贴合采集周期 |
-| 远端可下发项 | **仅 Reporter 输出策略** | 远端响应定向到所属 Reporter；全局实际采集配置只接受本地修改，消除多路冲突 |
+| 远端可下发项 | **仅所属 Reporter 的需求与输出策略** | 全局实际值没有写入口，每次从全部 Reporter 聚合，消除多路覆盖冲突 |
 | 流量校正 | **服务端职责，agent 不做** | netstatic 报诚实累计值；重装跳变由服务端检测并加 offset，校正属展示/账务层 |
 | 自升级/远程命令 | **不做** | 安全边界 |
 | 单位/类型 | **字节 + JSON number** | komari 风格，不学 cfsm 全字符串 |

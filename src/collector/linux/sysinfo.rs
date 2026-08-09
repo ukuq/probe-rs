@@ -14,7 +14,8 @@ pub fn collect(
     cfg: &crate::model::StaticConfig,
 ) -> StaticInfo {
     let (mem_total, _, swap_total, _) = mem::collect();
-    let (disk_total, _) = disk::collect();
+    let disks = disk::collect_volumes();
+    let disk_total = disks.iter().map(|disk| disk.total).sum();
     StaticInfo {
         ts: crate::model::now_millis(),
         os: os_name(),
@@ -26,6 +27,7 @@ pub fn collect(
         mem_total,
         swap_total,
         disk_total,
+        disks,
         gpu_name,
         virtualization: detect_virtualization(),
         boot_time: boot_time_ms().unwrap_or_else(|| crate::model::now_millis()),
@@ -178,9 +180,12 @@ mod tests {
             return;
         }
         let cfg = crate::model::StaticConfig {
+            global: Default::default(),
+            reporters: vec![],
             intervals: crate::model::Intervals::default(),
             reset_day: 1,
             interfaces: vec![],
+            disks: vec![],
             enable_gpu: false,
             pings: vec![],
             report_errors: true,

@@ -6,23 +6,15 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::model::{
-    CollectionIntervals, ExtConfig, Intervals, PingTarget, RemoteConfig, ReporterConfig,
-    StaticConfig,
+    CollectionIntervals, ExtConfig, GlobalConfigSummary, Intervals, PingKind, PingTarget,
+    RemoteConfig, ReporterConfig, ReporterSummary, StaticConfig,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalConfig {
-    /// 实际 collector/async worker 周期；不含任何上报周期。
-    pub intervals: CollectionIntervals,
-    /// 是否实际启动 GPU worker。各 Reporter 只能决定是否输出 GPU。
-    #[serde(default)]
-    pub enable_gpu: bool,
     #[serde(default = "default_net_static_path")]
     pub net_static_path: String,
-    /// 全局 Ping worker 定义；Reporter 仅用 ping_names 选择输出子集。
-    #[serde(default)]
-    pub pings: Vec<PingTarget>,
     /// 所有独立上报实例，包括 id="primary"。
     pub reporters: Vec<ReporterConfig>,
 }
@@ -38,11 +30,18 @@ pub struct ReporterSpec {
     pub intervals: Intervals,
     pub reset_day: u8,
     pub interfaces: Vec<String>,
+    pub disks: Vec<String>,
     pub report_gpu: bool,
     pub report_errors: bool,
     pub report_self: bool,
-    pub pings: Vec<PingTarget>,
+    pub pings: Vec<ScopedPingTarget>,
     pub ext: ExtConfig,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedPingTarget {
+    pub task_id: String,
+    pub target: PingTarget,
 }
 
 impl ReporterSpec {
@@ -56,15 +55,22 @@ impl ReporterSpec {
         )
     }
 
-    pub fn static_config(&self) -> StaticConfig {
+    pub fn static_config(
+        &self,
+        global: GlobalConfigSummary,
+        reporters: Vec<ReporterSummary>,
+    ) -> StaticConfig {
         StaticConfig {
+            global,
+            reporters,
             reset_day: self.reset_day,
             intervals: self.intervals,
             interfaces: self.interfaces.clone(),
+            disks: self.disks.clone(),
             enable_gpu: self.report_gpu,
             report_errors: self.report_errors,
             report_self: self.report_self,
-            pings: self.pings.clone(),
+            pings: self.pings.iter().map(|ping| ping.target.clone()).collect(),
             ext: self.ext.clone(),
         }
     }
@@ -106,14 +112,10 @@ fn platform_config_dir() -> PathBuf {
 
 impl LocalConfig {
     pub fn validate(&self) -> Result<()> {
-        self.intervals.validate().map_err(anyhow::Error::msg)?;
-        validate_pings(&self.pings)?;
         if self.reporters.is_empty() {
             bail!("至少需要一个 [[reporters]]");
         }
         let mut ids = std::collections::HashSet::new();
-        let global_ping_names: std::collections::HashSet<&str> =
-            self.pings.iter().map(|p| p.name.as_str()).collect();
         for reporter in &self.reporters {
             if reporter.id.trim().is_empty() {
                 bail!("reporters.id 不能为空");
@@ -130,21 +132,14 @@ impl LocalConfig {
             if reporter.report_interval == 0 {
                 bail!("reporter {} report_interval 必须 >= 1", reporter.id);
             }
+            reporter.intervals.validate().map_err(anyhow::Error::msg)?;
             if reporter.reset_day > 31 {
                 bail!("reporter {} reset_day 必须在 0-31 之间", reporter.id);
             }
             validate_interfaces(&reporter.interfaces)?;
-            if let Some(names) = &reporter.ping_names {
-                let mut selected = std::collections::HashSet::new();
-                for name in names {
-                    if !selected.insert(name) {
-                        bail!("reporter {} ping_names 重复: {name}", reporter.id);
-                    }
-                    if !global_ping_names.contains(name.as_str()) {
-                        bail!("reporter {} 引用了不存在的全局 ping: {name}", reporter.id);
-                    }
-                }
-            }
+            validate_patterns("disks", &reporter.disks)?;
+            validate_pings(&reporter.pings)
+                .with_context(|| format!("reporter {} pings 非法", reporter.id))?;
         }
         Ok(())
     }
@@ -152,32 +147,30 @@ impl LocalConfig {
     pub fn reporter_specs(&self) -> Vec<ReporterSpec> {
         self.reporters
             .iter()
-            .map(|r| {
-                let pings = match &r.ping_names {
-                    None => self.pings.clone(),
-                    Some(names) => self
-                        .pings
-                        .iter()
-                        .filter(|ping| names.contains(&ping.name))
-                        .cloned()
-                        .collect(),
-                };
-                ReporterSpec {
-                    id: r.id.clone(),
-                    protocol: r.protocol.clone(),
-                    server_id: r.server_id.clone(),
-                    secret: r.secret.clone(),
-                    worker_url: r.worker_url.clone(),
-                    config_version: r.config_version.clone(),
-                    intervals: self.intervals.with_report(r.report_interval),
-                    reset_day: r.reset_day,
-                    interfaces: r.interfaces.clone(),
-                    report_gpu: r.report_gpu.unwrap_or(r.protocol == "cf"),
-                    report_errors: r.report_errors,
-                    report_self: r.report_self,
-                    pings,
-                    ext: r.ext.clone(),
-                }
+            .map(|r| ReporterSpec {
+                id: r.id.clone(),
+                protocol: r.protocol.clone(),
+                server_id: r.server_id.clone(),
+                secret: r.secret.clone(),
+                worker_url: r.worker_url.clone(),
+                config_version: r.config_version.clone(),
+                intervals: r.intervals.with_report(r.report_interval),
+                reset_day: r.reset_day,
+                interfaces: r.interfaces.clone(),
+                disks: r.disks.clone(),
+                report_gpu: r.report_gpu.unwrap_or(r.protocol == "cf"),
+                report_errors: r.report_errors,
+                report_self: r.report_self,
+                pings: r
+                    .pings
+                    .iter()
+                    .cloned()
+                    .map(|target| ScopedPingTarget {
+                        task_id: ping_task_key(&target).expect("validated ping target"),
+                        target,
+                    })
+                    .collect(),
+                ext: r.ext.clone(),
             })
             .collect()
     }
@@ -186,24 +179,158 @@ impl LocalConfig {
         self.reporter_specs().into_iter().find(|r| r.id == id)
     }
 
+    /// 可安全随 static 上报的全局采集摘要。
+    pub fn global_summary(&self) -> GlobalConfigSummary {
+        let interfaces: std::collections::BTreeSet<String> = self
+            .reporters
+            .iter()
+            .flat_map(|reporter| reporter.interfaces.iter().cloned())
+            .collect();
+        let disks: std::collections::BTreeSet<String> = self
+            .reporters
+            .iter()
+            .flat_map(|reporter| reporter.disks.iter().cloned())
+            .collect();
+        GlobalConfigSummary {
+            intervals: self.effective_collection_intervals(),
+            enable_gpu: self.effective_gpu(),
+            interfaces: interfaces.into_iter().collect(),
+            all_interfaces: self
+                .reporters
+                .iter()
+                .any(|reporter| reporter.interfaces.is_empty()),
+            disks: disks.into_iter().collect(),
+            all_disks: self
+                .reporters
+                .iter()
+                .any(|reporter| reporter.disks.is_empty()),
+            ping_names: {
+                let mut tasks = std::collections::BTreeMap::new();
+                for reporter in &self.reporters {
+                    for ping in &reporter.pings {
+                        tasks
+                            .entry(ping_task_key(ping).expect("validated ping target"))
+                            .or_insert_with(|| format!("{}/{}", reporter.id, ping.name));
+                    }
+                }
+                tasks.into_values().collect()
+            },
+        }
+    }
+
+    /// 可安全随 static 上报的 Reporter 拓扑与输出策略摘要。
+    pub fn reporter_summaries(&self) -> Vec<ReporterSummary> {
+        self.reporter_specs()
+            .into_iter()
+            .map(|spec| ReporterSummary {
+                id: spec.id,
+                protocol: spec.protocol,
+                intervals: CollectionIntervals {
+                    collect: spec.intervals.collect,
+                    ping: spec.intervals.ping,
+                    slow: spec.intervals.slow,
+                    gpu: spec.intervals.gpu,
+                    ip: spec.intervals.ip,
+                    diskio: spec.intervals.diskio,
+                },
+                report_interval: spec.intervals.report,
+                reset_day: spec.reset_day,
+                interfaces: spec.interfaces,
+                disks: spec.disks,
+                report_gpu: spec.report_gpu,
+                report_errors: spec.report_errors,
+                report_self: spec.report_self,
+                ping_names: spec
+                    .pings
+                    .into_iter()
+                    .map(|ping| ping.target.name)
+                    .collect(),
+            })
+            .collect()
+    }
+
     pub fn effective_intervals(&self) -> Intervals {
-        // report 仅为旧的内部载体占位；任何 Reporter 变更都不会触发 collector ticker。
-        self.intervals.with_report(1)
+        self.effective_collection_intervals().with_report(1)
     }
 
     pub fn effective_gpu(&self) -> bool {
-        self.enable_gpu
+        self.reporter_specs()
+            .iter()
+            .any(|reporter| reporter.report_gpu)
     }
 
     pub fn effective_pings(&self) -> Vec<PingTarget> {
-        self.pings
+        let mut tasks: std::collections::BTreeMap<String, PingTarget> = Default::default();
+        for reporter in self.reporter_specs() {
+            for ping in reporter.pings {
+                let interval = ping.target.interval.unwrap_or(reporter.intervals.ping);
+                tasks
+                    .entry(ping.task_id.clone())
+                    .and_modify(|task| {
+                        task.interval = Some(task.interval.unwrap_or(interval).min(interval));
+                    })
+                    .or_insert_with(|| PingTarget {
+                        name: ping.task_id,
+                        kind: ping.target.kind,
+                        target: ping.target.target,
+                        interval: Some(interval),
+                    });
+            }
+        }
+        tasks.into_values().collect()
+    }
+
+    pub fn effective_collection_intervals(&self) -> CollectionIntervals {
+        self.reporters
             .iter()
-            .cloned()
-            .map(|mut ping| {
-                ping.interval = Some(ping.interval.unwrap_or(self.intervals.ping));
-                ping
+            .map(|reporter| reporter.intervals)
+            .reduce(|a, b| CollectionIntervals {
+                collect: a.collect.min(b.collect),
+                ping: a.ping.min(b.ping),
+                slow: a.slow.min(b.slow),
+                gpu: a.gpu.min(b.gpu),
+                ip: a.ip.min(b.ip),
+                diskio: a.diskio.min(b.diskio),
             })
-            .collect()
+            .unwrap_or_default()
+    }
+}
+
+fn ping_task_key(ping: &PingTarget) -> Result<String> {
+    match ping.kind {
+        PingKind::Http => {
+            let url = reqwest::Url::parse(&ping.target)
+                .with_context(|| format!("非法 HTTP Ping URL: {}", ping.target))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                bail!("HTTP Ping 只支持 http/https: {}", ping.target);
+            }
+            let host = url
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("HTTP Ping 缺少 host: {}", ping.target))?
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            let port = url
+                .port_or_known_default()
+                .ok_or_else(|| anyhow::anyhow!("HTTP Ping 缺少 port: {}", ping.target))?;
+            Ok(format!("http:{}://{host}:{port}", url.scheme()))
+        }
+        PingKind::Tcp => {
+            let (host, port) = crate::worker::ping::split_host_port(&ping.target)?;
+            Ok(format!(
+                "tcp:{}:{port}",
+                host.trim_end_matches('.').to_ascii_lowercase()
+            ))
+        }
+        PingKind::Icmp => {
+            let host = ping.target.trim().trim_matches(['[', ']']);
+            if host.is_empty() || host.contains('/') {
+                bail!("非法 ICMP host: {}", ping.target);
+            }
+            Ok(format!(
+                "icmp:{}",
+                host.trim_end_matches('.').to_ascii_lowercase()
+            ))
+        }
     }
 }
 
@@ -224,13 +351,16 @@ fn validate_connection(protocol: &str, server_id: &str, secret: &str, url: &str)
 }
 
 fn validate_interfaces(interfaces: &[String]) -> Result<()> {
-    for pattern in interfaces {
+    validate_patterns("interfaces", interfaces)
+}
+
+fn validate_patterns(field: &str, patterns: &[String]) -> Result<()> {
+    for pattern in patterns {
         let p = pattern.trim();
         if p.is_empty() || p.len() > 64 {
-            bail!("interfaces 参数非法: {pattern:?}");
+            bail!("{field} 参数非法: {pattern:?}");
         }
-        globset::Glob::new(p)
-            .map_err(|e| anyhow::anyhow!("interfaces glob 非法 {pattern:?}: {e}"))?;
+        globset::Glob::new(p).map_err(|e| anyhow::anyhow!("{field} glob 非法 {pattern:?}: {e}"))?;
     }
     Ok(())
 }
@@ -241,6 +371,7 @@ fn validate_pings(pings: &[PingTarget]) -> Result<()> {
         if ping.name.trim().is_empty() || ping.target.trim().is_empty() {
             bail!("ping name/target 不能为空");
         }
+        ping_task_key(ping)?;
         if !names.insert(&ping.name) {
             bail!("ping name 重复: {}", ping.name);
         }
@@ -345,9 +476,12 @@ impl SharedConfig {
         }
         let RemoteConfig {
             config_version,
+            intervals,
             report_interval,
             reset_day,
             interfaces,
+            disks,
+            pings,
             report_gpu,
             report_errors,
             report_self,
@@ -359,6 +493,9 @@ impl SharedConfig {
             .iter_mut()
             .find(|r| r.id == reporter_id)
             .ok_or_else(|| anyhow::anyhow!("Reporter 不存在: {reporter_id}"))?;
+        if let Some(value) = intervals {
+            reporter.intervals = value;
+        }
         if let Some(value) = report_interval {
             reporter.report_interval = value;
         }
@@ -367,6 +504,12 @@ impl SharedConfig {
         }
         if let Some(value) = interfaces {
             reporter.interfaces = value;
+        }
+        if let Some(value) = disks {
+            reporter.disks = value;
+        }
+        if let Some(value) = pings {
+            reporter.pings = value;
         }
         if let Some(value) = report_gpu {
             reporter.report_gpu = Some(value);
@@ -411,6 +554,9 @@ impl SharedConfig {
 
 /// 远端配置整体校验：任何一项非法则整体拒绝
 fn validate_remote(remote: &RemoteConfig) -> Result<()> {
+    if let Some(intervals) = remote.intervals {
+        intervals.validate().map_err(anyhow::Error::msg)?;
+    }
     if remote.report_interval == Some(0) {
         bail!("远端 report_interval 必须 >= 1");
     }
@@ -420,14 +566,13 @@ fn validate_remote(remote: &RemoteConfig) -> Result<()> {
         }
     }
     if let Some(interfaces) = &remote.interfaces {
-        for pattern in interfaces {
-            let p = pattern.trim();
-            if p.is_empty() || p.len() > 64 {
-                bail!("远端 interfaces 参数非法: {pattern:?}");
-            }
-            globset::Glob::new(p)
-                .map_err(|e| anyhow::anyhow!("远端 interfaces glob 非法 {pattern:?}: {e}"))?;
-        }
+        validate_patterns("远端 interfaces", interfaces)?;
+    }
+    if let Some(disks) = &remote.disks {
+        validate_patterns("远端 disks", disks)?;
+    }
+    if let Some(pings) = &remote.pings {
+        validate_pings(pings).context("远端 pings 非法")?;
     }
     Ok(())
 }
@@ -464,18 +609,7 @@ mod tests {
 
     fn base_config() -> LocalConfig {
         LocalConfig {
-            intervals: CollectionIntervals {
-                collect: 10,
-                ping: 30,
-                ..Default::default()
-            },
-            enable_gpu: true,
             net_static_path: "/tmp/x.json".into(),
-            pings: vec![PingTarget {
-                name: "ct".into(),
-                target: "example.com:80".into(),
-                interval: None,
-            }],
             reporters: vec![ReporterConfig {
                 id: "primary".into(),
                 protocol: "probe".into(),
@@ -483,13 +617,24 @@ mod tests {
                 secret: "sec".into(),
                 worker_url: "https://example.com/report".into(),
                 config_version: String::new(),
+                intervals: CollectionIntervals {
+                    collect: 10,
+                    ping: 30,
+                    ..Default::default()
+                },
                 report_interval: 60,
                 reset_day: 1,
                 interfaces: vec![],
+                disks: vec![],
                 report_gpu: Some(false),
                 report_errors: true,
                 report_self: false,
-                ping_names: None,
+                pings: vec![PingTarget {
+                    name: "ct".into(),
+                    kind: PingKind::Tcp,
+                    target: "example.com:80".into(),
+                    interval: None,
+                }],
                 ext: Default::default(),
             }],
         }
@@ -526,7 +671,7 @@ mod tests {
     #[test]
     fn rejects_zero_intervals() {
         let mut cfg = base_config();
-        cfg.intervals.collect = 0;
+        cfg.reporters[0].intervals.collect = 0;
         assert!(cfg.validate().is_err());
     }
 
@@ -539,7 +684,7 @@ mod tests {
         let back: LocalConfig = toml::from_str(&text).unwrap();
         assert_eq!(back, cfg);
         assert!(!back.reporters[0].ext.cf.correction);
-        assert_eq!(back.pings[0].name, "ct");
+        assert_eq!(back.reporters[0].pings[0].name, "ct");
     }
 
     #[test]
@@ -552,13 +697,24 @@ mod tests {
             secret: "token".into(),
             worker_url: "http://panel.example".into(),
             config_version: String::new(),
+            intervals: CollectionIntervals {
+                collect: 5,
+                ping: 10,
+                ..Default::default()
+            },
             report_interval: 3,
             reset_day: 12,
             interfaces: vec!["Ethernet*".into()],
+            disks: vec!["C:*".into()],
             report_gpu: Some(true),
             report_errors: false,
             report_self: true,
-            ping_names: Some(vec![]),
+            pings: vec![PingTarget {
+                name: "same-host".into(),
+                kind: PingKind::Tcp,
+                target: "EXAMPLE.com:80".into(),
+                interval: Some(10),
+            }],
             ext: Default::default(),
         });
         cfg.reporters.push(ReporterConfig {
@@ -568,34 +724,98 @@ mod tests {
             secret: "cf-secret".into(),
             worker_url: "https://worker.example/update".into(),
             config_version: String::new(),
+            intervals: CollectionIntervals {
+                collect: 1,
+                ping: 20,
+                ..Default::default()
+            },
             report_interval: 30,
             reset_day: 1,
             interfaces: vec![],
+            disks: vec![],
             report_gpu: None,
             report_errors: true,
             report_self: false,
-            ping_names: Some(vec!["ct".into()]),
+            pings: vec![],
             ext: Default::default(),
         });
 
         cfg.validate().unwrap();
         let komari = cfg.reporter("komari-a").unwrap();
         assert_eq!(komari.reset_day, 12);
-        assert_eq!(komari.intervals.collect, 10);
+        assert_eq!(komari.intervals.collect, 5);
         assert_eq!(komari.intervals.report, 3);
         assert!(komari.report_gpu);
         assert!(komari.report_self);
         assert!(!komari.report_errors);
-        assert!(komari.pings.is_empty());
-        assert!(cfg.reporter("cf-a").unwrap().report_gpu);
-        assert_eq!(cfg.effective_intervals().collect, 10);
+        assert_eq!(komari.pings.len(), 1);
+        let cf = cfg.reporter("cf-a").unwrap();
+        assert!(cf.report_gpu);
+        assert_eq!(cfg.effective_intervals().collect, 1);
         assert_eq!(cfg.effective_intervals().report, 1); // 内部占位，不是上报周期
         assert!(cfg.effective_gpu());
-        assert_eq!(cfg.effective_pings()[0].interval, Some(30));
+        assert_eq!(cfg.effective_pings().len(), 1); // type + 规范化 endpoint 去重
+        assert_eq!(cfg.effective_pings()[0].interval, Some(10)); // 各消费者取最小周期
 
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let roundtrip: LocalConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(roundtrip, cfg);
+
+        let receipt = cf.static_config(cfg.global_summary(), cfg.reporter_summaries());
+        assert_eq!(receipt.global.ping_names.len(), 1);
+        assert_eq!(receipt.reporters.len(), 3);
+        assert_eq!(receipt.reporters[1].id, "komari-a");
+        assert_eq!(receipt.reporters[1].ping_names, ["same-host"]);
+        assert!(receipt.reporters[2].report_gpu); // CF 缺省值已展开
+        let json = serde_json::to_string(&receipt).unwrap();
+        for private in [
+            "sec",
+            "token",
+            "cf-secret",
+            "https://example.com/report",
+            "http://panel.example",
+            "https://worker.example/update",
+            "node-a",
+            "cf-id",
+        ] {
+            assert!(!json.contains(private), "摘要泄露了私有字段: {private}");
+        }
+    }
+
+    #[test]
+    fn ping_task_key_normalizes_endpoint_and_ignores_http_path() {
+        let key = |kind, target: &str| {
+            ping_task_key(&PingTarget {
+                name: "test".into(),
+                kind,
+                target: target.into(),
+                interval: None,
+            })
+            .unwrap()
+        };
+
+        assert_eq!(
+            key(PingKind::Tcp, "EXAMPLE.com"),
+            key(PingKind::Tcp, "example.com.:80")
+        );
+        assert_eq!(
+            key(PingKind::Icmp, "EXAMPLE.com."),
+            key(PingKind::Icmp, "example.com")
+        );
+        assert_eq!(
+            key(PingKind::Http, "https://EXAMPLE.com/health?a=1"),
+            key(PingKind::Http, "https://example.com:443/other")
+        );
+        // HTTP and HTTPS on the same numeric port are not the same probe:
+        // TLS handshake and request semantics differ.
+        assert_ne!(
+            key(PingKind::Http, "http://example.com:443/a"),
+            key(PingKind::Http, "https://example.com:443/a")
+        );
+        assert_ne!(
+            key(PingKind::Tcp, "example.com:80"),
+            key(PingKind::Icmp, "example.com")
+        );
     }
 
     #[test]
@@ -612,15 +832,6 @@ mod tests {
     fn minimal_canonical_config_parses() {
         let text = r#"
 net_static_path = "/tmp/net.json"
-enable_gpu = true
-
-[intervals]
-collect = 1
-ping = 30
-slow = 60
-gpu = 60
-ip = 600
-diskio = 10
 
 [[reporters]]
 id = "komari"
@@ -632,9 +843,18 @@ config_version = ""
 report_interval = 1
 reset_day = 12
 interfaces = []
+disks = []
 report_gpu = true
 report_errors = true
 report_self = false
+
+[reporters.intervals]
+collect = 1
+ping = 30
+slow = 60
+gpu = 60
+ip = 600
+diskio = 10
 "#;
         let cfg: LocalConfig = toml::from_str(text).unwrap();
         cfg.validate().unwrap();
@@ -686,9 +906,12 @@ ping = 30
         shared
             .apply_remote(RemoteConfig {
                 config_version: String::new(),
+                intervals: None,
                 report_interval: Some(1),
                 reset_day: Some(5),
                 interfaces: None,
+                disks: None,
+                pings: None,
                 report_gpu: None,
                 report_errors: None,
                 report_self: None,
@@ -701,9 +924,12 @@ ping = 30
         assert!(shared
             .apply_remote(RemoteConfig {
                 config_version: "2026-08-06T15:00:00+08:00".into(),
+                intervals: None,
                 report_interval: Some(0),
                 reset_day: Some(5),
                 interfaces: None,
+                disks: None,
+                pings: None,
                 report_gpu: None,
                 report_errors: None,
                 report_self: None,
@@ -716,9 +942,12 @@ ping = 30
         shared
             .apply_remote(RemoteConfig {
                 config_version: "2026-08-06T15:00:00+08:00".into(),
+                intervals: None,
                 report_interval: Some(20),
                 reset_day: Some(15),
                 interfaces: None,
+                disks: None,
+                pings: None,
                 report_gpu: None,
                 report_errors: None,
                 report_self: None,
@@ -730,7 +959,7 @@ ping = 30
         assert_eq!(primary.config_version, "2026-08-06T15:00:00+08:00");
         assert_eq!(primary.reset_day, 15);
         assert_eq!(primary.intervals.report, 20);
-        assert_eq!(after.intervals.collect, 10);
+        assert_eq!(after.effective_intervals().collect, 10);
         assert!(!rx.has_changed().unwrap());
         let on_disk = load(&path).unwrap();
         assert_eq!(

@@ -2,7 +2,7 @@
 //! 只统计整盘（跳过分区/loop/ram/dm/md，避免与整盘重复计数）；
 //! sector 固定 512 字节；io 进行中时长（第 13 列）按盘保留，usage 取各盘最大
 
-use super::super::DiskIoCounters;
+use super::super::{DiskIoCounters, DiskIoDeviceCounters};
 
 /// 整盘判定：nvme0n1 / mmcblk0 / sda / vda / xvda / hda；
 /// 分区（nvme0n1p1、sda1、mmcblk0p1）与其余虚拟设备排除
@@ -32,6 +32,17 @@ pub fn parse_diskstats(data: &str) -> DiskIoCounters {
             continue;
         }
         let v = |i: usize| f[i].parse::<u64>().unwrap_or(0);
+        out.devices.insert(
+            f[2].to_string(),
+            DiskIoDeviceCounters {
+                read_ops: v(3),
+                read_bytes: v(5) * 512,
+                write_ops: v(7),
+                write_bytes: v(9) * 512,
+                total_time_ms: v(6) + v(10),
+                io_time_ms: Some(v(12)),
+            },
+        );
         out.read_ops += v(3);
         out.read_bytes += v(5) * 512;
         out.write_ops += v(7);

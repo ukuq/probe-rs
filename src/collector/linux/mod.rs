@@ -43,9 +43,8 @@ pub fn memory() -> (u64, u64, u64, u64) {
     mem::collect()
 }
 
-/// (disk_total, disk_used)，字节
-pub fn disk() -> (u64, u64) {
-    disk::collect()
+pub fn disks() -> Vec<crate::model::DiskVolume> {
+    disk::collect_volumes()
 }
 
 pub fn load() -> Option<[f64; 3]> {

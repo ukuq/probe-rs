@@ -41,6 +41,7 @@ pub fn spawn(
                                 write_iops: r.write_iops,
                                 await_ms: r.await_ms,
                                 usage: r.usage,
+                                disks: r.disks,
                             }));
                         }
                         None => {

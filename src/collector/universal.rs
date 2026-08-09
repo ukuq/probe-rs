@@ -88,9 +88,10 @@ const EXCLUDED_FS: &[&str] = &[
 ];
 
 /// (disk_total, disk_used)，字节
-pub fn disk() -> (u64, u64) {
+pub fn disks() -> Vec<crate::model::DiskVolume> {
     let disks = Disks::new_with_refreshed_list();
-    let mut devices: std::collections::HashMap<String, (u64, u64)> = Default::default();
+    let mut devices: std::collections::HashMap<String, crate::model::DiskVolume> =
+        Default::default();
     for d in &disks {
         let mount = d.mount_point().to_string_lossy().to_lowercase();
         let fs = d.file_system().to_string_lossy().to_lowercase();
@@ -103,16 +104,32 @@ pub fn disk() -> (u64, u64) {
             continue;
         }
         let name = d.name().to_string_lossy().to_string();
-        match devices.get(&name) {
-            Some(&(t, _)) if t >= total => {}
+        let mount_point = d.mount_point().to_string_lossy().to_string();
+        let id = if cfg!(target_os = "windows") {
+            mount_point.clone()
+        } else {
+            name.clone()
+        };
+        match devices.get(&id) {
+            Some(existing) if existing.total >= total => {}
             _ => {
-                devices.insert(name, (total, used));
+                devices.insert(
+                    id.clone(),
+                    crate::model::DiskVolume {
+                        id,
+                        name,
+                        mount_point,
+                        file_system: fs,
+                        total,
+                        used,
+                    },
+                );
             }
         }
     }
-    devices
-        .values()
-        .fold((0u64, 0u64), |(t, u), &(dt, du)| (t + dt, u + du))
+    let mut volumes: Vec<_> = devices.into_values().collect();
+    volumes.sort_by(|a, b| a.id.cmp(&b.id));
+    volumes
 }
 
 #[cfg(target_os = "macos")]
@@ -195,7 +212,8 @@ pub fn static_info(
     let mut s = System::new();
     s.refresh_cpu_all();
     let (mem_total, _, swap_total, _) = memory();
-    let (disk_total, _) = disk();
+    let disks = disks();
+    let disk_total = disks.iter().map(|disk| disk.total).sum();
     StaticInfo {
         ts: crate::model::now_millis(),
         os: System::long_os_version()
@@ -221,6 +239,7 @@ pub fn static_info(
         mem_total,
         swap_total,
         disk_total,
+        disks,
         gpu_name,
         // DMI 检测是 Linux 专属；macOS 物理机为主，Windows 一期不做虚拟化检测
         virtualization: None,
@@ -279,6 +298,7 @@ fn parse_ioreg_statistics(text: &str) -> super::DiskIoCounters {
         write_ops: sum_key(text, "Operations (Write)"),
         total_time_ms: total_ns / 1_000_000,
         io_ms_per_dev: Default::default(), // macOS 无 io 进行中时长计数器，usage 不可得
+        devices: Default::default(),
     }
 }
 

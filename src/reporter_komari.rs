@@ -119,6 +119,7 @@ mod tests {
             mem_total: 16_000_000_000,
             swap_total: 1_000_000_000,
             disk_total: 80_000_000_000,
+            disks: vec![],
             gpu_name: None,
             virtualization: Some("kvm".into()),
             boot_time: 900,
@@ -126,9 +127,12 @@ mod tests {
             ipv6: None,
             agent_version: "0.1.1".into(),
             config: crate::model::StaticConfig {
+                global: Default::default(),
+                reporters: vec![],
                 reset_day: 1,
                 intervals: crate::model::Intervals::default(),
                 interfaces: vec![],
+                disks: vec![],
                 enable_gpu: false,
                 report_errors: true,
                 report_self: true,
@@ -158,6 +162,7 @@ mod tests {
         let slow = SlowBlock {
             ts: 999,
             disk_used: Some(4_000_000_000),
+            disks: vec![],
             tcp_conn: Some(3),
             udp_conn: Some(1),
             processes: Some(99),

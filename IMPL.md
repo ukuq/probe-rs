@@ -92,9 +92,11 @@ probe-rs/
 
 ### 3.6 探测（worker/ping.rs）
 
+- 类型显式为 `http/tcp/icmp`；内部按类型 + 规范化目标聚合，重复目标周期取最小值。
+- 每轮先解析一次 DNS，再开始 RTT 计时；4 次测量与高延迟重试复用已解析地址。
 - TCP：`tokio::net::TcpStream::connect` + `tokio::time::timeout(3s)`，计时 connect 耗时。
-- HTTP：reqwest `Client`（`pool_max_idle_per_host(0)`），2xx/3xx 视为成功。
-- ICMP（可选）：`surge-ping`，需要 root 或 `CAP_NET_RAW`；无权限时降级为 TCP。
+- HTTP：reqwest `Client`（`pool_max_idle_per_host(0)`），固定预解析 IP 且禁止重定向；2xx/3xx 视为成功。
+- ICMP：先解析为 IP，再调用平台 `ping` 命令；无需给 agent 本身授予 raw socket capability。
 - 一轮 = 每目标 4 次测量取中位数；>1000ms 触发防重传重试（移植设计书 §2.3 规则）。
 - 每个目标并发执行（`futures::future::join_all`），一轮总耗时 ≈ 最慢目标，不是累加。
 
@@ -107,8 +109,8 @@ probe-rs/
 ### 3.8 配置热加载
 
 - main 里 3s 轮询配置文件 mtime；变更后重新 load + 校验，失败保持原配置。
-- `interfaces`/远程下发的 intervals 经 `SharedConfig::update_local` 即时生效（每 tick 重读 / watch 通知）。
-- `pings` / `enable_gpu` 变更时重建对应 worker：channel 在 main 创建一次，任务可中止重建，scheduler 无感。
+- 每个 Reporter 的 `intervals/interfaces/disks/pings/report_gpu` 经 `SharedConfig::update_local` 即时生效；实际周期取最小值、GPU 取 OR，选择项取并集。
+- 聚合后的 `pings` / GPU 开关变更时重建对应 worker：channel 在 main 创建一次，任务可中止重建，scheduler 无感。
 
 ### 3.9 优雅退出
 
@@ -162,7 +164,7 @@ sudo ./deploy/install.sh       # 装二进制/unit/示例配置；已装过则�
 
 - 二进制 → `/usr/local/bin/probe-rs`；配置 → `/etc/probe-rs/config.toml`（600，含 secret）；数据 → `/var/lib/probe-rs/`
 - 首次安装需先编辑配置填 `server_id` / `secret` / `worker_url`，再 `systemctl enable --now probe-rs`
-- unit 加固：`ProtectSystem=strict` + `ReadWritePaths=/var/lib/probe-rs /etc/probe-rs`（后者因远端配置要回写 config.toml）；未来启用 ICMP ping 时解开 `AmbientCapabilities=CAP_NET_RAW`
+- unit 加固：`ProtectSystem=strict` + `ReadWritePaths=/var/lib/probe-rs /etc/probe-rs`（后者因远端配置要回写 config.toml）；ICMP 使用系统 `ping`，agent 无需 `CAP_NET_RAW`
 - 卸载：`./deploy/install.sh uninstall`（保留配置与数据，加 `--purge` 全清）
 - 一键脚本（换 URL 即可装，参数对齐各官方探针）：CF 模式 `deploy/cf-install.sh`（-id/-secret/-url/-ct/-cu/-cm/-bd）；komari 模式 `deploy/komari-install.sh`（-e 面板地址/-t token/-i 间隔，缺省 collect=1 report=3 对齐官方节奏）
 
@@ -199,7 +201,7 @@ Windows 使用同一套 CF 协议逻辑；CF 一键安装默认启用 GPU 采集
 
 **上报映射**（reporter_cf.rs）：顶层 `{id, secret, metrics, samples[]}`；ram/swap/disk 字节→MB；load 转空格字符串；GPU → `gpu_info:[{id,name,info}]`（显存/温度丢弃）；ping 按组名落 `ping_ct/cu/cm/bd` + `loss_*`（bgp 是 bd 别名，未配置为 `false`，已配置但失败为 `null`）；`ip_v4/v6` 不可达报数值 `0`；`dynamic[]` → `samples[]`（`ext.cf.batch=false` 时只发单条 metrics）。空上报周期复用最近一次独立采集快照，避免 CF 将缺失动态字段写成假 0，但不会由 report 触发采集。errors/self/virtualization 无落点，CF 模式下不产生。
 
-**配置下发**：请求头 `X-Agent-Config-Schema: 3` + `X-Agent-Config-Md5`（复用 `config_version` 字段存 MD5，空 = `none`）。响应 204 = 无变更；200 + URL-encoded body → 解析 collect_interval/report_interval/reset_day/custom_ct/cu/cm/bd/interface，合成 `RemoteConfig`（config_version 取响应头 MD5）走 `apply_remote` 同一条热应用管线。`collect=0` 兼容映射为内部 1 秒采集，保持采集/上报分离；逗号分隔的 interface 拆成多个过滤项。CF 未覆盖的字段（ping/slow/gpu/ip 子间隔、enable_gpu、report_*、ext.*）保持现值，仅本地可改。
+**配置下发**：请求头 `X-Agent-Config-Schema: 3` + `X-Agent-Config-Md5`（复用 `config_version` 字段存 MD5，空 = `none`）。响应 204 = 无变更；200 + URL-encoded body → 解析 collect_interval/report_interval/reset_day/custom_ct/cu/cm/bd/interface，合成 `RemoteConfig`（config_version 取响应头 MD5）走 `apply_remote_for`。`collect=0` 兼容映射为当前 CF Reporter 的 1 秒采集需求，随后参与机器级最小值聚合；逗号分隔的 interface 拆成多个过滤项。CF 未覆盖的 ping/slow/gpu/ip 子间隔与输出开关保持该 Reporter 现值。
 
 **流量校正**：响应尾部 `rx_correction/tx_correction`（GB，覆盖当月累计）。netstatic 记账期偏移（offset = 校正字节 − 原始月累计，period_start 匹配才生效，翻页自动失效），立即落盘；校正确认用**独立请求**回传（CF 服务端见到 correction 字段会把整个请求当确认、丢弃 metrics），服务端清空后停止。`ext.cf.correction = false` 时整个回路忽略。`update=1`（自升级）永远忽略。
 
