@@ -44,6 +44,9 @@ pub struct Correction {
 struct StoreFile {
     interfaces: BTreeMap<String, VecDeque<Entry>>,
     #[serde(default)]
+    corrections: BTreeMap<String, Correction>,
+    /// Compatibility with the pre-multi-reporter on-disk format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     correction: Option<Correction>,
 }
 
@@ -68,6 +71,12 @@ impl NetStatic {
             .unwrap_or_default();
         let cutoff = crate::model::now_millis() - RETAIN.num_milliseconds();
         let mut store = store;
+        if let Some(legacy) = store.correction.take() {
+            store
+                .corrections
+                .entry("primary".to_string())
+                .or_insert(legacy);
+        }
         for entries in store.interfaces.values_mut() {
             while entries.front().is_some_and(|e| e.ts < cutoff) {
                 entries.pop_front();
@@ -136,13 +145,14 @@ impl NetStatic {
     /// 月累计查询：原始值 + 校正偏移（偏移仅当属于当前账期时生效）
     pub fn query_monthly(
         &self,
+        reporter_id: &str,
         filter: &IfaceFilter,
         period_start: i64,
         now_ms: i64,
     ) -> (u64, u64) {
         let (raw_rx, raw_tx) = self.query(filter, period_start, now_ms);
         let inner = self.inner.lock().expect("netstatic lock poisoned");
-        match inner.store.correction {
+        match inner.store.corrections.get(reporter_id).copied() {
             Some(c) if c.period_start == period_start => (
                 (raw_rx as i64 + c.rx_offset).max(0) as u64,
                 (raw_tx as i64 + c.tx_offset).max(0) as u64,
@@ -155,6 +165,7 @@ impl NetStatic {
     /// GB 值原样保存供回传确认；立即落盘（重启不丢）
     pub fn apply_correction(
         &self,
+        reporter_id: &str,
         period_start: i64,
         raw_monthly: (u64, u64),
         rx_gb: f64,
@@ -165,14 +176,17 @@ impl NetStatic {
         let tx_bytes = (tx_gb * GIB).round() as i64;
         {
             let mut inner = self.inner.lock().expect("netstatic lock poisoned");
-            inner.store.correction = Some(Correction {
-                period_start,
-                rx_offset: rx_bytes - raw_monthly.0 as i64,
-                tx_offset: tx_bytes - raw_monthly.1 as i64,
-                rx_gb,
-                tx_gb,
-                confirm_pending: true,
-            });
+            inner.store.corrections.insert(
+                reporter_id.to_string(),
+                Correction {
+                    period_start,
+                    rx_offset: rx_bytes - raw_monthly.0 as i64,
+                    tx_offset: tx_bytes - raw_monthly.1 as i64,
+                    rx_gb,
+                    tx_gb,
+                    confirm_pending: true,
+                },
+            );
             inner.dirty = true;
         }
         self.flush();
@@ -180,20 +194,22 @@ impl NetStatic {
     }
 
     /// 待回传的校正确认值（GB 原值）
-    pub fn confirm_pending(&self) -> Option<(f64, f64)> {
+    pub fn confirm_pending(&self, reporter_id: &str) -> Option<(f64, f64)> {
         let inner = self.inner.lock().expect("netstatic lock poisoned");
         inner
             .store
-            .correction
+            .corrections
+            .get(reporter_id)
+            .copied()
             .filter(|c| c.confirm_pending)
             .map(|c| (c.rx_gb, c.tx_gb))
     }
 
     /// 服务端已清空待修正（响应不再带校正字段）：停止回传；偏移保留到账期结束
-    pub fn clear_confirm(&self) {
+    pub fn clear_confirm(&self, reporter_id: &str) {
         let need = {
             let mut inner = self.inner.lock().expect("netstatic lock poisoned");
-            match &mut inner.store.correction {
+            match inner.store.corrections.get_mut(reporter_id) {
                 Some(c) if c.confirm_pending => {
                     c.confirm_pending = false;
                     inner.dirty = true;
@@ -376,31 +392,56 @@ mod tests {
         }
         // 校正为 rx=10GB tx=5GB（覆盖语义）
         ns.apply_correction(
+            "primary",
             period,
             (2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024),
             10.0,
             5.0,
         );
-        let (rx, tx) = ns.query_monthly(&filter, period, now);
+        let (rx, tx) = ns.query_monthly("primary", &filter, period, now);
         assert_eq!(rx, 10 * 1024 * 1024 * 1024);
         assert_eq!(tx, 5 * 1024 * 1024 * 1024);
-        assert_eq!(ns.confirm_pending(), Some((10.0, 5.0)));
+        assert_eq!(ns.confirm_pending("primary"), Some((10.0, 5.0)));
+
+        // A second CF Reporter owns a separate offset and confirmation cursor.
+        ns.apply_correction(
+            "cf-secondary",
+            period,
+            (2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024),
+            3.0,
+            4.0,
+        );
+        assert_eq!(
+            ns.query_monthly("cf-secondary", &filter, period, now),
+            (3 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(ns.confirm_pending("cf-secondary"), Some((3.0, 4.0)));
+        ns.clear_confirm("primary");
+        assert_eq!(ns.confirm_pending("primary"), None);
+        assert_eq!(ns.confirm_pending("cf-secondary"), Some((3.0, 4.0)));
+        ns.apply_correction(
+            "primary",
+            period,
+            (2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024),
+            10.0,
+            5.0,
+        );
 
         // 落盘恢复：偏移与确认状态都在
         let ns2 = NetStatic::load(path.as_path());
-        let (rx2, tx2) = ns2.query_monthly(&filter, period, now);
+        let (rx2, tx2) = ns2.query_monthly("primary", &filter, period, now);
         assert_eq!((rx2, tx2), (rx, tx));
-        assert_eq!(ns2.confirm_pending(), Some((10.0, 5.0)));
+        assert_eq!(ns2.confirm_pending("primary"), Some((10.0, 5.0)));
 
         // 服务端清空后停止回传，但偏移保留
-        ns2.clear_confirm();
-        assert_eq!(ns2.confirm_pending(), None);
-        let (rx3, _) = ns2.query_monthly(&filter, period, now);
+        ns2.clear_confirm("primary");
+        assert_eq!(ns2.confirm_pending("primary"), None);
+        let (rx3, _) = ns2.query_monthly("primary", &filter, period, now);
         assert_eq!(rx3, rx);
 
         // 账期翻页：偏移失效，回到原始累计
         let next_period = period + 32i64 * 24 * 3600 * 1000;
-        let (rx4, tx4) = ns2.query_monthly(&filter, next_period, now);
+        let (rx4, tx4) = ns2.query_monthly("primary", &filter, next_period, now);
         assert_eq!((rx4, tx4), (0, 0));
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();

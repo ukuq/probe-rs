@@ -18,7 +18,6 @@ use linux as imp;
 use universal as imp;
 
 use crate::model::StaticInfo;
-use net::{IfaceFilter, NetBytes};
 
 /// 探针自身资源采样器（有状态，CPU 差值法；首轮 cpu 为 None）
 pub struct SelfMonitor(imp::SelfMonitor);
@@ -70,10 +69,6 @@ pub fn connections() -> Result<(u64, u64), String> {
 }
 
 /// 白名单网卡合计 (rx, tx)，字节
-pub fn net_bytes(filter: &IfaceFilter) -> NetBytes {
-    imp::net_bytes(filter)
-}
-
 /// 遍历全部网卡（不过滤），netstatic 采样用
 pub fn scan_net_dev(f: impl FnMut(&str, u64, u64)) {
     imp::scan_net_dev(f);
@@ -158,7 +153,7 @@ pub fn static_info(
     ipv6: Option<String>,
     gpu_name: Option<String>,
     agent_version: &str,
-    cfg: &crate::config::LocalConfig,
+    cfg: &crate::model::StaticConfig,
 ) -> StaticInfo {
     imp::static_info(ipv4, ipv6, gpu_name, agent_version, cfg)
 }

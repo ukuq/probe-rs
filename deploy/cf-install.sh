@@ -39,6 +39,7 @@ usage() {
   -rx_correction= -tx_correction=  忽略（校正由服务端运行时下发）
 额外:
   -bin=              二进制来源（本地路径或 URL），缺省 GitHub Releases
+  -reporter_id=      已有配置中追加/更新的 Reporter id（缺省 cf）
 EOF
 }
 
@@ -66,7 +67,7 @@ case "$CMD" in
 esac
 
 ID=""; SECRET=""; URL=""; COLLECT=0; REPORT=60; RESET_DAY=1
-CT=""; CU=""; CM=""; BD=""; BIN=""
+CT=""; CU=""; CM=""; BD=""; BIN=""; REPORTER_ID="cf"
 for arg in "$@"; do
     case "$arg" in
         -id=*)              ID="${arg#-id=}" ;;
@@ -80,11 +81,16 @@ for arg in "$@"; do
         -cm=*)              CM="${arg#-cm=}" ;;
         -bd=*)              BD="${arg#-bd=}" ;;
         -bin=*)             BIN="${arg#-bin=}" ;;
+        -reporter_id=*|--reporter-id=*) REPORTER_ID="${arg#*=}" ;;
         -auto_update=*|-rx_correction=*|-tx_correction=*)
             log "参数 $arg 忽略（见脚本头注释）" ;;
         *) die "未知参数: $arg" ;;
     esac
 done
+
+case "$REPORTER_ID" in
+    ''|*[!A-Za-z0-9_.-]*) die "reporter id must use A-Z, a-z, 0-9, _, . or -" ;;
+esac
 
 [ "$(id -u)" = 0 ] || die "需要 root（sudo 或 root 执行）"
 [ -n "$ID" ] || die "缺少 -id="
@@ -127,26 +133,85 @@ rm -f "$TMP_BIN"
 # ---- 配置 ----
 install -d -m 0755 "$DATA_DIR"
 install -d -m 0750 "$CONF_DIR"
+CONFIG_PATH="$CONF_DIR/config.toml"
+
+remove_reporter_block() {
+    cfg="$1"; target="$2"; tmp=$(mktemp "$CONF_DIR/config.toml.XXXXXX")
+    awk -v target="$target" '
+        function flush() {
+            if (in_reporter && !drop) printf "%s", block
+            block=""; drop=0
+        }
+        /^[[:space:]]*\[\[reporters\]\][[:space:]]*$/ {
+            if (in_reporter) flush()
+            in_reporter=1; block=$0 ORS; next
+        }
+        {
+            if (in_reporter && $0 ~ /^[[:space:]]*\[/ &&
+                $0 !~ /^[[:space:]]*\[\[?reporters(\.|\]\])/) {
+                flush(); in_reporter=0
+            }
+            if (in_reporter) {
+                block=block $0 ORS
+                if ($0 ~ /^[[:space:]]*id[[:space:]]*=/) {
+                    value=$0
+                    sub(/^[^=]*=[[:space:]]*"/, "", value)
+                    sub(/"[[:space:]]*(#.*)?$/, "", value)
+                    if (value == target) drop=1
+                }
+            } else print
+        }
+        END { if (in_reporter) flush() }
+    ' "$cfg" > "$tmp"
+    mv -f "$tmp" "$cfg"
+}
+
+if [ -s "$CONFIG_PATH" ] &&
+   grep -q '^[[:space:]]*\[\[reporters\]\]' "$CONFIG_PATH" &&
+   ! awk '
+       /^[[:space:]]*\[/ { exit }
+       /^[[:space:]]*server_id[[:space:]]*=/ { found=1 }
+       END { exit found ? 0 : 1 }
+   ' "$CONFIG_PATH"; then
+    # 新 schema 的全局 collector 只有一份。CF 默认需要 GPU，采样周期也按本次安装参数更新；
+    # 全局 Ping 定义保持现状，避免覆盖其他 Reporter 正在使用的目标。
+    sed -i '0,/^[[:space:]]*enable_gpu[[:space:]]*=.*/s//enable_gpu = true/' "$CONFIG_PATH"
+    sed -i "/^[[:space:]]*\[intervals\][[:space:]]*$/,/^[[:space:]]*\[/ s/^[[:space:]]*collect[[:space:]]*=.*/collect = $COLLECT/" "$CONFIG_PATH"
+    remove_reporter_block "$CONFIG_PATH" "$REPORTER_ID"
+    {
+        echo ""
+        echo "[[reporters]]"
+        echo "id = \"$REPORTER_ID\""
+        echo 'protocol = "cf"'
+        echo "server_id = \"$ID\""
+        echo "secret = \"$SECRET\""
+        echo "worker_url = \"$URL\""
+        echo 'config_version = ""'
+        echo "report_interval = $REPORT"
+        echo "reset_day = $RESET_DAY"
+        echo "interfaces = []"
+        echo "report_gpu = true"
+        echo "report_errors = true"
+        echo "report_self = false"
+        echo ""
+        echo "[reporters.ext.cf]"
+        echo "correction = true"
+        echo "batch = true"
+    } >> "$CONFIG_PATH"
+    log "preserved global collectors and upserted CF Reporter '$REPORTER_ID'"
+else
+    # 缺失配置或旧的根连接 schema 都直接覆盖为新 canonical 格式，不做兼容迁移。
 {
-    echo "server_id = \"$ID\""
-    echo "secret = \"$SECRET\""
-    echo "worker_url = \"$URL\""
-    echo 'protocol = "cf"'
     echo "net_static_path = \"$DATA_DIR/net_static.json\""
-    echo "reset_day = $RESET_DAY"
-    echo 'config_version = ""'
-    echo "interfaces = []"
     echo "enable_gpu = true"
-    echo "report_errors = true"
-    echo "report_self = false"
     echo ""
     echo "[intervals]"
     echo "collect = $COLLECT"
-    echo "report = $REPORT"
     echo "ping = 30"
     echo "slow = 60"
     echo "gpu = 60"
     echo "ip = 600"
+    echo "diskio = 10"
     for pair in "ct:$CT" "cu:$CU" "cm:$CM" "bd:$BD"; do
         name="${pair%%:*}"; target="${pair#*:}"
         [ -n "$target" ] || continue
@@ -156,11 +221,27 @@ install -d -m 0750 "$CONF_DIR"
         echo "target = \"$target\""
     done
     echo ""
-    echo "[ext.cf]"
+    echo "[[reporters]]"
+    echo "id = \"$REPORTER_ID\""
+    echo 'protocol = "cf"'
+    echo "server_id = \"$ID\""
+    echo "secret = \"$SECRET\""
+    echo "worker_url = \"$URL\""
+    echo 'config_version = ""'
+    echo "report_interval = $REPORT"
+    echo "reset_day = $RESET_DAY"
+    echo "interfaces = []"
+    echo "report_gpu = true"
+    echo "report_errors = true"
+    echo "report_self = false"
+    echo ""
+    echo "[reporters.ext.cf]"
     echo "correction = true"
     echo "batch = true"
-} > "$CONF_DIR/config.toml"
-chmod 600 "$CONF_DIR/config.toml"
+} > "$CONFIG_PATH"
+    log "wrote a fresh canonical config with CF Reporter '$REPORTER_ID'"
+fi
+chmod 600 "$CONFIG_PATH"
 
 # ---- systemd unit ----
 cat > "$UNIT_DST" <<'EOF'

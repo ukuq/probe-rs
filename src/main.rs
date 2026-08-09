@@ -17,7 +17,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::sync::watch;
 
-use crate::config::SharedConfig;
+use crate::config::{LocalConfig, SharedConfig};
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -36,86 +36,83 @@ async fn main() -> Result<()> {
         .init();
 
     let config_path = parse_config_arg();
-    let local = config::load(&config_path).context("配置加载失败")?;
-    tracing::info!(path = %config_path.display(), server_id = %local.server_id, "配置已加载");
-    if local.protocol == "cf" {
-        tracing::info!(url = %local.worker_url, "CF 协议模式（POST /update）");
-        for p in &local.pings {
-            if !["ct", "cu", "cm", "bd", "bgp"].contains(&p.name.as_str()) {
-                tracing::warn!(name = %p.name, "CF 模式下该 ping 组无落点（仅 ct/cu/cm/bd 会被上报）");
+    let local = config::load(&config_path).context("failed to load config")?;
+    let initial_specs = local.reporter_specs();
+    tracing::info!(
+        path = %config_path.display(),
+        reporters = initial_specs.len(),
+        "config loaded"
+    );
+    for spec in &initial_specs {
+        tracing::info!(
+            reporter_id = %spec.id,
+            protocol = %spec.protocol,
+            "reporter configured"
+        );
+        if spec.protocol == "cf" {
+            for ping in &spec.pings {
+                if !["ct", "cu", "cm", "bd", "bgp"].contains(&ping.name.as_str()) {
+                    tracing::warn!(
+                        reporter_id = %spec.id,
+                        name = %ping.name,
+                        "CF has no field for this ping group"
+                    );
+                }
             }
         }
     }
 
     let net_static_path = PathBuf::from(&local.net_static_path);
-    let reporter = Arc::new(
-        reporter::Reporter::new(&local.worker_url, &local.secret, AGENT_VERSION)
-            .context("reporter 初始化失败")?,
-    );
     let (shared, intervals_rx, config_rx) = SharedConfig::new(local.clone(), config_path.clone());
     let buffers = Arc::new(buffer::Buffers::new());
+    for spec in &initial_specs {
+        buffers.register(spec.id.clone());
+    }
     let net = netstatic::NetStatic::load(&net_static_path);
-    // watch 保留最新退出状态；即使任务当时正在采集/上报，返回 select 后也不会漏信号。
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // netstatic 采样 task：每 2s 采样，每 10min 落盘
+    // The persistent traffic ledger captures all interfaces. Reporter-specific
+    // filters and corrections are applied only when a payload is built.
     {
         let net = net.clone();
-        let shared = Arc::clone(&shared);
         let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(net.sample_interval());
+            let all = collector::net::IfaceFilter::all();
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        let filter = collector::net::IfaceFilter::new(&shared.get().interfaces);
-                        net.sample(&filter);
+                        net.sample(&all);
                         net.flush_if_due();
                     }
-                    r = shutdown_rx.changed() => {
-                        if r.is_err() || *shutdown_rx.borrow() { break; }
-                    },
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() { break; }
+                    }
                 }
             }
         });
     }
 
-    let (ping_tx, ping_rx) = tokio::sync::watch::channel(worker::ping::PingSnapshot::new());
-    let (gpu_name_tx, gpu_name_rx) = tokio::sync::watch::channel::<Option<String>>(None);
-    let (gpu_tx, gpu_rx) = tokio::sync::watch::channel::<Vec<model::GpuRecord>>(Vec::new());
+    let (ping_tx, ping_rx) = watch::channel(worker::ping::PingSnapshot::new());
+    let (gpu_name_tx, gpu_name_rx) = watch::channel::<Option<String>>(None);
+    let (gpu_tx, gpu_rx) = watch::channel::<Vec<model::GpuRecord>>(Vec::new());
     let (_ip_handle, ip_rx) = worker::public_ip::spawn(Arc::clone(&buffers), intervals_rx.clone());
-    let (_slow_handle, slow_rx, self_rx) = worker::slow::spawn(
-        Arc::clone(&shared),
-        intervals_rx.clone(),
-        Arc::clone(&buffers),
-    );
+    let (_slow_handle, slow_rx, self_rx) =
+        worker::slow::spawn(intervals_rx.clone(), Arc::clone(&buffers));
     let (_diskio_handle, diskio_rx) =
         worker::diskio::spawn(intervals_rx.clone(), Arc::clone(&buffers));
 
-    // komari 模式：WS worker（v2 JSON-RPC）；其余协议不建通道
-    let (komari_tx, _komari_handle) = if local.protocol == "komari" {
-        let (tx, rx) = tokio::sync::watch::channel(worker::komari::KomariOut::default());
-        let h = worker::komari::spawn(
-            local.worker_url.clone(),
-            local.secret.clone(),
-            rx,
-            Arc::clone(&buffers),
-        );
-        (Some(tx), Some(h))
-    } else {
-        (None, None)
-    };
-
     let init_cfg = shared.get();
-    let mut ping_worker = (!init_cfg.pings.is_empty()).then(|| {
+    let init_pings = init_cfg.effective_pings();
+    let mut ping_worker = (!init_pings.is_empty()).then(|| {
         worker::ping::PingWorker::start(
-            init_cfg.pings.clone(),
+            init_pings,
             ping_tx.clone(),
             Arc::clone(&buffers),
             intervals_rx.clone(),
         )
     });
-    let mut gpu_handle = init_cfg.enable_gpu.then(|| {
+    let mut gpu_handle = init_cfg.effective_gpu().then(|| {
         worker::gpu::start(
             gpu_name_tx.clone(),
             gpu_tx.clone(),
@@ -124,8 +121,9 @@ async fn main() -> Result<()> {
         )
     });
 
-    // 配置 supervisor：3s 轮询配置文件（本地热加载）+ 监听配置变更（远端下发），
-    // 统一 reconcile pings / enable_gpu worker；interfaces/intervals 经 SharedConfig 即时生效
+    // Local file reload and shared collector reconciliation. Endpoint identity,
+    // credentials, protocol and Reporter count are restart-only; scoped
+    // collection settings remain hot-reloadable.
     {
         let watch_path = config_path.clone();
         let shared = Arc::clone(&shared);
@@ -134,62 +132,69 @@ async fn main() -> Result<()> {
         let gpu_tx = gpu_tx.clone();
         let buffers = Arc::clone(&buffers);
         let intervals_rx2 = intervals_rx.clone();
+        let initial_connections = connection_signature(&local);
         let mut config_rx = config_rx;
         tokio::spawn(async move {
-            let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            let mtime =
+                |path: &std::path::Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
             let mut last_mtime = mtime(&watch_path);
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
-            ticker.tick().await; // 跳过立即触发的第一拍
-            let mut applied_pings = shared.get().pings;
-            let mut applied_gpu = shared.get().enable_gpu;
-            let applied_protocol = shared.get().protocol;
+            let mut ticker = tokio::time::interval(Duration::from_secs(3));
+            ticker.tick().await;
+            let mut applied_pings = shared.get().effective_pings();
+            let mut applied_gpu = shared.get().effective_gpu();
             loop {
                 tokio::select! {
-                    // 本地文件变更 → 重载进 SharedConfig（会触发 config_tx → 走下方 reconcile）
                     _ = ticker.tick() => {
-                        let m = mtime(&watch_path);
-                        if m == last_mtime {
-                            continue;
-                        }
-                        last_mtime = m;
+                        let current_mtime = mtime(&watch_path);
+                        if current_mtime == last_mtime { continue; }
+                        last_mtime = current_mtime;
                         match config::load(&watch_path) {
                             Ok(cfg) => {
-                                if cfg.protocol != applied_protocol {
-                                    tracing::warn!(protocol = %cfg.protocol, "protocol 变更需重启 agent 才生效，已忽略");
-                                    continue;
-                                }
-                                if cfg != shared.get() {
+                                if connection_signature(&cfg) != initial_connections {
+                                    tracing::warn!(
+                                        "Reporter endpoints/count changed; restart required, hot reload skipped"
+                                    );
+                                } else if cfg != shared.get() {
                                     shared.update_local(cfg);
-                                    tracing::info!("配置已热加载");
+                                    tracing::info!("config hot-reloaded");
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "热加载配置失败，保持原配置");
-                            }
+                            Err(error) => tracing::warn!(%error, "config hot reload rejected"),
                         }
                     }
-                    // 配置变更（本地热加载或远端下发）→ 重建差异 worker
-                    r = config_rx.changed() => {
-                        if r.is_err() { return; }
+                    changed = config_rx.changed() => {
+                        if changed.is_err() { return; }
                         let cfg = config_rx.borrow().clone();
-                        if cfg.pings != applied_pings {
-                            if let Some(w) = ping_worker.take() {
-                                w.stop();
+                        let desired_pings = cfg.effective_pings();
+                        if desired_pings != applied_pings {
+                            if let Some(worker) = ping_worker.take() {
+                                worker.stop();
                             }
-                            ping_worker = (!cfg.pings.is_empty()).then(|| {
-                                worker::ping::PingWorker::start(cfg.pings.clone(), ping_tx.clone(), Arc::clone(&buffers), intervals_rx2.clone())
+                            ping_worker = (!desired_pings.is_empty()).then(|| {
+                                worker::ping::PingWorker::start(
+                                    desired_pings.clone(),
+                                    ping_tx.clone(),
+                                    Arc::clone(&buffers),
+                                    intervals_rx2.clone(),
+                                )
                             });
-                            applied_pings = cfg.pings.clone();
-                            tracing::info!(groups = applied_pings.len(), "探测目标已重建");
+                            applied_pings = desired_pings;
+                            tracing::info!(groups = applied_pings.len(), "ping workers reconciled");
                         }
-                        if cfg.enable_gpu != applied_gpu {
-                            if cfg.enable_gpu {
-                                gpu_handle = Some(worker::gpu::start(gpu_name_tx.clone(), gpu_tx.clone(), Arc::clone(&buffers), intervals_rx2.clone()));
-                            } else if let Some(h) = gpu_handle.take() {
-                                h.abort();
+                        let desired_gpu = cfg.effective_gpu();
+                        if desired_gpu != applied_gpu {
+                            if desired_gpu {
+                                gpu_handle = Some(worker::gpu::start(
+                                    gpu_name_tx.clone(),
+                                    gpu_tx.clone(),
+                                    Arc::clone(&buffers),
+                                    intervals_rx2.clone(),
+                                ));
+                            } else if let Some(handle) = gpu_handle.take() {
+                                handle.abort();
                             }
-                            applied_gpu = cfg.enable_gpu;
-                            tracing::info!(enable = applied_gpu, "GPU 采集状态已切换");
+                            applied_gpu = desired_gpu;
+                            tracing::info!(enable = applied_gpu, "GPU worker reconciled");
                         }
                     }
                 }
@@ -197,35 +202,93 @@ async fn main() -> Result<()> {
         });
     }
 
-    let sched = scheduler::Scheduler::new(
-        Arc::clone(&shared),
-        buffers,
-        reporter,
-        net.clone(),
+    let collector = scheduler::Scheduler::new(
+        Arc::clone(&buffers),
         intervals_rx,
-        ip_rx,
-        gpu_name_rx,
-        ping_rx,
-        gpu_rx,
-        slow_rx,
+        ping_rx.clone(),
+        gpu_rx.clone(),
+        slow_rx.clone(),
         self_rx,
-        diskio_rx,
-        shutdown_rx,
-        AGENT_VERSION.to_string(),
-        komari_tx,
+        diskio_rx.clone(),
+        shutdown_rx.clone(),
     );
+    let collector_handle = tokio::spawn(collector.run());
+    tokio::task::yield_now().await;
+
+    // A separate runtime and, for Komari, a separate WebSocket worker is
+    // created for every configured Reporter, including same-protocol peers.
+    for spec in initial_specs {
+        let reporter = Arc::new(
+            reporter::Reporter::new(
+                &spec.worker_url,
+                &spec.secret,
+                AGENT_VERSION,
+                &spec.id,
+                &spec.protocol,
+            )
+            .with_context(|| format!("failed to initialize Reporter {}", spec.id))?,
+        );
+        let komari_tx = if spec.protocol == "komari" {
+            let (tx, rx) = watch::channel(worker::komari::KomariOut::default());
+            worker::komari::spawn(
+                spec.worker_url.clone(),
+                spec.secret.clone(),
+                rx,
+                Arc::clone(&buffers),
+            );
+            Some(tx)
+        } else {
+            None
+        };
+        let runner = scheduler::ReporterRunner::new(
+            spec.id,
+            Arc::clone(&shared),
+            Arc::clone(&buffers),
+            reporter,
+            net.clone(),
+            shared.subscribe_config(),
+            ip_rx.clone(),
+            gpu_name_rx.clone(),
+            ping_rx.clone(),
+            gpu_rx.clone(),
+            slow_rx.clone(),
+            diskio_rx.clone(),
+            shutdown_rx.clone(),
+            AGENT_VERSION.to_string(),
+            komari_tx,
+        );
+        tokio::spawn(runner.run());
+    }
 
     tokio::spawn(async move {
         wait_for_signal().await;
         shutdown_tx.send_replace(true);
     });
 
-    sched.run().await;
-
-    // 退出前落盘，缩小丢失窗口
+    collector_handle
+        .await
+        .context("collection scheduler failed")?;
     net.flush();
-    tracing::info!("probe-rs 已退出");
+    tracing::info!("probe-rs stopped");
     Ok(())
+}
+
+use std::time::Duration;
+
+fn connection_signature(cfg: &LocalConfig) -> Vec<(String, String, String, String, String)> {
+    cfg.reporter_specs()
+        .into_iter()
+        .map(|spec| {
+            let (id, protocol, server_id, secret, worker_url) = spec.connection_key();
+            (
+                id.to_string(),
+                protocol.to_string(),
+                server_id.to_string(),
+                secret.to_string(),
+                worker_url.to_string(),
+            )
+        })
+        .collect()
 }
 
 fn parse_config_arg() -> PathBuf {
@@ -251,7 +314,7 @@ async fn wait_for_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut term = signal(SignalKind::terminate()).expect("注册 SIGTERM 失败");
+        let mut term = signal(SignalKind::terminate()).expect("failed to register SIGTERM");
         tokio::select! {
             _ = ctrl_c => {}
             _ = term.recv() => {}

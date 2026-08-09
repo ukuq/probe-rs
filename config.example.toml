@@ -1,70 +1,80 @@
-# probe-rs 本地配置
-# 与「配置样例」tab（JSON5 注释版）内容一致
+# probe-rs canonical configuration (0.1.3-beta.1+)
+# Global = actual collection/async workers. Every output connection lives in [[reporters]].
 
-# ===== 🔒 不可远端修改（身份与安全边界） =====
-server_id = "srv-01"
-secret = "change-me"
-worker_url = "https://monitor.example.com/report"
-# Linux 默认路径；Windows 安装脚本会改写为 %ProgramData%\probe-rs\net_static.json
+# Persistent per-interface traffic ledger. Windows default:
+# C:\ProgramData\probe-rs\net_static.json
 net_static_path = "/var/lib/probe-rs/net_static.json"
-# 协议类型："probe"（默认，REPORT.md 协议）| "cf"（CF-Server-Monitor 的 POST /update）
-#        | "komari"（komari 面板的 WS v2 JSON-RPC）
-# 仅本地修改，重启生效。CF 模式下：server_id 填 CF 后台分配的 UUID，
-# secret 填 API_SECRET，worker_url 填 https://<worker>/update。
-# komari 模式下：secret 填面板的 API token，worker_url 填面板地址（https://<panel>）
-protocol = "probe"
 
-# ===== 本地或远端均可修改（本地热加载 ~3s；远端便车下发即时） =====
-# 月流量账期重置日 1-31；0 = 不重置（永久累计）
-reset_day = 1
+# Actually start the GPU worker. report_gpu on each Reporter only filters output.
+enable_gpu = true
 
-# 配置版本（机制维护，远端下发幂等用，勿手改）；人类可读的 UTC+8 时间戳字符串，不等才应用
-config_version = ""
-
-# 网卡白名单（glob，如 "eth*"）；空 = 所有非虚拟网卡
-interfaces = []
-# GPU 采集开关（nvidia-smi；macOS 用 ioreg）
-enable_gpu = false
-# 是否上报 errors 错误事件（关闭后 errors 数组恒为空）
-report_errors = true
-# 是否上报探针自身资源占用 kind:"self"（CPU/RSS）
-report_self = false
-
-# 注意：标量字段必须放在 [intervals] 段之前，否则会被解析进 intervals 表（agent 报错拒绝）
-# 各间隔完全独立且均 >=1；CF 安装参数 collect_interval=0 会兼容映射为 1 秒
+# Actual machine-wide collection periods. There is deliberately no report here.
 [intervals]
-# 采样间隔（秒）
-collect = 10
-# 上报间隔（秒）
-report = 60
-# 探测默认间隔（秒），[[pings]] 组未设 interval 时生效
+collect = 1
 ping = 30
-# 慢变指标（磁盘/连接数/进程数）采集间隔（秒）
 slow = 60
-# GPU 采集间隔（秒）
 gpu = 60
-# 公网 IP 查询间隔（秒）
 ip = 600
-# 磁盘 IO 采集间隔（秒）：Linux 读 /proc/diskstats 可高频；macOS 走 ioreg 子进程建议 >= 10
 diskio = 10
 
-# ===== 探测目标组：name 为唯一键（远端下发时整体替换，name 不可重复） =====
-# target 以 http(s):// 开头 → HTTP 探测；否则 TCP（host[:port]，默认 80）
-# interval 可选（秒），缺省跟随 intervals.ping
-# [[pings]]
-# name = "ct"
-# target = "gd-ct-dualstack.ip.zstaticcdn.com:80"
-# interval = 30
-#
-# [[pings]]
-# name = "baidu"
-# target = "https://www.baidu.com"
-# interval = 60
+# Global Ping workers. interval is optional and falls back to intervals.ping.
+[[pings]]
+name = "ct"
+target = "gd-ct-dualstack.ip.zstaticcdn.com:80"
+interval = 30
 
-# ===== 协议扩展（ext.*，本地或远端均可；注意必须放在文件最后，[[pings]] 之后） =====
-# CF 协议扩展：仅 protocol = "cf" 时生效
-[ext.cf]
-# 是否执行流量校正回路（应用 + 回传确认），缺省 true
+[[pings]]
+name = "cu"
+target = "gd-cu-dualstack.ip.zstaticcdn.com:80"
+interval = 30
+
+# All connections, including primary, are ordinary independent Reporters.
+[[reporters]]
+id = "primary"
+protocol = "cf" # probe | cf | komari
+server_id = "cf-server-uuid"
+secret = "cf-api-secret"
+worker_url = "https://monitor.example.com/update"
+config_version = ""
+report_interval = 30
+reset_day = 1
+interfaces = []
+report_gpu = true
+report_errors = true
+report_self = false
+# Missing ping_names means all global pings; [] means none.
+ping_names = ["ct", "cu"]
+
+[reporters.ext.cf]
 correction = true
-# 上报形状：true = 发送 samples[]；false = 只发单条 metrics，缺省 true
 batch = true
+
+[[reporters]]
+id = "komari"
+protocol = "komari"
+server_id = "my-host"
+secret = "komari-token"
+worker_url = "https://komari.example.com"
+config_version = ""
+report_interval = 1
+reset_day = 12
+interfaces = []
+report_gpu = true
+report_errors = true
+report_self = false
+ping_names = []
+
+[[reporters]]
+id = "local-demo"
+protocol = "probe"
+server_id = "my-host"
+secret = "change-me"
+worker_url = "http://127.0.0.1:8080/report"
+config_version = ""
+report_interval = 1
+reset_day = 1
+interfaces = []
+report_gpu = true
+report_errors = true
+report_self = true
+# Omit ping_names to publish all global ping results to this Reporter.

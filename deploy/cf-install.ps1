@@ -56,6 +56,10 @@ param(
     [Alias("tx_correction")]
     [string]$TxCorrection,
 
+    [Alias("reporter_id")]
+    [ValidatePattern('^[A-Za-z0-9_.-]+$')]
+    [string]$ReporterId = "primary",
+
     [switch]$Purge
 )
 
@@ -108,28 +112,80 @@ function ConvertTo-TomlString {
     return ConvertTo-Json -InputObject $Value -Compress
 }
 
-function Write-CfConfig {
-    $effectiveCollect = [Math]::Max(1, $CollectInterval)
+function New-CfReporterBlock {
     $lines = New-Object 'System.Collections.Generic.List[string]'
+    $lines.Add("[[reporters]]")
+    $lines.Add(("id = {0}" -f (ConvertTo-TomlString $ReporterId)))
+    $lines.Add('protocol = "cf"')
     $lines.Add(("server_id = {0}" -f (ConvertTo-TomlString $ServerId)))
     $lines.Add(("secret = {0}" -f (ConvertTo-TomlString $Secret)))
     $lines.Add(("worker_url = {0}" -f (ConvertTo-TomlString $WorkerUrl)))
-    $lines.Add('protocol = "cf"')
-    $lines.Add(("net_static_path = {0}" -f (ConvertTo-TomlString $NetStaticPath)))
-    $lines.Add("reset_day = $ResetDay")
     $lines.Add('config_version = ""')
+    $lines.Add("report_interval = $ReportInterval")
+    $lines.Add("reset_day = $ResetDay")
     $lines.Add("interfaces = []")
-    $lines.Add("enable_gpu = true")
+    $lines.Add("report_gpu = true")
     $lines.Add("report_errors = true")
     $lines.Add("report_self = false")
     $lines.Add("")
+    $lines.Add("[reporters.ext.cf]")
+    $lines.Add("correction = true")
+    $lines.Add("batch = true")
+    return $lines -join [Environment]::NewLine
+}
+
+function Remove-ReporterBlock {
+    param([string]$Text, [string]$Id)
+
+    $quotedId = ConvertTo-TomlString $Id
+    $blockPattern = '(?ms)^[ \t]*\[\[reporters\]\][ \t]*\r?\n(?<body>.*?)(?=^[ \t]*\[\[reporters\]\][ \t]*\r?$|\z)'
+    return [regex]::Replace($Text, $blockPattern, {
+            param($match)
+            $idPattern = '(?m)^[ \t]*id[ \t]*=[ \t]*' + [regex]::Escape($quotedId) + '[ \t]*\r?$'
+            if ([regex]::IsMatch($match.Groups['body'].Value, $idPattern)) { return '' }
+            return $match.Value
+        })
+}
+
+function Write-CfConfig {
+    $effectiveCollect = [Math]::Max(1, $CollectInterval)
+    if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) {
+        $existing = [IO.File]::ReadAllText($ConfigPath)
+        $firstReporter = [regex]::Match($existing, '(?m)^[ \t]*\[\[reporters\]\][ \t]*\r?$')
+        if ($firstReporter.Success) {
+            $global = $existing.Substring(0, $firstReporter.Index)
+            # Presence of a root connection identifies the deliberately unsupported legacy schema.
+            if ($global -notmatch '(?m)^[ \t]*server_id[ \t]*=') {
+                $updated = Remove-ReporterBlock $existing $ReporterId
+                $updated = ([regex]::new(
+                        '(?m)^[ \t]*enable_gpu[ \t]*=.*$'
+                    )).Replace($updated, 'enable_gpu = true', 1)
+                $updated = ([regex]::new(
+                        '(?ms)(^[ \t]*\[intervals\][ \t]*\r?$.*?^[ \t]*collect[ \t]*=[ \t]*)\d+'
+                    )).Replace($updated, {
+                        param($match)
+                        return $match.Groups[1].Value + $effectiveCollect
+                    }, 1)
+                $content = $updated.TrimEnd() + [Environment]::NewLine + [Environment]::NewLine +
+                    (New-CfReporterBlock) + [Environment]::NewLine
+                [IO.File]::WriteAllText($ConfigPath, $content, $Utf8NoBom)
+                Write-Host "Preserved canonical global config and upserted CF Reporter '$ReporterId'."
+                return
+            }
+        }
+    }
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $lines.Add(("net_static_path = {0}" -f (ConvertTo-TomlString $NetStaticPath)))
+    $lines.Add("enable_gpu = true")
+    $lines.Add("")
     $lines.Add("[intervals]")
     $lines.Add("collect = $effectiveCollect")
-    $lines.Add("report = $ReportInterval")
     $lines.Add("ping = 30")
     $lines.Add("slow = 60")
     $lines.Add("gpu = 60")
     $lines.Add("ip = 600")
+    $lines.Add("diskio = 10")
 
     foreach ($probe in @(
             @{ Name = "ct"; Target = $Ct },
@@ -146,9 +202,7 @@ function Write-CfConfig {
     }
 
     $lines.Add("")
-    $lines.Add("[ext.cf]")
-    $lines.Add("correction = true")
-    $lines.Add("batch = true")
+    $lines.Add((New-CfReporterBlock))
     [IO.File]::WriteAllLines($ConfigPath, $lines, $Utf8NoBom)
 }
 

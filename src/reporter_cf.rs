@@ -76,7 +76,7 @@ pub struct CfMetrics {
     pub kernel_version: String,
     pub cpu_info: String,
     pub cpu_cores: u32,
-    /// 探针标识（CF 存库展示；形如 0.0.0_probe-rs_0.1.0，可与官方探针区分）
+    /// 探针标识（CF 存库展示；形如 0.0.0_probe-rs_<版本>，可与官方探针区分）
     pub agent_version: String,
     /// 上报时刻（毫秒），CF 映射为 last_updated
     pub timestamp: i64,
@@ -329,45 +329,16 @@ pub struct CfPush {
     pub interface: Option<String>,
 }
 
-/// 把 CF 推送合成为通用 RemoteConfig（走 apply_remote 同一条热应用管线）。
-/// cur = 当前生效 intervals（CF 只下发 collect/report，其余四项保持现值）
-pub fn synthesize_remote(
-    push: &CfPush,
-    cur: &crate::model::Intervals,
-) -> crate::model::RemoteConfig {
-    let intervals =
-        (push.collect.is_some() || push.report.is_some()).then(|| crate::model::Intervals {
-            // 项目内部采集/上报严格分离，采集间隔至少 1 秒；兼容 CF 的 0 输入。
-            collect: push.collect.unwrap_or(cur.collect).max(1),
-            report: push.report.unwrap_or(cur.report),
-            ping: cur.ping,
-            slow: cur.slow,
-            gpu: cur.gpu,
-            ip: cur.ip,
-            diskio: cur.diskio,
-        });
-    let pings = push.custom.iter().any(Option::is_some).then(|| {
-        ["ct", "cu", "cm", "bd"]
-            .iter()
-            .zip(push.custom.iter())
-            .filter_map(|(name, target)| {
-                let target = target.as_ref()?;
-                // 空值 = 该组清空（不下发该组）
-                if target.is_empty() {
-                    return None;
-                }
-                Some(crate::model::PingTarget {
-                    name: (*name).to_string(),
-                    target: target.clone(),
-                    interval: None,
-                })
-            })
-            .collect()
-    });
+/// 把 CF 推送合成为 Reporter 远端配置。collect/custom ping 属于本机全局
+/// collection，故绝不由某个上报端修改。
+pub fn synthesize_remote(push: &CfPush, current_report: u64) -> crate::model::RemoteConfig {
     crate::model::RemoteConfig {
         config_version: push.version.clone(),
+        report_interval: push
+            .report
+            .map(|value| value.max(1))
+            .or_else(|| push.collect.is_some().then_some(current_report)),
         reset_day: push.reset_day,
-        intervals,
         interfaces: push.interface.as_ref().map(|s| {
             s.split(',')
                 .map(str::trim)
@@ -375,10 +346,9 @@ pub fn synthesize_remote(
                 .map(str::to_string)
                 .collect()
         }),
-        enable_gpu: None,
+        report_gpu: None,
         report_errors: None,
         report_self: None,
-        pings,
         ext: None,
     }
 }
@@ -534,6 +504,7 @@ mod tests {
             net_tx_speed: Some(7_600),
             net_rx_monthly: Some(594_000),
             net_tx_monthly: Some(467_000),
+            net_interfaces: Default::default(),
         };
         let slow = SlowBlock {
             ts: 999,
@@ -635,8 +606,8 @@ mod tests {
             custom: [None, None, None, None],
             interface: Some("eth0, eth1,,bond*".into()),
         };
-        let remote = synthesize_remote(&push, &crate::model::Intervals::default());
-        assert_eq!(remote.intervals.unwrap().collect, 1);
+        let remote = synthesize_remote(&push, 30);
+        assert_eq!(remote.report_interval, Some(60));
         assert_eq!(remote.interfaces.unwrap(), vec!["eth0", "eth1", "bond*"]);
     }
 

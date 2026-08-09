@@ -153,6 +153,7 @@ mod tests {
             net_tx_speed: Some(512),
             net_rx_monthly: Some(1),
             net_tx_monthly: Some(2),
+            net_interfaces: Default::default(),
         };
         let slow = SlowBlock {
             ts: 999,

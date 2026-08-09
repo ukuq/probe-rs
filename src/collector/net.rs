@@ -71,6 +71,7 @@ pub struct NetBytes {
 #[derive(Debug, Clone)]
 pub struct IfaceFilter {
     whitelist: Option<GlobSet>,
+    allow_all: bool,
 }
 
 impl IfaceFilter {
@@ -100,10 +101,22 @@ impl IfaceFilter {
             } else {
                 None
             },
+            allow_all: false,
+        }
+    }
+
+    /// 内部逐网卡账本使用：不过滤任何接口，出口仍按各 Reporter 的过滤器聚合。
+    pub fn all() -> Self {
+        Self {
+            whitelist: None,
+            allow_all: true,
         }
     }
 
     pub fn includes(&self, name: &str) -> bool {
+        if self.allow_all {
+            return true;
+        }
         match &self.whitelist {
             Some(set) => set.is_match(name),
             None => !is_default_excluded(name),
@@ -128,18 +141,6 @@ pub fn scan_net_dev(mut f: impl FnMut(&str, u64, u64)) {
             fields[8].parse::<u64>().unwrap_or(0),
         );
     });
-}
-
-#[cfg(target_os = "linux")]
-pub fn read_net_bytes(filter: &IfaceFilter) -> NetBytes {
-    let mut total = NetBytes::default();
-    scan_net_dev(|name, rx, tx| {
-        if filter.includes(name) {
-            total.rx += rx;
-            total.tx += tx;
-        }
-    });
-    total
 }
 
 /// 计数器回退（重启/换卡）时 delta 记 0，绝不出错误增量

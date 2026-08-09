@@ -74,7 +74,7 @@ fn kind_of(target: &str) -> PingKind {
     }
 }
 
-/// 单目标循环：interval 缺省时跟随全局 intervals.ping（远端可调）
+/// 单目标循环：interval 缺省时跟随全局 intervals.ping（仅本地配置）
 async fn target_loop(
     target: PingTarget,
     tx: watch::Sender<PingSnapshot>,

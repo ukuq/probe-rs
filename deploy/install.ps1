@@ -52,7 +52,9 @@ function Test-PlaceholderConfig {
     param([string]$Path)
 
     $text = [IO.File]::ReadAllText($Path)
-    return $text -match '(?m)^server_id\s*=\s*"srv-01"\s*$' -or
+    return $text -match '(?m)^server_id\s*=\s*"cf-server-uuid"\s*$' -or
+        $text -match '(?m)^worker_url\s*=\s*"https://monitor\.example\.com/update"\s*$' -or
+        $text -match '(?m)^worker_url\s*=\s*"https://komari\.example\.com"\s*$' -or
         $text -match '(?m)^worker_url\s*=\s*"https://monitor\.example\.com/report"\s*$'
 }
 
@@ -151,10 +153,25 @@ function Write-InitialConfig {
     }
     else {
         $content = @"
+net_static_path = '$NetStaticPath'
+enable_gpu = false
+
+[intervals]
+collect = 10
+ping = 30
+slow = 60
+gpu = 60
+ip = 600
+diskio = 10
+
+[[reporters]]
+id = "primary"
+protocol = "probe"
 server_id = "srv-01"
 secret = "change-me"
 worker_url = "https://monitor.example.com/report"
-net_static_path = '$NetStaticPath'
+report_interval = 60
+reset_day = 1
 "@
     }
     [IO.File]::WriteAllText($ConfigPath, $content, $Utf8NoBom)

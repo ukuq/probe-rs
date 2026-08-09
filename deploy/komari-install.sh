@@ -33,6 +33,7 @@ usage() {
   --include-nics <列表> 网卡白名单，逗号分隔（映射 interfaces）
   --install-version <v> 指定 probe-rs 版本（缺省 latest）
   --name <名称>         客户端名（缺省主机名）
+  --reporter-id <id>   已有配置中追加/更新的 Reporter id（缺省 komari）
   -bin=<路径或URL>      二进制来源（缺省 GitHub Releases 按架构下载）
 兼容忽略（仅提示）：--disable-web-ssh / --disable-auto-update / --ignore-unsafe-cert 等其余官方参数
 EOF
@@ -63,7 +64,7 @@ fi
 [ $# -gt 0 ] || { usage; exit 1; }
 
 ENDPOINT=""; TOKEN=""; INTERVAL=3; RESET_DAY=1; NAME=""; BIN=""
-ENABLE_GPU=false; INTERFACES=""; VERSION=""
+ENABLE_GPU=false; INTERFACES=""; VERSION=""; REPORTER_ID="komari"
 # 需要吞掉一个值的官方参数（接受但忽略）
 IGNORED_WITH_VALUE="--auto-discovery --max-retries -r --reconnect-interval -c --info-report-interval --exclude-nics --include-mountpoint --custom-dns --custom-ipv4 --custom-ipv6 --config --protocol-version --prefer-ip-version --install-dir --install-service-name --install-ghproxy"
 # 纯标志位官方参数
@@ -79,6 +80,7 @@ while [ $# -gt 0 ]; do
         --include-nics)      INTERFACES="$2"; shift 2 ;;
         --install-version)   VERSION="$2"; shift 2 ;;
         --name)              NAME="$2"; shift 2 ;;
+        --reporter-id)       REPORTER_ID="$2"; shift 2 ;;
         -bin=*)              BIN="${1#-bin=}"; shift ;;
         -h|--help)           usage; exit 0 ;;
         *)
@@ -91,6 +93,10 @@ while [ $# -gt 0 ]; do
             fi ;;
     esac
 done
+
+case "$REPORTER_ID" in
+    ''|*[!A-Za-z0-9_.-]*) die "--reporter-id must use A-Z, a-z, 0-9, _, . or -" ;;
+esac
 
 [ "$(id -u)" = 0 ] || die "需要 root（sudo 或 root 执行）"
 [ -n "$ENDPOINT" ] || die "缺少 -e <面板地址>"
@@ -142,29 +148,104 @@ rm -f "$TMP_BIN"
 # ---- 配置 ----
 install -d -m 0755 "$DATA_DIR"
 install -d -m 0750 "$CONF_DIR"
-cat > "$CONF_DIR/config.toml" <<EOF
+CONFIG_PATH="$CONF_DIR/config.toml"
+
+# Remove one complete [[reporters]] subtree while preserving all other
+# reporters and any root tables serialized after it.
+remove_reporter_block() {
+    cfg="$1"; target="$2"; tmp=$(mktemp "$CONF_DIR/config.toml.XXXXXX")
+    awk -v target="$target" '
+        function flush() {
+            if (in_reporter && !drop) printf "%s", block
+            block=""; drop=0
+        }
+        /^[[:space:]]*\[\[reporters\]\][[:space:]]*$/ {
+            if (in_reporter) flush()
+            in_reporter=1; block=$0 ORS; next
+        }
+        {
+            if (in_reporter && $0 ~ /^[[:space:]]*\[/ &&
+                $0 !~ /^[[:space:]]*\[\[?reporters(\.|\]\])/) {
+                flush(); in_reporter=0
+            }
+            if (in_reporter) {
+                block=block $0 ORS
+                if ($0 ~ /^[[:space:]]*id[[:space:]]*=/) {
+                    value=$0
+                    sub(/^[^=]*=[[:space:]]*"/, "", value)
+                    sub(/"[[:space:]]*(#.*)?$/, "", value)
+                    if (value == target) drop=1
+                }
+            } else print
+        }
+        END { if (in_reporter) flush() }
+    ' "$cfg" > "$tmp"
+    mv -f "$tmp" "$cfg"
+}
+
+if [ -s "$CONFIG_PATH" ] &&
+   grep -q '^[[:space:]]*\[\[reporters\]\]' "$CONFIG_PATH" &&
+   ! awk '
+       /^[[:space:]]*\[/ { exit }
+       /^[[:space:]]*server_id[[:space:]]*=/ { found=1 }
+       END { exit found ? 0 : 1 }
+   ' "$CONFIG_PATH"; then
+    # --gpu 表示需要实际 GPU worker；已有多路配置中只允许把全局开关打开，
+    # 不因某一路未传 --gpu 而关闭其他 Reporter 正在使用的采集。
+    if [ "$ENABLE_GPU" = true ]; then
+        sed -i '0,/^[[:space:]]*enable_gpu[[:space:]]*=.*/s//enable_gpu = true/' "$CONFIG_PATH"
+    fi
+    remove_reporter_block "$CONFIG_PATH" "$REPORTER_ID"
+    cat >> "$CONFIG_PATH" <<EOF
+
+[[reporters]]
+id = "$REPORTER_ID"
+protocol = "komari"
 server_id = "$NAME"
 secret = "$TOKEN_ESC"
 worker_url = "$ENDPOINT_ESC"
-protocol = "komari"
-net_static_path = "$DATA_DIR/net_static.json"
-reset_day = $RESET_DAY
 config_version = ""
+report_interval = $INTERVAL
+reset_day = $RESET_DAY
 interfaces = $INTERFACES_TOML
-enable_gpu = $ENABLE_GPU
+report_gpu = $ENABLE_GPU
 report_errors = true
 report_self = false
+ping_names = []
+EOF
+    log "preserved global collectors and upserted Komari Reporter '$REPORTER_ID'"
+else
+    # 缺失配置或旧的根连接 schema 都直接覆盖为新 canonical 格式，不做兼容迁移。
+cat > "$CONFIG_PATH" <<EOF
+net_static_path = "$DATA_DIR/net_static.json"
+enable_gpu = $ENABLE_GPU
 
 [intervals]
 collect = 1
-report = $INTERVAL
 ping = 30
 slow = 60
 gpu = 60
 ip = 600
-# diskio 缺省 10s，不显式写出（兼容 0.1.x 已发布二进制的 deny_unknown_fields）
+diskio = 10
+
+[[reporters]]
+id = "$REPORTER_ID"
+protocol = "komari"
+server_id = "$NAME"
+secret = "$TOKEN_ESC"
+worker_url = "$ENDPOINT_ESC"
+config_version = ""
+report_interval = $INTERVAL
+reset_day = $RESET_DAY
+interfaces = $INTERFACES_TOML
+report_gpu = $ENABLE_GPU
+report_errors = true
+report_self = false
+ping_names = []
 EOF
-chmod 600 "$CONF_DIR/config.toml"
+    log "wrote a fresh canonical config with Komari Reporter '$REPORTER_ID'"
+fi
+chmod 600 "$CONFIG_PATH"
 
 # ---- systemd unit ----
 cat > "$UNIT_DST" <<'EOF'

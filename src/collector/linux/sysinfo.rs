@@ -11,7 +11,7 @@ pub fn collect(
     ipv6: Option<String>,
     gpu_name: Option<String>,
     agent_version: &str,
-    cfg: &crate::config::LocalConfig,
+    cfg: &crate::model::StaticConfig,
 ) -> StaticInfo {
     let (mem_total, _, swap_total, _) = mem::collect();
     let (disk_total, _) = disk::collect();
@@ -32,16 +32,7 @@ pub fn collect(
         ipv4,
         ipv6,
         agent_version: agent_version.to_string(),
-        config: crate::model::StaticConfig {
-            intervals: cfg.intervals,
-            reset_day: cfg.reset_day,
-            interfaces: cfg.interfaces.clone(),
-            enable_gpu: cfg.enable_gpu,
-            report_errors: cfg.report_errors,
-            report_self: cfg.report_self,
-            pings: cfg.pings.clone(),
-            ext: cfg.ext.clone(),
-        },
+        config: cfg.clone(),
     }
 }
 
@@ -186,17 +177,11 @@ mod tests {
         if !std::path::Path::new("/proc/stat").exists() {
             return;
         }
-        let cfg = crate::config::LocalConfig {
-            server_id: "test".into(),
-            secret: String::new(),
-            worker_url: String::new(),
-            protocol: "probe".into(),
+        let cfg = crate::model::StaticConfig {
             intervals: crate::model::Intervals::default(),
             reset_day: 1,
-            config_version: String::new(),
             interfaces: vec![],
             enable_gpu: false,
-            net_static_path: String::new(),
             pings: vec![],
             report_errors: true,
             report_self: false,

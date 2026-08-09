@@ -6,6 +6,7 @@
 //! - agent.terminal.request → 拨 terminal WS 发一句说明后关闭，浏览器立即看到提示
 //!   （否则面板要空转 30s 超时）
 //! - agent.ping → 回 agent.pingResult value=-1（与官方"unsupported ping type"一致）
+//!
 //! 我们从不调用 agent.pull 声明能力，正常服务端不会排队这些事件。
 //! 断线只保留最新报告（komari 无 ts/批量语义，旧数据无重发价值）。
 
@@ -39,7 +40,6 @@ pub fn spawn(
     buffers: Arc<Buffers>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let ws_url = to_ws_url(&endpoint, &token);
         loop {
             match run_session(&endpoint, &token, &mut out_rx).await {
                 Ok(()) => tracing::warn!("komari WS 连接结束，5s 后重连"),

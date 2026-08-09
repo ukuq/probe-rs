@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// 上报报文，对应 REPORT.md §完整报文示例
@@ -80,6 +82,17 @@ pub struct DynamicRecord {
     pub net_tx_speed: Option<u64>,
     pub net_rx_monthly: Option<u64>,
     pub net_tx_monthly: Option<u64>,
+    /// 内部逐网卡快照：多 Reporter 在出口按各自 interfaces 聚合，不进入任何协议报文。
+    #[serde(skip)]
+    pub net_interfaces: BTreeMap<String, NetInterfaceSample>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NetInterfaceSample {
+    pub rx: u64,
+    pub tx: u64,
+    pub rx_speed: u64,
+    pub tx_speed: u64,
 }
 
 /// 慢变指标块：由 slow worker 测量，ts 为真实测量时刻
@@ -177,29 +190,116 @@ pub struct PingTarget {
     pub interval: Option<u64>,
 }
 
-/// 服务端通过上报响应下发的远端配置（config 一级内，全部字段可选，
-/// 出现的字段才应用）。🔒 server_id/secret/worker_url/net_static_path/protocol 永不下发
+/// 全局实际采集/异步 worker 周期。上报周期不属于这里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectionIntervals {
+    pub collect: u64,
+    #[serde(default = "default_ping_interval")]
+    pub ping: u64,
+    #[serde(default = "default_slow_interval")]
+    pub slow: u64,
+    #[serde(default = "default_gpu_interval")]
+    pub gpu: u64,
+    #[serde(default = "default_ip_interval")]
+    pub ip: u64,
+    #[serde(default = "default_diskio_interval")]
+    pub diskio: u64,
+}
+
+impl Default for CollectionIntervals {
+    fn default() -> Self {
+        Self {
+            collect: 10,
+            ping: default_ping_interval(),
+            slow: default_slow_interval(),
+            gpu: default_gpu_interval(),
+            ip: default_ip_interval(),
+            diskio: default_diskio_interval(),
+        }
+    }
+}
+
+impl CollectionIntervals {
+    pub fn validate(&self) -> Result<(), String> {
+        for (key, value) in [
+            ("collect", self.collect),
+            ("ping", self.ping),
+            ("slow", self.slow),
+            ("gpu", self.gpu),
+            ("ip", self.ip),
+            ("diskio", self.diskio),
+        ] {
+            if value == 0 {
+                return Err(format!("intervals.{key} 必须 >= 1 秒"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn with_report(self, report: u64) -> Intervals {
+        Intervals {
+            collect: self.collect,
+            report,
+            ping: self.ping,
+            slow: self.slow,
+            gpu: self.gpu,
+            ip: self.ip,
+            diskio: self.diskio,
+        }
+    }
+}
+
+/// 一条独立上报线路；所有连接信息和输出策略都只存在于 Reporter 内。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReporterConfig {
+    pub id: String,
+    pub protocol: String,
+    pub server_id: String,
+    pub secret: String,
+    pub worker_url: String,
+    #[serde(default, deserialize_with = "de_config_version")]
+    pub config_version: String,
+    pub report_interval: u64,
+    #[serde(default = "default_reset_day")]
+    pub reset_day: u8,
+    #[serde(default)]
+    pub interfaces: Vec<String>,
+    #[serde(default)]
+    pub report_gpu: Option<bool>,
+    #[serde(default = "default_true")]
+    pub report_errors: bool,
+    #[serde(default)]
+    pub report_self: bool,
+    /// 缺席 = 上报全部全局 ping；空数组 = 不上报 ping。
+    #[serde(default)]
+    pub ping_names: Option<Vec<String>>,
+    #[serde(default)]
+    pub ext: ExtConfig,
+}
+
+/// 服务端通过上报响应下发的远端配置（config 一级内，config_version 必填，
+/// 其余字段出现才应用）。🔒 全局采集字段与连接身份永不下发。
 #[derive(Debug, Clone, Deserialize)]
 pub struct RemoteConfig {
     /// 版本字符串；不等才应用（>= 语义对人类可读时间戳不可靠）
     #[serde(deserialize_with = "de_config_version")]
     pub config_version: String,
     #[serde(default)]
-    pub reset_day: Option<u8>,
+    pub report_interval: Option<u64>,
     #[serde(default)]
-    pub intervals: Option<Intervals>,
+    pub reset_day: Option<u8>,
     #[serde(default)]
     pub interfaces: Option<Vec<String>>,
     #[serde(default)]
-    pub enable_gpu: Option<bool>,
+    pub report_gpu: Option<bool>,
     /// 是否上报 errors 错误事件（默认 true）
     #[serde(default)]
     pub report_errors: Option<bool>,
     /// 是否上报探针自身资源占用 kind:"self"（默认 false）
     #[serde(default)]
     pub report_self: Option<bool>,
-    #[serde(default)]
-    pub pings: Option<Vec<PingTarget>>,
     /// 协议扩展配置（ext.*；仅对应协议启用时生效）
     #[serde(default)]
     pub ext: Option<RemoteExt>,
@@ -256,6 +356,14 @@ fn default_cf_true() -> bool {
     true
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_reset_day() -> u8 {
+    1
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Intervals {
@@ -303,6 +411,7 @@ impl Default for Intervals {
     }
 }
 
+#[cfg(test)]
 impl Intervals {
     /// 仅要求各项 >= 1 秒。各间隔之间没有任何关系约束：
     /// report 时把缓冲全部发出即可，异步源按自己的 ts 新鲜度去重

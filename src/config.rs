@@ -5,53 +5,69 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use crate::model::{ExtConfig, Intervals, PingTarget, RemoteConfig};
+use crate::model::{
+    CollectionIntervals, ExtConfig, Intervals, PingTarget, RemoteConfig, ReporterConfig,
+    StaticConfig,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalConfig {
-    pub server_id: String,
-    pub secret: String,
-    pub worker_url: String,
-    /// 🔒 协议类型："probe"（默认）| "cf"；仅本地修改，重启生效，远端不可下发
-    #[serde(default = "default_protocol")]
-    pub protocol: String,
-    pub intervals: Intervals,
-    #[serde(default = "default_reset_day")]
-    pub reset_day: u8,
-    /// 版本字符串（UTC+8 时间戳格式）；空串 = 从未下发过
-    /// CF 模式下复用为 CF 配置 MD5（服务端响应头给出，回显幂等）
-    #[serde(default, deserialize_with = "crate::model::de_config_version")]
-    pub config_version: String,
-    #[serde(default)]
-    pub interfaces: Vec<String>,
+    /// 实际 collector/async worker 周期；不含任何上报周期。
+    pub intervals: CollectionIntervals,
+    /// 是否实际启动 GPU worker。各 Reporter 只能决定是否输出 GPU。
     #[serde(default)]
     pub enable_gpu: bool,
     #[serde(default = "default_net_static_path")]
     pub net_static_path: String,
+    /// 全局 Ping worker 定义；Reporter 仅用 ping_names 选择输出子集。
     #[serde(default)]
     pub pings: Vec<PingTarget>,
-    /// 是否上报 errors 错误事件（默认 true）
-    #[serde(default = "default_report_errors")]
+    /// 所有独立上报实例，包括 id="primary"。
+    pub reporters: Vec<ReporterConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReporterSpec {
+    pub id: String,
+    pub protocol: String,
+    pub server_id: String,
+    pub secret: String,
+    pub worker_url: String,
+    pub config_version: String,
+    pub intervals: Intervals,
+    pub reset_day: u8,
+    pub interfaces: Vec<String>,
+    pub report_gpu: bool,
     pub report_errors: bool,
-    /// 是否上报探针自身资源占用 kind:"self"（默认 false）
-    #[serde(default)]
     pub report_self: bool,
-    /// 协议扩展配置（ext.*；须为结构体最后一个字段，保证 TOML 表格次序合法）
-    #[serde(default)]
+    pub pings: Vec<PingTarget>,
     pub ext: ExtConfig,
 }
 
-fn default_protocol() -> String {
-    "probe".into()
-}
+impl ReporterSpec {
+    pub fn connection_key(&self) -> (&str, &str, &str, &str, &str) {
+        (
+            &self.id,
+            &self.protocol,
+            &self.server_id,
+            &self.secret,
+            &self.worker_url,
+        )
+    }
 
-fn default_report_errors() -> bool {
-    true
-}
-
-fn default_reset_day() -> u8 {
-    1
+    pub fn static_config(&self) -> StaticConfig {
+        StaticConfig {
+            reset_day: self.reset_day,
+            intervals: self.intervals,
+            interfaces: self.interfaces.clone(),
+            enable_gpu: self.report_gpu,
+            report_errors: self.report_errors,
+            report_self: self.report_self,
+            pings: self.pings.clone(),
+            ext: self.ext.clone(),
+        }
+    }
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -90,38 +106,149 @@ fn platform_config_dir() -> PathBuf {
 
 impl LocalConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.server_id.trim().is_empty() {
-            bail!("server_id 不能为空");
-        }
-        if self.secret.trim().is_empty() {
-            bail!("secret 不能为空");
-        }
-        let url = self.worker_url.trim();
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            bail!("worker_url 必须是 http(s) URL");
-        }
-        if !["probe", "cf", "komari"].contains(&self.protocol.as_str()) {
-            bail!("protocol 必须是 \"probe\" / \"cf\" / \"komari\"");
-        }
         self.intervals.validate().map_err(anyhow::Error::msg)?;
-        if self.reset_day > 31 {
-            bail!("reset_day 必须在 0-31 之间");
+        validate_pings(&self.pings)?;
+        if self.reporters.is_empty() {
+            bail!("至少需要一个 [[reporters]]");
         }
-        for p in &self.pings {
-            if p.name.trim().is_empty() {
-                bail!("探测目标 name 不能为空");
+        let mut ids = std::collections::HashSet::new();
+        let global_ping_names: std::collections::HashSet<&str> =
+            self.pings.iter().map(|p| p.name.as_str()).collect();
+        for reporter in &self.reporters {
+            if reporter.id.trim().is_empty() {
+                bail!("reporters.id 不能为空");
             }
-            if p.target.trim().is_empty() {
-                bail!("探测目标 {} 的 target 不能为空", p.name);
+            if !ids.insert(reporter.id.clone()) {
+                bail!("reporters.id 重复: {}", reporter.id);
             }
-            if let Some(i) = p.interval {
-                if i == 0 {
-                    bail!("探测目标 {} 的 interval 必须 >= 1 秒", p.name);
+            validate_connection(
+                &reporter.protocol,
+                &reporter.server_id,
+                &reporter.secret,
+                &reporter.worker_url,
+            )?;
+            if reporter.report_interval == 0 {
+                bail!("reporter {} report_interval 必须 >= 1", reporter.id);
+            }
+            if reporter.reset_day > 31 {
+                bail!("reporter {} reset_day 必须在 0-31 之间", reporter.id);
+            }
+            validate_interfaces(&reporter.interfaces)?;
+            if let Some(names) = &reporter.ping_names {
+                let mut selected = std::collections::HashSet::new();
+                for name in names {
+                    if !selected.insert(name) {
+                        bail!("reporter {} ping_names 重复: {name}", reporter.id);
+                    }
+                    if !global_ping_names.contains(name.as_str()) {
+                        bail!("reporter {} 引用了不存在的全局 ping: {name}", reporter.id);
+                    }
                 }
             }
         }
         Ok(())
     }
+
+    pub fn reporter_specs(&self) -> Vec<ReporterSpec> {
+        self.reporters
+            .iter()
+            .map(|r| {
+                let pings = match &r.ping_names {
+                    None => self.pings.clone(),
+                    Some(names) => self
+                        .pings
+                        .iter()
+                        .filter(|ping| names.contains(&ping.name))
+                        .cloned()
+                        .collect(),
+                };
+                ReporterSpec {
+                    id: r.id.clone(),
+                    protocol: r.protocol.clone(),
+                    server_id: r.server_id.clone(),
+                    secret: r.secret.clone(),
+                    worker_url: r.worker_url.clone(),
+                    config_version: r.config_version.clone(),
+                    intervals: self.intervals.with_report(r.report_interval),
+                    reset_day: r.reset_day,
+                    interfaces: r.interfaces.clone(),
+                    report_gpu: r.report_gpu.unwrap_or(r.protocol == "cf"),
+                    report_errors: r.report_errors,
+                    report_self: r.report_self,
+                    pings,
+                    ext: r.ext.clone(),
+                }
+            })
+            .collect()
+    }
+
+    pub fn reporter(&self, id: &str) -> Option<ReporterSpec> {
+        self.reporter_specs().into_iter().find(|r| r.id == id)
+    }
+
+    pub fn effective_intervals(&self) -> Intervals {
+        // report 仅为旧的内部载体占位；任何 Reporter 变更都不会触发 collector ticker。
+        self.intervals.with_report(1)
+    }
+
+    pub fn effective_gpu(&self) -> bool {
+        self.enable_gpu
+    }
+
+    pub fn effective_pings(&self) -> Vec<PingTarget> {
+        self.pings
+            .iter()
+            .cloned()
+            .map(|mut ping| {
+                ping.interval = Some(ping.interval.unwrap_or(self.intervals.ping));
+                ping
+            })
+            .collect()
+    }
+}
+
+fn validate_connection(protocol: &str, server_id: &str, secret: &str, url: &str) -> Result<()> {
+    if server_id.trim().is_empty() {
+        bail!("server_id 不能为空");
+    }
+    if secret.trim().is_empty() {
+        bail!("secret 不能为空");
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        bail!("worker_url 必须是 http(s) URL");
+    }
+    if !["probe", "cf", "komari"].contains(&protocol) {
+        bail!("protocol 必须是 probe / cf / komari");
+    }
+    Ok(())
+}
+
+fn validate_interfaces(interfaces: &[String]) -> Result<()> {
+    for pattern in interfaces {
+        let p = pattern.trim();
+        if p.is_empty() || p.len() > 64 {
+            bail!("interfaces 参数非法: {pattern:?}");
+        }
+        globset::Glob::new(p)
+            .map_err(|e| anyhow::anyhow!("interfaces glob 非法 {pattern:?}: {e}"))?;
+    }
+    Ok(())
+}
+
+fn validate_pings(pings: &[PingTarget]) -> Result<()> {
+    let mut names = std::collections::HashSet::new();
+    for ping in pings {
+        if ping.name.trim().is_empty() || ping.target.trim().is_empty() {
+            bail!("ping name/target 不能为空");
+        }
+        if !names.insert(&ping.name) {
+            bail!("ping name 重复: {}", ping.name);
+        }
+        if ping.interval == Some(0) {
+            bail!("ping {} interval 必须 >= 1", ping.name);
+        }
+    }
+    Ok(())
 }
 
 /// 共享运行时配置：本地配置 + intervals 变更通知（scheduler 重建 ticker）
@@ -142,7 +269,7 @@ impl SharedConfig {
         watch::Receiver<Intervals>,
         watch::Receiver<LocalConfig>,
     ) {
-        let (tx, rx) = watch::channel(cfg.intervals);
+        let (tx, rx) = watch::channel(cfg.effective_intervals());
         let (config_tx, config_rx) = watch::channel(cfg.clone());
         (
             Arc::new(Self {
@@ -160,13 +287,20 @@ impl SharedConfig {
         self.inner.read().expect("config lock poisoned").clone()
     }
 
+    pub fn subscribe_config(&self) -> watch::Receiver<LocalConfig> {
+        self.config_tx.subscribe()
+    }
+
     /// 本地文件热加载：整体替换（文件是唯一事实源，远端应用也会回写文件）。
     /// 仅在 intervals 变化时通知 scheduler 重建 ticker
     pub fn update_local(&self, cfg: LocalConfig) {
         let mut guard = self.inner.write().expect("config lock poisoned");
+        let effective = cfg.effective_intervals();
+        *guard = cfg.clone();
+        drop(guard);
         self.intervals_tx.send_if_modified(|cur| {
-            if *cur != cfg.intervals {
-                *cur = cfg.intervals;
+            if *cur != effective {
+                *cur = effective;
                 true
             } else {
                 false
@@ -180,78 +314,105 @@ impl SharedConfig {
                 false
             }
         });
-        *guard = cfg;
     }
 
-    /// 应用远端配置：整体校验通过才应用 + 落盘；version 不更大则忽略。
-    /// intervals/reset_day/interfaces 立即更新到内存（intervals 经 watch 触发热重建）；
-    /// pings/enable_gpu 写入文件后由热加载监听（≤3s）重建对应 worker
+    #[cfg(test)]
     pub fn apply_remote(&self, remote: RemoteConfig) -> Result<()> {
+        self.apply_remote_for("primary", remote)
+    }
+
+    /// 远端配置只写入产生它的 Reporter；全局采集配置永不受上报端影响。
+    pub fn apply_remote_for(&self, reporter_id: &str, remote: RemoteConfig) -> Result<()> {
         {
             let current = self.inner.read().expect("config lock poisoned");
-            // != 判断：版本不同才应用（幂等：同版本跳过）
-            if remote.config_version.is_empty() || remote.config_version == current.config_version {
+            let version = current
+                .reporter(reporter_id)
+                .ok_or_else(|| anyhow::anyhow!("Reporter 不存在: {reporter_id}"))?
+                .config_version;
+            if remote.config_version.is_empty() || remote.config_version == version {
                 return Ok(());
             }
         }
         validate_remote(&remote)?;
         let mut cfg = self.inner.write().expect("config lock poisoned");
-        // 二次检查，避免读锁释放期间被其他响应抢先应用
-        if remote.config_version == cfg.config_version {
+        if remote.config_version
+            == cfg
+                .reporter(reporter_id)
+                .ok_or_else(|| anyhow::anyhow!("Reporter 不存在: {reporter_id}"))?
+                .config_version
+        {
             return Ok(());
         }
-        // 先在副本上改、落盘成功才换入内存：落盘失败时内存与磁盘保持一致，
-        // 版本号不会被提前吃掉导致服务端永远不再重发
+        let RemoteConfig {
+            config_version,
+            report_interval,
+            reset_day,
+            interfaces,
+            report_gpu,
+            report_errors,
+            report_self,
+            ext,
+        } = remote;
         let mut next = cfg.clone();
-        if let Some(intervals) = remote.intervals {
-            next.intervals = intervals;
+        let reporter = next
+            .reporters
+            .iter_mut()
+            .find(|r| r.id == reporter_id)
+            .ok_or_else(|| anyhow::anyhow!("Reporter 不存在: {reporter_id}"))?;
+        if let Some(value) = report_interval {
+            reporter.report_interval = value;
         }
-        if let Some(reset_day) = remote.reset_day {
-            next.reset_day = reset_day;
+        if let Some(value) = reset_day {
+            reporter.reset_day = value;
         }
-        if let Some(interfaces) = remote.interfaces {
-            next.interfaces = interfaces;
+        if let Some(value) = interfaces {
+            reporter.interfaces = value;
         }
-        if let Some(pings) = remote.pings {
-            next.pings = pings;
+        if let Some(value) = report_gpu {
+            reporter.report_gpu = Some(value);
         }
-        if let Some(enable_gpu) = remote.enable_gpu {
-            next.enable_gpu = enable_gpu;
+        if let Some(value) = report_errors {
+            reporter.report_errors = value;
         }
-        if let Some(report_errors) = remote.report_errors {
-            next.report_errors = report_errors;
+        if let Some(value) = report_self {
+            reporter.report_self = value;
         }
-        if let Some(report_self) = remote.report_self {
-            next.report_self = report_self;
-        }
-        if let Some(ext) = remote.ext {
-            if let Some(cf) = ext.cf {
-                if let Some(correction) = cf.correction {
-                    next.ext.cf.correction = correction;
+        if let Some(value) = ext {
+            if let Some(cf) = value.cf {
+                if let Some(value) = cf.correction {
+                    reporter.ext.cf.correction = value;
                 }
-                if let Some(batch) = cf.batch {
-                    next.ext.cf.batch = batch;
+                if let Some(value) = cf.batch {
+                    reporter.ext.cf.batch = value;
                 }
             }
         }
-        let version = remote.config_version;
-        next.config_version = version.clone();
+        reporter.config_version = config_version.clone();
+        next.validate()
+            .context("remote Reporter config is invalid")?;
         persist(&self.path, &next).context("远端配置落盘失败")?;
-        let intervals = next.intervals;
+        let effective = next.effective_intervals();
         let full = next.clone();
         *cfg = next;
         drop(cfg);
-        self.intervals_tx.send_replace(intervals);
+        self.intervals_tx.send_if_modified(|current| {
+            if *current != effective {
+                *current = effective;
+                true
+            } else {
+                false
+            }
+        });
         self.config_tx.send_replace(full);
-        tracing::info!(config_version = version, "远端配置已应用");
+        tracing::info!(reporter_id, config_version, "Reporter 远端配置已应用");
         Ok(())
     }
 }
 
 /// 远端配置整体校验：任何一项非法则整体拒绝
 fn validate_remote(remote: &RemoteConfig) -> Result<()> {
-    if let Some(intervals) = &remote.intervals {
-        intervals.validate().map_err(anyhow::Error::msg)?;
+    if remote.report_interval == Some(0) {
+        bail!("远端 report_interval 必须 >= 1");
     }
     if let Some(reset_day) = remote.reset_day {
         if reset_day > 31 {
@@ -266,25 +427,6 @@ fn validate_remote(remote: &RemoteConfig) -> Result<()> {
             }
             globset::Glob::new(p)
                 .map_err(|e| anyhow::anyhow!("远端 interfaces glob 非法 {pattern:?}: {e}"))?;
-        }
-    }
-    if let Some(pings) = &remote.pings {
-        let mut names = std::collections::HashSet::new();
-        for p in pings {
-            if p.name.trim().is_empty() {
-                bail!("远端 pings 存在空 name");
-            }
-            if p.target.trim().is_empty() {
-                bail!("远端 pings 目标 {} 的 target 为空", p.name);
-            }
-            if !names.insert(p.name.clone()) {
-                bail!("远端 pings name 重复: {}", p.name);
-            }
-            if let Some(i) = p.interval {
-                if i == 0 {
-                    bail!("远端 pings 目标 {} 的 interval 必须 >= 1 秒", p.name);
-                }
-            }
         }
     }
     Ok(())
@@ -322,25 +464,34 @@ mod tests {
 
     fn base_config() -> LocalConfig {
         LocalConfig {
-            server_id: "s1".into(),
-            secret: "sec".into(),
-            worker_url: "https://example.com/report".into(),
-            protocol: "probe".into(),
-            intervals: Intervals {
+            intervals: CollectionIntervals {
                 collect: 10,
-                report: 60,
                 ping: 30,
                 ..Default::default()
             },
-            reset_day: 1,
-            config_version: String::new(),
-            interfaces: vec![],
-            enable_gpu: false,
+            enable_gpu: true,
             net_static_path: "/tmp/x.json".into(),
-            pings: vec![],
-            report_errors: true,
-            report_self: false,
-            ext: Default::default(),
+            pings: vec![PingTarget {
+                name: "ct".into(),
+                target: "example.com:80".into(),
+                interval: None,
+            }],
+            reporters: vec![ReporterConfig {
+                id: "primary".into(),
+                protocol: "probe".into(),
+                server_id: "s1".into(),
+                secret: "sec".into(),
+                worker_url: "https://example.com/report".into(),
+                config_version: String::new(),
+                report_interval: 60,
+                reset_day: 1,
+                interfaces: vec![],
+                report_gpu: Some(false),
+                report_errors: true,
+                report_self: false,
+                ping_names: None,
+                ext: Default::default(),
+            }],
         }
     }
 
@@ -377,26 +528,74 @@ mod tests {
         let mut cfg = base_config();
         cfg.intervals.collect = 0;
         assert!(cfg.validate().is_err());
-
-        cfg.protocol = "cf".into();
-        assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn toml_roundtrip_preserves_ext_and_pings() {
         // TOML 布局陷阱防回归：[ext.cf] 与 [[pings]] 的表格次序必须往返无损
         let mut cfg = base_config();
-        cfg.pings = vec![PingTarget {
-            name: "ct".into(),
-            target: "example.com:80".into(),
-            interval: Some(5),
-        }];
-        cfg.ext.cf.correction = false;
+        cfg.reporters[0].ext.cf.correction = false;
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: LocalConfig = toml::from_str(&text).unwrap();
         assert_eq!(back, cfg);
-        assert!(!back.ext.cf.correction);
+        assert!(!back.reporters[0].ext.cf.correction);
         assert_eq!(back.pings[0].name, "ct");
+    }
+
+    #[test]
+    fn global_collection_and_reporter_output_are_independent() {
+        let mut cfg = base_config();
+        cfg.reporters.push(ReporterConfig {
+            id: "komari-a".into(),
+            protocol: "komari".into(),
+            server_id: "node-a".into(),
+            secret: "token".into(),
+            worker_url: "http://panel.example".into(),
+            config_version: String::new(),
+            report_interval: 3,
+            reset_day: 12,
+            interfaces: vec!["Ethernet*".into()],
+            report_gpu: Some(true),
+            report_errors: false,
+            report_self: true,
+            ping_names: Some(vec![]),
+            ext: Default::default(),
+        });
+        cfg.reporters.push(ReporterConfig {
+            id: "cf-a".into(),
+            protocol: "cf".into(),
+            server_id: "cf-id".into(),
+            secret: "cf-secret".into(),
+            worker_url: "https://worker.example/update".into(),
+            config_version: String::new(),
+            report_interval: 30,
+            reset_day: 1,
+            interfaces: vec![],
+            report_gpu: None,
+            report_errors: true,
+            report_self: false,
+            ping_names: Some(vec!["ct".into()]),
+            ext: Default::default(),
+        });
+
+        cfg.validate().unwrap();
+        let komari = cfg.reporter("komari-a").unwrap();
+        assert_eq!(komari.reset_day, 12);
+        assert_eq!(komari.intervals.collect, 10);
+        assert_eq!(komari.intervals.report, 3);
+        assert!(komari.report_gpu);
+        assert!(komari.report_self);
+        assert!(!komari.report_errors);
+        assert!(komari.pings.is_empty());
+        assert!(cfg.reporter("cf-a").unwrap().report_gpu);
+        assert_eq!(cfg.effective_intervals().collect, 10);
+        assert_eq!(cfg.effective_intervals().report, 1); // 内部占位，不是上报周期
+        assert!(cfg.effective_gpu());
+        assert_eq!(cfg.effective_pings()[0].interval, Some(30));
+
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        let roundtrip: LocalConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(roundtrip, cfg);
     }
 
     #[test]
@@ -410,20 +609,68 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_fields_loudly() {
-        // 标量误放在 [intervals] 段之后会被解析进 intervals 表，必须报错而不是静默忽略
-        let bad_toml = r#"
-server_id = "s1"
-secret = "sec"
-worker_url = "https://example.com/report"
+    fn minimal_canonical_config_parses() {
+        let text = r#"
+net_static_path = "/tmp/net.json"
+enable_gpu = true
 
 [intervals]
 collect = 1
-report = 2
+ping = 30
+slow = 60
+gpu = 60
+ip = 600
+diskio = 10
+
+[[reporters]]
+id = "komari"
+protocol = "komari"
+server_id = "node-a"
+secret = "token"
+worker_url = "http://panel.example"
+config_version = ""
+report_interval = 1
+reset_day = 12
+interfaces = []
+report_gpu = true
+report_errors = true
+report_self = false
+"#;
+        let cfg: LocalConfig = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+        let komari = cfg.reporter("komari").unwrap();
+        assert_eq!(komari.protocol, "komari");
+        assert_eq!(komari.reset_day, 12);
+        assert_eq!(komari.intervals.collect, 1);
+        assert!(komari.report_gpu);
+    }
+
+    #[test]
+    fn rejects_unknown_fields_loudly() {
+        // 标量误放在 [intervals] 段之后会被解析进 intervals 表，必须报错而不是静默忽略
+        let bad_toml = r#"
+[intervals]
+collect = 1
 ping = 2
 reset_day = 15
 "#;
         assert!(toml::from_str::<LocalConfig>(bad_toml).is_err());
+    }
+
+    #[test]
+    fn rejects_legacy_root_connection_shape() {
+        let legacy = r#"
+server_id = "s1"
+secret = "sec"
+worker_url = "https://example.com/report"
+protocol = "probe"
+
+[intervals]
+collect = 1
+report = 10
+ping = 30
+"#;
+        assert!(toml::from_str::<LocalConfig>(legacy).is_err());
     }
 
     #[test]
@@ -439,70 +686,58 @@ reset_day = 15
         shared
             .apply_remote(RemoteConfig {
                 config_version: String::new(),
-                intervals: Some(Intervals {
-                    collect: 1,
-                    report: 1,
-                    ping: 1,
-                    ..Default::default()
-                }),
+                report_interval: Some(1),
                 reset_day: Some(5),
                 interfaces: None,
-                enable_gpu: None,
-                pings: None,
+                report_gpu: None,
                 report_errors: None,
                 report_self: None,
                 ext: None,
             })
             .unwrap();
-        assert_eq!(shared.get().reset_day, 1);
+        assert_eq!(shared.get().reporter("primary").unwrap().reset_day, 1);
 
         // 零值间隔：整体拒绝
         assert!(shared
             .apply_remote(RemoteConfig {
                 config_version: "2026-08-06T15:00:00+08:00".into(),
-                intervals: Some(Intervals {
-                    collect: 0,
-                    report: 20,
-                    ping: 30,
-                    ..Default::default()
-                }),
+                report_interval: Some(0),
                 reset_day: Some(5),
                 interfaces: None,
-                enable_gpu: None,
-                pings: None,
+                report_gpu: None,
                 report_errors: None,
                 report_self: None,
                 ext: None,
             })
             .is_err());
-        assert_eq!(shared.get().config_version, "");
+        assert_eq!(shared.get().reporter("primary").unwrap().config_version, "");
 
         // 合法：应用并落盘
         shared
             .apply_remote(RemoteConfig {
                 config_version: "2026-08-06T15:00:00+08:00".into(),
-                intervals: Some(Intervals {
-                    collect: 5,
-                    report: 20,
-                    ping: 15,
-                    ..Default::default()
-                }),
+                report_interval: Some(20),
                 reset_day: Some(15),
                 interfaces: None,
-                enable_gpu: None,
-                pings: None,
+                report_gpu: None,
                 report_errors: None,
                 report_self: None,
                 ext: None,
             })
             .unwrap();
         let after = shared.get();
-        assert_eq!(after.config_version, "2026-08-06T15:00:00+08:00");
-        assert_eq!(after.reset_day, 15);
-        assert!(rx.has_changed().unwrap());
+        let primary = after.reporter("primary").unwrap();
+        assert_eq!(primary.config_version, "2026-08-06T15:00:00+08:00");
+        assert_eq!(primary.reset_day, 15);
+        assert_eq!(primary.intervals.report, 20);
+        assert_eq!(after.intervals.collect, 10);
+        assert!(!rx.has_changed().unwrap());
         let on_disk = load(&path).unwrap();
-        assert_eq!(on_disk.config_version, "2026-08-06T15:00:00+08:00");
-        assert_eq!(on_disk.intervals.report, 20);
+        assert_eq!(
+            on_disk.reporter("primary").unwrap().config_version,
+            "2026-08-06T15:00:00+08:00"
+        );
+        assert_eq!(on_disk.reporters[0].report_interval, 20);
 
         std::fs::remove_dir_all(&dir).ok();
     }

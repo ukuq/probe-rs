@@ -12,7 +12,6 @@ pub mod sysinfo;
 
 pub use super::scan_file;
 
-use crate::collector::net::{IfaceFilter, NetBytes};
 use crate::model::StaticInfo;
 
 pub use selfproc::{SelfMonitor, SelfStats};
@@ -61,10 +60,6 @@ pub fn connections() -> Result<(u64, u64), String> {
     Ok(conn::collect())
 }
 
-pub fn net_bytes(filter: &IfaceFilter) -> NetBytes {
-    crate::collector::net::read_net_bytes(filter)
-}
-
 pub fn scan_net_dev(f: impl FnMut(&str, u64, u64)) {
     crate::collector::net::scan_net_dev(f);
 }
@@ -74,7 +69,7 @@ pub fn static_info(
     ipv6: Option<String>,
     gpu_name: Option<String>,
     agent_version: &str,
-    cfg: &crate::config::LocalConfig,
+    cfg: &crate::model::StaticConfig,
 ) -> StaticInfo {
     sysinfo::collect(ipv4, ipv6, gpu_name, agent_version, cfg)
 }

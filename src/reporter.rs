@@ -37,10 +37,18 @@ pub struct Reporter {
     url: String,
     secret: String,
     agent_version: String,
+    reporter_id: String,
+    protocol: String,
 }
 
 impl Reporter {
-    pub fn new(worker_url: &str, secret: &str, agent_version: &str) -> Result<Self> {
+    pub fn new(
+        worker_url: &str,
+        secret: &str,
+        agent_version: &str,
+        reporter_id: &str,
+        protocol: &str,
+    ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(TIMEOUT)
             .pool_max_idle_per_host(1)
@@ -51,6 +59,8 @@ impl Reporter {
             url: worker_url.to_string(),
             secret: secret.to_string(),
             agent_version: agent_version.to_string(),
+            reporter_id: reporter_id.to_string(),
+            protocol: protocol.to_string(),
         })
     }
 
@@ -61,6 +71,10 @@ impl Reporter {
             .post(&self.url)
             .header("X-Secret", &self.secret)
             .header("X-Agent-Version", &self.agent_version)
+            // Optional metadata: old servers ignore these headers. Values are
+            // percent-encoded so arbitrary Unicode Reporter ids remain valid.
+            .header("X-Reporter-Id", encode_header_value(&self.reporter_id))
+            .header("X-Reporter-Protocol", encode_header_value(&self.protocol))
             .json(report)
             .send()
             .await
@@ -143,5 +157,27 @@ impl Reporter {
             anyhow::bail!("校正确认响应 HTTP {}", resp.status());
         }
         Ok(())
+    }
+}
+
+fn encode_header_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            write!(&mut encoded, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    encoded
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn reporter_header_value_percent_encodes_unicode() {
+        let encoded = super::encode_header_value("本地 demo/一");
+        assert_eq!(encoded, "%E6%9C%AC%E5%9C%B0%20demo%2F%E4%B8%80");
     }
 }

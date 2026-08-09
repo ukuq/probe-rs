@@ -6,7 +6,6 @@ use std::process::Command;
 
 use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
 
-use crate::collector::net::{IfaceFilter, NetBytes};
 use crate::model::StaticInfo;
 
 #[derive(Debug, Clone, Copy)]
@@ -179,17 +178,6 @@ fn parse_netstat(text: &str) -> (u64, u64) {
     (tcp, udp)
 }
 
-pub fn net_bytes(filter: &IfaceFilter) -> NetBytes {
-    let mut total = NetBytes::default();
-    scan_net_dev(|name, rx, tx| {
-        if filter.includes(name) {
-            total.rx += rx;
-            total.tx += tx;
-        }
-    });
-    total
-}
-
 pub fn scan_net_dev(mut f: impl FnMut(&str, u64, u64)) {
     let networks = Networks::new_with_refreshed_list();
     for (name, data) in &networks {
@@ -202,7 +190,7 @@ pub fn static_info(
     ipv6: Option<String>,
     gpu_name: Option<String>,
     agent_version: &str,
-    cfg: &crate::config::LocalConfig,
+    cfg: &crate::model::StaticConfig,
 ) -> StaticInfo {
     let mut s = System::new();
     s.refresh_cpu_all();
@@ -240,16 +228,7 @@ pub fn static_info(
         ipv4,
         ipv6,
         agent_version: agent_version.to_string(),
-        config: crate::model::StaticConfig {
-            intervals: cfg.intervals,
-            reset_day: cfg.reset_day,
-            interfaces: cfg.interfaces.clone(),
-            enable_gpu: cfg.enable_gpu,
-            report_errors: cfg.report_errors,
-            report_self: cfg.report_self,
-            pings: cfg.pings.clone(),
-            ext: cfg.ext.clone(),
-        },
+        config: cfg.clone(),
     }
 }
 

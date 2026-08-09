@@ -14,12 +14,10 @@ use tokio::time::interval;
 
 use crate::buffer::Buffers;
 use crate::collector::{self, SelfMonitor};
-use crate::config::SharedConfig;
 use crate::model::{Intervals, SelfRecord, SlowBlock};
 
 #[allow(clippy::type_complexity)]
 pub fn spawn(
-    cfg: Arc<SharedConfig>,
     mut intervals_rx: watch::Receiver<Intervals>,
     buffers: Arc<Buffers>,
 ) -> (
@@ -53,17 +51,13 @@ pub fn spawn(
                         udp_conn,
                         processes,
                     }));
-                    // 探针自身资源：report_self 开关控制，关闭时快照也清空（ts 不再前进）
-                    if cfg.get().report_self {
-                        let stats = self_monitor.sample();
-                        self_tx.send_replace(Some(SelfRecord {
-                            ts,
-                            cpu_usage: stats.cpu_usage,
-                            mem_rss: stats.mem_rss,
-                        }));
-                    } else {
-                        self_tx.send_replace(None);
-                    }
+                    // 自身占用与 slow 同频实际采集；各 Reporter 仅决定是否输出。
+                    let stats = self_monitor.sample();
+                    self_tx.send_replace(Some(SelfRecord {
+                        ts,
+                        cpu_usage: stats.cpu_usage,
+                        mem_rss: stats.mem_rss,
+                    }));
                     tracing::debug!(ts, "slow 快照已更新");
                 }
                 r = intervals_rx.changed() => {
