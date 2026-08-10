@@ -450,30 +450,34 @@ impl ReporterRunner {
         };
 
         let slow = self.slow_rx.borrow();
-        let Some(slow_record) = slow.as_ref() else {
-            tracing::warn!(reporter_id = %self.id, "Komari report 缺少 slow 快照，已清空待发报告");
-            publish_komari(&tx, None, basic_info);
-            return true;
+        let (scoped_slow, slow_valid_until) = match slow.as_ref() {
+            Some(slow_record) => match snapshot_valid_until(
+                slow_record.ts,
+                spec.intervals.slow,
+                spec.intervals.report,
+                now_ms,
+            ) {
+                Some(valid_until) => (Some(self.scope_slow(slow_record, spec)), Some(valid_until)),
+                None => {
+                    tracing::warn!(
+                        reporter_id = %self.id,
+                        measured_at = slow_record.ts,
+                        "Komari slow 快照已过期，本轮不携带 slow 数据"
+                    );
+                    (None, None)
+                }
+            },
+            None => {
+                tracing::warn!(reporter_id = %self.id, "Komari report 缺少 slow 快照，本轮不携带 slow 数据");
+                (None, None)
+            }
         };
-        let Some(slow_valid_until) = snapshot_valid_until(
-            slow_record.ts,
-            spec.intervals.slow,
-            spec.intervals.report,
-            now_ms,
-        ) else {
-            tracing::warn!(
-                reporter_id = %self.id,
-                measured_at = slow_record.ts,
-                "Komari slow 快照已过期，已清空待发报告"
-            );
-            publish_komari(&tx, None, basic_info);
-            return true;
-        };
-        let scoped_slow = self.scope_slow(slow_record, spec);
         drop(slow);
 
         let gpus = self.gpu_rx.borrow();
-        let mut report_valid_until = dynamic_valid_until.min(slow_valid_until);
+        let mut report_valid_until = slow_valid_until
+            .map(|valid_until| dynamic_valid_until.min(valid_until))
+            .unwrap_or(dynamic_valid_until);
         let fresh_gpus: Vec<GpuRecord> = if spec.report_gpu {
             gpus.iter()
                 .filter_map(|gpu| {
@@ -493,7 +497,7 @@ impl ReporterRunner {
         let report = crate::reporter_komari::build_report(
             &static_info,
             Some(dyn_latest),
-            Some(&scoped_slow),
+            scoped_slow.as_ref(),
             &fresh_gpus,
             &errors,
             now_ms,

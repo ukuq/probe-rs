@@ -131,12 +131,15 @@ if ($PSBoundParameters.ContainsKey("AutoUpdate")) {
 # when this installation does not explicitly mention -Debug.
 $debugSpecified = $PSBoundParameters.ContainsKey("Debug")
 $debugEnabled = $debugSpecified -and [bool]$PSBoundParameters["Debug"]
+$existingTask = Get-ScheduledTask -TaskName "probe-rs" -ErrorAction SilentlyContinue
 if (-not $debugSpecified) {
-    $existingTask = Get-ScheduledTask -TaskName "probe-rs" -ErrorAction SilentlyContinue
     if ($existingTask -and $existingTask.Actions.Arguments -match '(?:^|\s)--debug(?:\s|$)') {
         $debugEnabled = $true
     }
 }
+$previousTaskEnabled = $false
+$previousTaskRunning = $false
+$taskStateNeedsRestore = $false
 
 $temporaryBinary = $null
 $temporaryChecksums = $null
@@ -215,6 +218,12 @@ try {
         )
     }
 
+    # install.ps1 -NoStart stops and disables an existing task. From this
+    # point onward, any configuration error must restore its previous state.
+    $taskBeforeInstall = Get-ScheduledTask -TaskName "probe-rs" -ErrorAction SilentlyContinue
+    $previousTaskEnabled = $taskBeforeInstall -and [bool]$taskBeforeInstall.Settings.Enabled
+    $previousTaskRunning = $taskBeforeInstall -and ([string]$taskBeforeInstall.State -eq "Running")
+    $taskStateNeedsRestore = [bool]$taskBeforeInstall
     & $Installer install -BinaryPath $resolvedBinary -NoStart -DebugLog:$debugEnabled
 
     $configureArgs = @(
@@ -298,6 +307,45 @@ try {
         Write-Host "CF mode installed and started. Reporter: $selectedReporter"
     }
     Write-Host "Config: $ConfigPath"
+    $taskStateNeedsRestore = $false
+}
+catch {
+    $installError = $_
+    if ($taskStateNeedsRestore) {
+        try {
+            $restoredTask = Get-ScheduledTask -TaskName "probe-rs" -ErrorAction Stop
+            if ($previousTaskRunning) {
+                Enable-ScheduledTask -TaskName "probe-rs" | Out-Null
+                $runningRestored = $false
+                for ($attempt = 0; $attempt -lt 15; $attempt++) {
+                    Start-ScheduledTask -TaskName "probe-rs" -ErrorAction SilentlyContinue
+                    Start-Sleep -Milliseconds 200
+                    $restoredTask = Get-ScheduledTask -TaskName "probe-rs" -ErrorAction Stop
+                    if ([string]$restoredTask.State -eq "Running") {
+                        $runningRestored = $true
+                        break
+                    }
+                }
+                if (-not $runningRestored) {
+                    throw "The probe-rs task did not return to the Running state."
+                }
+            }
+            else {
+                Stop-ScheduledTask -TaskName "probe-rs" -ErrorAction SilentlyContinue
+            }
+            if ($previousTaskEnabled) {
+                Enable-ScheduledTask -TaskName "probe-rs" | Out-Null
+            }
+            else {
+                Disable-ScheduledTask -TaskName "probe-rs" | Out-Null
+            }
+            Write-Warning "CF installation failed; restored the previous probe-rs task state."
+        }
+        catch {
+            Write-Warning "CF installation failed and the previous probe-rs task state could not be restored: $($_.Exception.Message)"
+        }
+    }
+    throw $installError
 }
 finally {
     foreach ($temporary in @($temporaryBinary, $temporaryChecksums)) {

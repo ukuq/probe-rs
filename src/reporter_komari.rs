@@ -36,10 +36,9 @@ pub fn build_report(
         "cpu": { "usage": d.cpu_usage.unwrap_or(0.0) },
         "ram": { "total": st.mem_total, "used": d.mem_used.unwrap_or(0) },
         "swap": { "total": st.swap_total, "used": d.swap_used.unwrap_or(0) },
-        "disk": { "total": st.disk_total, "used": slow.and_then(|s| s.disk_used).unwrap_or(0) },
+        "disk": { "total": st.disk_total },
         "network": network,
         "uptime": ((now_ms - st.boot_time).max(0) / 1000) as u64,
-        "process": slow.and_then(|s| s.processes).unwrap_or(0),
         "message": errors.iter().map(|e| format!("[{}] {}", e.source, e.msg))
             .collect::<Vec<_>>().join("; "),
     });
@@ -47,10 +46,25 @@ pub fn build_report(
         out["load"] = json!({ "load1": l[0], "load5": l[1], "load15": l[2] });
     }
     if let Some(s) = slow {
-        out["connections"] = json!({
-            "tcp": s.tcp_conn.unwrap_or(0),
-            "udp": s.udp_conn.unwrap_or(0),
-        });
+        if let Some(value) = s.disk_used {
+            out["disk"]["used"] = json!(value);
+        }
+        if let Some(value) = s.processes {
+            out["process"] = json!(value);
+        }
+        let mut connections = json!({});
+        if let Some(value) = s.tcp_conn {
+            connections["tcp"] = json!(value);
+        }
+        if let Some(value) = s.udp_conn {
+            connections["udp"] = json!(value);
+        }
+        if connections
+            .as_object()
+            .is_some_and(|value| !value.is_empty())
+        {
+            out["connections"] = connections;
+        }
     }
     if !gpus.is_empty() {
         let usages: Vec<_> = gpus.iter().filter_map(|g| g.usage).collect();
@@ -254,6 +268,22 @@ mod tests {
 
         let report = build_report(&stub(), None, None, &gpus[1..], &[], 1_900);
         assert!(report["gpu"].get("average_usage").is_none());
+    }
+
+    #[test]
+    fn missing_slow_snapshot_omits_only_slow_fields() {
+        let dynamic = DynamicRecord {
+            cpu_usage: Some(12.5),
+            mem_used: Some(4_000),
+            ..Default::default()
+        };
+        let report = build_report(&stub(), Some(&dynamic), None, &[], &[], 1_900);
+
+        assert_eq!(report["cpu"]["usage"], 12.5);
+        assert_eq!(report["ram"]["used"], 4_000);
+        assert!(report["disk"].get("used").is_none());
+        assert!(report.get("process").is_none());
+        assert!(report.get("connections").is_none());
     }
 
     #[test]

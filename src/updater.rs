@@ -199,12 +199,17 @@ async fn check_and_apply(settings: &AutoUpdateConfig) -> Result<CheckOutcome> {
     .context("update staging task panicked")??;
 
     let replace_source = staging.path().to_owned();
-    let replaced = tokio::task::spawn_blocking(move || self_replace::self_replace(replace_source))
+    #[cfg(windows)]
+    let previous_executable =
+        tokio::task::spawn_blocking(move || replace_windows_executable(&replace_source))
+            .await
+            .context("update replacement task panicked")?
+            .context("failed to replace the running executable")?;
+    #[cfg(not(windows))]
+    tokio::task::spawn_blocking(move || self_replace::self_replace(replace_source))
         .await
-        .context("update replacement task panicked")?;
-    if let Err(error) = replaced {
-        return Err(error).context("failed to replace the running executable");
-    }
+        .context("update replacement task panicked")?
+        .context("failed to replace the running executable")?;
 
     #[cfg(windows)]
     if let Err(error) = refresh_windows_tray_companion(staging.path()) {
@@ -219,7 +224,7 @@ async fn check_and_apply(settings: &AutoUpdateConfig) -> Result<CheckOutcome> {
 
     #[cfg(windows)]
     {
-        if let Err(error) = spawn_windows_restart_helper() {
+        if let Err(error) = spawn_windows_restart_helper(&previous_executable) {
             tracing::error!(%error, "failed to start Windows update restart helper");
             return Ok(CheckOutcome::InstalledPendingRestart);
         }
@@ -378,16 +383,99 @@ fn platform_asset_name(os: &str, arch: &str) -> Option<&'static str> {
 const WINDOWS_UPDATE_HELPER_ARG: &str = "--probe-rs-finish-update";
 
 #[cfg(windows)]
-fn spawn_windows_restart_helper() -> Result<()> {
+fn replace_windows_executable(new_executable: &std::path::Path) -> Result<std::path::PathBuf> {
+    use std::io::{Read, Write};
+
+    let executable = std::env::current_exe()
+        .context("failed to locate the running executable")?
+        .canonicalize()
+        .context("failed to resolve the running executable")?;
+    let directory = executable
+        .parent()
+        .context("running executable has no parent directory")?;
+
+    // Put the complete replacement on the destination volume before moving the
+    // canonical executable. This makes disk-space and copy failures harmless.
+    let mut source = std::fs::File::open(new_executable)
+        .with_context(|| format!("failed to open {}", new_executable.display()))?;
+    let mut incoming = tempfile::Builder::new()
+        .prefix(".probe-rs-update-")
+        .suffix(".exe")
+        .tempfile_in(directory)
+        .context("failed to create update file beside the running executable")?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .context("failed to read the staged update")?;
+        if read == 0 {
+            break;
+        }
+        incoming
+            .write_all(&buffer[..read])
+            .context("failed to stage the update beside the running executable")?;
+    }
+    incoming
+        .as_file()
+        .sync_all()
+        .context("failed to flush the incoming executable")?;
+
+    let incoming_name = incoming
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("incoming executable has an invalid file name")?
+        .to_owned();
+    let (_, incoming_path) = incoming
+        .keep()
+        .map_err(|error| error.error)
+        .context("failed to preserve the incoming executable")?;
+    let previous = directory.join(format!("{incoming_name}.previous.exe"));
+
+    swap_windows_executable(&executable, &incoming_path, &previous)?;
+    Ok(previous)
+}
+
+#[cfg(windows)]
+fn swap_windows_executable(
+    executable: &std::path::Path,
+    incoming: &std::path::Path,
+    previous: &std::path::Path,
+) -> Result<()> {
+    if let Err(error) = std::fs::rename(executable, previous) {
+        let _ = std::fs::remove_file(incoming);
+        return Err(error).context("failed to move the running executable aside");
+    }
+    if let Err(install_error) = std::fs::rename(incoming, executable) {
+        let restore_result = std::fs::rename(previous, executable);
+        let _ = std::fs::remove_file(incoming);
+        return match restore_result {
+            Ok(()) => Err(install_error).context(
+                "failed to install the incoming executable; restored the previous executable",
+            ),
+            Err(restore_error) => bail!(
+                "failed to install the incoming executable ({install_error}); also failed to restore the previous executable ({restore_error})"
+            ),
+        };
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn spawn_windows_restart_helper(previous_executable: &std::path::Path) -> Result<()> {
     use std::os::windows::process::CommandExt;
     use std::process::Command;
     use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
 
     let executable = std::env::current_exe().context("failed to locate updated executable")?;
+    let previous_name = previous_executable
+        .file_name()
+        .context("previous executable has no file name")?;
     let mut command = Command::new(executable);
     command
         .arg(WINDOWS_UPDATE_HELPER_ARG)
         .arg(std::process::id().to_string())
+        .arg(previous_name)
         .arg("--")
         .args(std::env::args_os().skip(1))
         .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
@@ -472,6 +560,10 @@ pub fn maybe_finish_windows_update() -> Result<bool> {
         .context("Windows update helper is missing the parent process id")?
         .parse()
         .context("invalid Windows update parent process id")?;
+    let previous_name = args
+        .next()
+        .context("Windows update helper is missing the previous executable name")?;
+    let previous_executable = windows_previous_executable_path(&previous_name)?;
     let mut original_args: Vec<_> = args.collect();
     if original_args.first().is_some_and(|arg| arg == "--") {
         original_args.remove(0);
@@ -487,17 +579,61 @@ pub fn maybe_finish_windows_update() -> Result<bool> {
         if wait != WAIT_OBJECT_0 {
             bail!("failed while waiting for the previous probe-rs process");
         }
+    } else {
+        // The parent may have exited before OpenProcess, but an access failure
+        // must not let this helper mistake that still-running parent for the
+        // freshly started task instance.
+        for attempt in 0..600 {
+            if !windows_probe_process_id_running(parent_id)
+                .context("failed to inspect the previous probe-rs process")?
+            {
+                break;
+            }
+            if attempt == 599 {
+                bail!("timed out waiting for the previous probe-rs process to stop");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
-    for _ in 0..15 {
+    if let Err(error) = std::fs::remove_file(&previous_executable) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %previous_executable.display(),
+                %error,
+                "failed to remove the previous Windows executable"
+            );
+        }
+    }
+
+    'task_start: for _ in 0..15 {
+        match windows_agent_process_running(parent_id) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, "failed to inspect Windows processes while confirming restart");
+                break;
+            }
+        }
         let status = Command::new("schtasks.exe")
             .args(["/Run", "/TN", "probe-rs"])
             .creation_flags(CREATE_NO_WINDOW)
             .status();
         if status.is_ok_and(|status| status.success()) {
-            return Ok(true);
+            for _ in 0..5 {
+                std::thread::sleep(Duration::from_millis(200));
+                match windows_agent_process_running(parent_id) {
+                    Ok(true) => return Ok(true),
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to inspect Windows processes while confirming restart");
+                        break 'task_start;
+                    }
+                }
+            }
+        } else {
+            std::thread::sleep(Duration::from_secs(1));
         }
-        std::thread::sleep(Duration::from_secs(1));
     }
 
     let executable = std::env::current_exe().context("failed to locate updated executable")?;
@@ -513,6 +649,77 @@ pub fn maybe_finish_windows_update() -> Result<bool> {
         .spawn()
         .context("failed to restart updated probe-rs")?;
     Ok(true)
+}
+
+#[cfg(windows)]
+fn windows_previous_executable_path(file_name: &std::ffi::OsStr) -> Result<std::path::PathBuf> {
+    let file_name = file_name
+        .to_str()
+        .context("previous executable name is not valid Unicode")?;
+    if !file_name.starts_with(".probe-rs-update-")
+        || !file_name.ends_with(".exe.previous.exe")
+        || file_name.contains(['\\', '/'])
+    {
+        bail!("invalid previous executable name");
+    }
+    let executable = std::env::current_exe().context("failed to locate updated executable")?;
+    let directory = executable
+        .parent()
+        .context("updated executable has no parent directory")?;
+    Ok(directory.join(file_name))
+}
+
+#[cfg(windows)]
+fn windows_agent_process_running(previous_process_id: u32) -> std::io::Result<bool> {
+    let current_id = std::process::id();
+    windows_process_matches(|process_id, process_name| {
+        process_id != current_id
+            && process_id != previous_process_id
+            && process_name.eq_ignore_ascii_case("probe-rs.exe")
+    })
+}
+
+#[cfg(windows)]
+fn windows_probe_process_id_running(process_id: u32) -> std::io::Result<bool> {
+    windows_process_matches(|candidate_id, process_name| {
+        candidate_id == process_id && process_name.eq_ignore_ascii_case("probe-rs.exe")
+    })
+}
+
+#[cfg(windows)]
+fn windows_process_matches(mut predicate: impl FnMut(u32, &str) -> bool) -> std::io::Result<bool> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut found = false;
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while has_entry {
+        let name_len = entry
+            .szExeFile
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let process_name = String::from_utf16_lossy(&entry.szExeFile[..name_len]);
+        if predicate(entry.th32ProcessID, &process_name) {
+            found = true;
+            break;
+        }
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    Ok(found)
 }
 
 #[cfg(not(windows))]
@@ -642,5 +849,33 @@ mod tests {
             Some("probe-rs-windows-x86_64.exe")
         );
         assert_eq!(platform_asset_name("macos", "aarch64"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_swap_restores_the_previous_executable_when_install_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("probe-rs.exe");
+        let missing_incoming = directory.path().join("missing-update.exe");
+        let previous = directory.path().join("previous.exe");
+        std::fs::write(&executable, b"previous binary").unwrap();
+
+        assert!(swap_windows_executable(&executable, &missing_incoming, &previous).is_err());
+        assert_eq!(std::fs::read(&executable).unwrap(), b"previous binary");
+        assert!(!previous.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_helper_accepts_only_its_own_backup_names() {
+        let valid = std::ffi::OsStr::new(".probe-rs-update-abc.exe.previous.exe");
+        assert_eq!(
+            windows_previous_executable_path(valid).unwrap().file_name(),
+            Some(valid)
+        );
+        assert!(windows_previous_executable_path(std::ffi::OsStr::new(
+            ".probe-rs-update-abc.exe.previous.exe\\..\\victim"
+        ))
+        .is_err());
     }
 }
