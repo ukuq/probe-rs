@@ -2059,7 +2059,7 @@ var EXAMPLE_JSON5 = \`{
     "boot_time": 1754300000000,             // ms 时间戳
     "ipv4": "203.0.113.10",                 // 查询失败保留旧值
     "ipv6": "2001:db8::10",                 // 可选；无 v6 出口为 null
-    "agent_version": "0.1.3-beta.1",
+    "agent_version": "0.1.3-beta.2",
     "config": {                             // 当前生效配置（供服务端展示/核对）
       "global": {                           // Agent 全局实际采集；与任何 Reporter 的上报周期无关
         "intervals": {

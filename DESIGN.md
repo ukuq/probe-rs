@@ -280,6 +280,7 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 | `scheduler` | 全局 collect ticker + 每 Reporter 独立 report ticker、事件游标和重试状态 |
 | `buffer` | dynamic / async 共享有界事件日志，支持多路独立游标读取 |
 | `reporter` | probe / CF / Komari 输出；响应解析并定向应用所属 Reporter 配置 |
+| `updater` | 固定 GitHub Release 源；通道/SemVer 选择、SHA-256 校验、平台安全替换与重启 |
 
 平台支持：Linux（手写 /proc 解析，零依赖）、macOS/Windows（sysinfo crate 实现，连接数解析 netstat）；`collector` 模块为平台门面，按 cfg 分流。Linux 默认从 `/etc/probe-rs/config.toml` 读取配置并把流量数据写到 `/var/lib/probe-rs/`；Windows 默认把配置和流量数据放在 `%ProgramData%\probe-rs\`，由 SYSTEM 开机计划任务托管。
 
@@ -299,6 +300,7 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 | 实时网速来源 | **主采集计数器差值** | 比 netstatic 2s 粒度更贴合采集周期 |
 | 远端可下发项 | **仅所属 Reporter 的需求与输出策略** | 全局实际值没有写入口，每次从全部 Reporter 聚合，消除多路覆盖冲突 |
 | 流量校正 | **服务端职责，agent 不做** | netstatic 报诚实累计值；重装跳变由服务端检测并加 offset，校正属展示/账务层 |
-| 自升级/远程命令 | **不做** | 安全边界 |
+| 自升级 | **本地显式开关；仅固定 GitHub Release + SHA-256** | 不接受服务端 URL/命令，版本必须按 SemVer 严格增加 |
+| 远程命令 | **不做** | CF/Komari 服务端不能触发命令执行或指定更新来源 |
 | 单位/类型 | **字节 + JSON number** | komari 风格，不学 cfsm 全字符串 |
 | 方向/探测命名 | **rx/tx、ping** | 避免 in-out/up-down、ping-probe 混用 |

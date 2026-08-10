@@ -31,6 +31,7 @@ $TaskName = "probe-rs"
 $InstallDir = Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "probe-rs"
 $DataDir = Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "probe-rs"
 $InstalledBinary = Join-Path $InstallDir "probe-rs.exe"
+$InstalledTrayBinary = Join-Path $InstallDir "probe-rs-tray.exe"
 $ConfigPath = Join-Path $DataDir "config.toml"
 $NetStaticPath = Join-Path $DataDir "net_static.json"
 $ExampleConfig = Join-Path $PSScriptRoot "..\config.example.toml"
@@ -103,11 +104,14 @@ function Protect-DataDirectory {
 }
 
 function Get-TrayProcesses {
-    @(Get-CimInstance Win32_Process -Filter "Name='probe-rs.exe'" -ErrorAction SilentlyContinue | `
-            Where-Object {
-                $_.ExecutablePath -eq $InstalledBinary -and
-                $_.CommandLine -match '(?i)(?:^|\s|")--tray(?:\s|$|")'
-            })
+    $processes = @(
+        Get-CimInstance Win32_Process -Filter "Name='probe-rs.exe'" -ErrorAction SilentlyContinue
+        Get-CimInstance Win32_Process -Filter "Name='probe-rs-tray.exe'" -ErrorAction SilentlyContinue
+    )
+    @($processes | Where-Object {
+            $_.ExecutablePath -in @($InstalledBinary, $InstalledTrayBinary) -and
+            $_.CommandLine -match '(?i)(?:^|\s|")--tray(?:\s|$|")'
+        })
 }
 
 function Stop-Tray {
@@ -119,7 +123,7 @@ function Stop-Tray {
 function Install-TrayStartup {
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($TrayShortcut)
-    $shortcut.TargetPath = $InstalledBinary
+    $shortcut.TargetPath = $InstalledTrayBinary
     $shortcut.Arguments = "--tray"
     $shortcut.WorkingDirectory = $InstallDir
     $shortcut.IconLocation = $InstalledBinary
@@ -129,12 +133,12 @@ function Install-TrayStartup {
 }
 
 function Start-Tray {
-    if (-not (Test-Path -LiteralPath $InstalledBinary -PathType Leaf)) {
+    if (-not (Test-Path -LiteralPath $InstalledTrayBinary -PathType Leaf)) {
         return
     }
     if (@(Get-TrayProcesses).Count -eq 0) {
         Start-Process `
-            -FilePath $InstalledBinary `
+            -FilePath $InstalledTrayBinary `
             -ArgumentList "--tray" `
             -WorkingDirectory $InstallDir `
             -WindowStyle Hidden
@@ -197,6 +201,9 @@ function Install-Probe {
     New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
     Protect-DataDirectory
     Copy-Item -LiteralPath $source.Path -Destination $InstalledBinary -Force
+    # Keep the interactive tray in a separate image file. This prevents a
+    # signed-in user's tray process from locking the agent during self-update.
+    Copy-Item -LiteralPath $source.Path -Destination $InstalledTrayBinary -Force
 
     $newConfig = -not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)
     if ($newConfig) {
@@ -264,6 +271,9 @@ function Uninstall-Probe {
     if (Test-Path -LiteralPath $InstalledBinary) {
         Remove-Item -LiteralPath $InstalledBinary -Force
     }
+    if (Test-Path -LiteralPath $InstalledTrayBinary) {
+        Remove-Item -LiteralPath $InstalledTrayBinary -Force
+    }
     if ((Test-Path -LiteralPath $InstallDir) -and
         -not (Get-ChildItem -LiteralPath $InstallDir -Force | Select-Object -First 1)) {
         Remove-Item -LiteralPath $InstallDir -Force
@@ -322,6 +332,7 @@ function Show-ProbeStatus {
         LastTaskResult = $info.LastTaskResult
         NextRunTime    = $info.NextRunTime
         Binary         = $InstalledBinary
+        TrayBinary     = $InstalledTrayBinary
         Config         = $ConfigPath
         TrayStartup    = $TrayShortcut
     } | Format-List

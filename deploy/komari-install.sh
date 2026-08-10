@@ -34,8 +34,10 @@ usage() {
   --install-version <v> 指定 probe-rs 版本（缺省 latest）
   --name <名称>         客户端名（缺省主机名）
   --reporter-id <id>   已有配置中追加/更新的 Reporter id（缺省 komari）
+  --disable-auto-update 关闭自动更新（缺省开启）
+  --update-channel <c> stable / prerelease（缺省 stable）
   -bin=<路径或URL>      二进制来源（缺省 GitHub Releases 按架构下载）
-兼容忽略（仅提示）：--disable-web-ssh / --disable-auto-update / --ignore-unsafe-cert 等其余官方参数
+兼容忽略（仅提示）：--disable-web-ssh / --ignore-unsafe-cert 等其余官方参数
 EOF
 }
 
@@ -65,10 +67,11 @@ fi
 
 ENDPOINT=""; TOKEN=""; INTERVAL=3; RESET_DAY=1; NAME=""; BIN=""
 ENABLE_GPU=false; INTERFACES=""; VERSION=""; REPORTER_ID="komari"
+AUTO_UPDATE=true; UPDATE_CHANNEL=stable
 # 需要吞掉一个值的官方参数（接受但忽略）
 IGNORED_WITH_VALUE="--auto-discovery --max-retries -r --reconnect-interval -c --info-report-interval --exclude-nics --include-mountpoint --custom-dns --custom-ipv4 --custom-ipv6 --config --protocol-version --prefer-ip-version --install-dir --install-service-name --install-ghproxy"
 # 纯标志位官方参数
-IGNORED_FLAGS="--disable-auto-update --disable-web-ssh -u --ignore-unsafe-cert --memory-include-cache --memory-exclude-bcf --show-warning --get-ip-addr-from-nic --disable-compression"
+IGNORED_FLAGS="--disable-web-ssh -u --ignore-unsafe-cert --memory-include-cache --memory-exclude-bcf --show-warning --get-ip-addr-from-nic --disable-compression"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -81,6 +84,9 @@ while [ $# -gt 0 ]; do
         --install-version)   VERSION="$2"; shift 2 ;;
         --name)              NAME="$2"; shift 2 ;;
         --reporter-id)       REPORTER_ID="$2"; shift 2 ;;
+        --disable-auto-update) AUTO_UPDATE=false; shift ;;
+        --enable-auto-update) AUTO_UPDATE=true; shift ;;
+        --update-channel)    UPDATE_CHANNEL="$2"; shift 2 ;;
         -bin=*)              BIN="${1#-bin=}"; shift ;;
         -h|--help)           usage; exit 0 ;;
         *)
@@ -96,6 +102,10 @@ done
 
 case "$REPORTER_ID" in
     ''|*[!A-Za-z0-9_.-]*) die "--reporter-id must use A-Z, a-z, 0-9, _, . or -" ;;
+esac
+case "$UPDATE_CHANNEL" in
+    stable|prerelease) ;;
+    *) die "--update-channel must be stable or prerelease" ;;
 esac
 
 [ "$(id -u)" = 0 ] || die "需要 root（sudo 或 root 执行）"
@@ -214,6 +224,35 @@ strip_seeded_sample_reporters() {
     mv -f "$tmp" "$cfg"
 }
 
+upsert_auto_update_config() {
+    cfg="$1"; tmp=$(mktemp "$CONF_DIR/config.toml.XXXXXX")
+    awk -v enabled="$AUTO_UPDATE" -v channel="$UPDATE_CHANNEL" '
+        BEGIN { in_auto=0; inserted=0 }
+        /^[[:space:]]*\[auto_update\][[:space:]]*$/ { in_auto=1; next }
+        in_auto && /^[[:space:]]*\[/ { in_auto=0 }
+        in_auto { next }
+        !inserted && /^[[:space:]]*\[\[reporters\]\][[:space:]]*$/ {
+            print "[auto_update]"
+            print "enabled = " enabled
+            print "channel = \"" channel "\""
+            print "check_interval = 21600"
+            print ""
+            inserted=1
+        }
+        { print }
+        END {
+            if (!inserted) {
+                print ""
+                print "[auto_update]"
+                print "enabled = " enabled
+                print "channel = \"" channel "\""
+                print "check_interval = 21600"
+            }
+        }
+    ' "$cfg" > "$tmp"
+    mv -f "$tmp" "$cfg"
+}
+
 if [ -s "$CONFIG_PATH" ] && grep -q '^[[:space:]]*\[\[reporters\]\]' "$CONFIG_PATH"; then
     strip_seeded_sample_reporters "$CONFIG_PATH"
 fi
@@ -284,6 +323,7 @@ diskio = 10
 EOF
     log "wrote a fresh canonical config with Komari Reporter '$REPORTER_ID'"
 fi
+upsert_auto_update_config "$CONFIG_PATH"
 chmod 600 "$CONFIG_PATH"
 
 # ---- systemd unit ----
@@ -300,7 +340,7 @@ Restart=always
 RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=-/var/lib/probe-rs -/etc/probe-rs
+ReadWritePaths=-/var/lib/probe-rs -/etc/probe-rs -/usr/local/bin
 ProtectHome=true
 PrivateTmp=true
 

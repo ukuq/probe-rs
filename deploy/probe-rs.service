@@ -10,7 +10,7 @@ ExecStart=/usr/local/bin/probe-rs
 Restart=always
 RestartSec=5
 
-# agent 需要：读 /proc、出站 HTTP/TCP、写两个路径——
+# agent 需要：读 /proc、出站 HTTP/TCP、写以下路径——
 #   /var/lib/probe-rs  netstatic 流量时序落盘
 #   /etc/probe-rs      远端下发配置时回写 config.toml（设计如此）
 # 「-」前缀 = 目录缺失时不影响启动（agent 会自建，install.sh 也会建）
@@ -18,7 +18,9 @@ RestartSec=5
 #       否则 ProtectSystem=strict 下 flush 会一直 EROFS
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=-/var/lib/probe-rs -/etc/probe-rs
+# /usr/local/bin is writable so the checksum-verified updater can atomically
+# replace probe-rs. The repository and asset names are fixed in the binary.
+ReadWritePaths=-/var/lib/probe-rs -/etc/probe-rs -/usr/local/bin
 ProtectHome=true
 PrivateTmp=true
 

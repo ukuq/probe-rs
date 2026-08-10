@@ -10,7 +10,7 @@
 #
 # 额外参数（官方没有，可选）：
 #   -bin=<路径或URL>   指定 probe-rs 二进制来源；缺省从 GitHub Releases 按架构下载
-# 官方参数里 -auto_update 忽略（probe-rs 不做自升级）；
+# 官方参数里的 -auto_update 映射为全局自动更新开关；
 # -rx_correction/-tx_correction 忽略（校正由服务端运行时下发，agent 原生支持）。
 #
 # 卸载：bash cf-install.sh uninstall [--purge]
@@ -35,11 +35,12 @@ usage() {
   -interval=         上报间隔秒（缺省 60）
   -reset_day=        月流量账期重置日 1-31，0 = 不重置（缺省 1）
   -ct= -cu= -cm= -bd=  电信/联通/移动/BGP 探测节点 host[:port]
-  -auto_update=      忽略（probe-rs 不支持自升级）
+  -auto_update=      自动更新开关：0/1（缺省 0）
   -rx_correction= -tx_correction=  忽略（校正由服务端运行时下发）
 额外:
   -bin=              二进制来源（本地路径或 URL），缺省 GitHub Releases
   -reporter_id=      已有配置中追加/更新的 Reporter id（缺省 cf）
+  -update_channel=   stable / prerelease（缺省 stable）
 EOF
 }
 
@@ -68,6 +69,8 @@ esac
 
 ID=""; SECRET=""; URL=""; COLLECT=0; REPORT=60; RESET_DAY=1
 CT=""; CU=""; CM=""; BD=""; BIN=""; REPORTER_ID="cf"
+AUTO_UPDATE=false; UPDATE_CHANNEL=stable
+UPDATE_SETTINGS_SET=false
 for arg in "$@"; do
     case "$arg" in
         -id=*)              ID="${arg#-id=}" ;;
@@ -82,7 +85,15 @@ for arg in "$@"; do
         -bd=*)              BD="${arg#-bd=}" ;;
         -bin=*)             BIN="${arg#-bin=}" ;;
         -reporter_id=*|--reporter-id=*) REPORTER_ID="${arg#*=}" ;;
-        -auto_update=*|-rx_correction=*|-tx_correction=*)
+        -auto_update=*)
+            UPDATE_SETTINGS_SET=true
+            case "${arg#*=}" in
+                1|true|TRUE|yes|YES) AUTO_UPDATE=true ;;
+                0|false|FALSE|no|NO|'') AUTO_UPDATE=false ;;
+                *) die "-auto_update must be 0 or 1" ;;
+            esac ;;
+        -update_channel=*|--update-channel=*) UPDATE_CHANNEL="${arg#*=}"; UPDATE_SETTINGS_SET=true ;;
+        -rx_correction=*|-tx_correction=*)
             log "参数 $arg 忽略（见脚本头注释）" ;;
         *) die "未知参数: $arg" ;;
     esac
@@ -90,6 +101,10 @@ done
 
 case "$REPORTER_ID" in
     ''|*[!A-Za-z0-9_.-]*) die "reporter id must use A-Z, a-z, 0-9, _, . or -" ;;
+esac
+case "$UPDATE_CHANNEL" in
+    stable|prerelease) ;;
+    *) die "update channel must be stable or prerelease" ;;
 esac
 
 [ "$(id -u)" = 0 ] || die "需要 root（sudo 或 root 执行）"
@@ -197,6 +212,39 @@ strip_seeded_sample_reporters() {
     mv -f "$tmp" "$cfg"
 }
 
+upsert_auto_update_config() {
+    cfg="$1"; tmp=$(mktemp "$CONF_DIR/config.toml.XXXXXX")
+    if [ "$UPDATE_SETTINGS_SET" = false ] && grep -q '^[[:space:]]*\[auto_update\][[:space:]]*$' "$cfg"; then
+        rm -f "$tmp"
+        return
+    fi
+    awk -v enabled="$AUTO_UPDATE" -v channel="$UPDATE_CHANNEL" '
+        BEGIN { in_auto=0; inserted=0 }
+        /^[[:space:]]*\[auto_update\][[:space:]]*$/ { in_auto=1; next }
+        in_auto && /^[[:space:]]*\[/ { in_auto=0 }
+        in_auto { next }
+        !inserted && /^[[:space:]]*\[\[reporters\]\][[:space:]]*$/ {
+            print "[auto_update]"
+            print "enabled = " enabled
+            print "channel = \"" channel "\""
+            print "check_interval = 21600"
+            print ""
+            inserted=1
+        }
+        { print }
+        END {
+            if (!inserted) {
+                print ""
+                print "[auto_update]"
+                print "enabled = " enabled
+                print "channel = \"" channel "\""
+                print "check_interval = 21600"
+            }
+        }
+    ' "$cfg" > "$tmp"
+    mv -f "$tmp" "$cfg"
+}
+
 if [ -s "$CONFIG_PATH" ] && grep -q '^[[:space:]]*\[\[reporters\]\]' "$CONFIG_PATH"; then
     strip_seeded_sample_reporters "$CONFIG_PATH"
 fi
@@ -296,6 +344,7 @@ else
 } > "$CONFIG_PATH"
     log "wrote a fresh canonical config with CF Reporter '$REPORTER_ID'"
 fi
+upsert_auto_update_config "$CONFIG_PATH"
 chmod 600 "$CONFIG_PATH"
 
 # ---- systemd unit ----
@@ -312,7 +361,7 @@ Restart=always
 RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=-/var/lib/probe-rs -/etc/probe-rs
+ReadWritePaths=-/var/lib/probe-rs -/etc/probe-rs -/usr/local/bin
 ProtectHome=true
 PrivateTmp=true
 

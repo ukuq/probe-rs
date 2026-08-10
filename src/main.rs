@@ -9,6 +9,7 @@ mod reporter_komari;
 mod scheduler;
 #[cfg(windows)]
 mod tray;
+mod updater;
 mod worker;
 
 use std::path::PathBuf;
@@ -23,6 +24,11 @@ const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(windows)]
+    if updater::maybe_finish_windows_update()? {
+        return Ok(());
+    }
+
     #[cfg(windows)]
     if std::env::args_os().any(|arg| arg == "--tray") {
         return tray::run();
@@ -74,6 +80,12 @@ async fn main() -> Result<()> {
         .map(|spec| spec.id.as_str());
     let net = netstatic::NetStatic::load_with_legacy_reporter(&net_static_path, legacy_cf_reporter);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    updater::spawn(
+        shared.subscribe_config(),
+        shutdown_tx.clone(),
+        shutdown_rx.clone(),
+    );
 
     // The persistent traffic ledger captures all interfaces. Reporter-specific
     // filters and corrections are applied only when a payload is built.

@@ -32,6 +32,7 @@ probe-rs/
 │   ├── scheduler.rs         # collect/report 双层 ticker；异步快照新鲜度摘取
 │   ├── buffer.rs            # dynamic 单缓冲，drain/restore（有界）
 │   ├── reporter.rs          # POST /report；X-Secret 头；解析响应里的远端配置
+│   ├── updater.rs           # GitHub Release 检查、SemVer/通道过滤、SHA-256 校验与自替换
 │   ├── collector/
 │   │   ├── mod.rs           # 平台门面：Linux /proc 实现 + sysinfo 跨平台实现
 │   │   ├── cpu.rs           # /proc/stat 差值（持有 prev 状态）
@@ -118,6 +119,14 @@ probe-rs/
 - `tokio::signal::ctrl_c()` + SIGTERM（`signal::unix`）→ 通知 netstatic flush → 退出。
 - 崩溃兜底靠 10min 定期落盘，退出 flush 只是减少丢失窗口。
 
+### 3.10 自动更新
+
+- `[auto_update] enabled=false` 默认关闭；`stable` 只读取正式 Release，`prerelease` 同时接受预发布版及之后更高的正式版。
+- 仅当远端版本按 SemVer precedence 严格大于编译版本时更新；draft、缺少当前平台资产或缺少 `SHA256SUMS` 的 Release 均跳过。
+- GitHub 仓库、下载路径和平台资产名编译期固定；二进制下载后必须通过 Release 附带的 SHA-256 校验。
+- Linux 原子替换后由 systemd `Restart=always` 拉起；Windows 使用新版 helper 等旧 Agent 退出后重新运行计划任务，托盘 companion 单独替换。
+- GitHub/API/下载/校验失败只记日志，不中断采集和上报；检查周期最低 300 秒，默认 6 小时。
+
 ## 4. 实施顺序
 
 | 阶段 | 内容 | 产出 |
@@ -165,7 +174,7 @@ sudo ./deploy/install.sh       # 装二进制/unit/示例配置；已装过则�
 
 - 二进制 → `/usr/local/bin/probe-rs`；配置 → `/etc/probe-rs/config.toml`（600，含 secret）；数据 → `/var/lib/probe-rs/`
 - 首次安装需先编辑配置填 `server_id` / `secret` / `worker_url`，再 `systemctl enable --now probe-rs`
-- unit 加固：`ProtectSystem=strict` + `ReadWritePaths=/var/lib/probe-rs /etc/probe-rs`（后者因远端配置要回写 config.toml）；ICMP 使用系统 `ping`，agent 无需 `CAP_NET_RAW`
+- unit 加固：`ProtectSystem=strict` + `ReadWritePaths=/var/lib/probe-rs /etc/probe-rs /usr/local/bin`（分别用于流量落盘、配置回写和校验后的原子自替换）；ICMP 使用系统 `ping`，agent 无需 `CAP_NET_RAW`
 - 卸载：`./deploy/install.sh uninstall`（保留配置与数据，加 `--purge` 全清）
 - 一键脚本（换 URL 即可装，参数对齐各官方探针）：CF 模式 `deploy/cf-install.sh`（-id/-secret/-url/-ct/-cu/-cm/-bd）；komari 模式 `deploy/komari-install.sh`（-e 面板地址/-t token/-i 间隔，缺省 collect=1 report=3 对齐官方节奏）
 

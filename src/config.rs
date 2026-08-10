@@ -13,12 +13,50 @@ use crate::model::{
 
 pub const KOMARI_LEARNED_PING_LIMIT: usize = 5;
 const KOMARI_PING_TOUCH_PERSIST_MS: i64 = 60_000;
+pub const MIN_UPDATE_CHECK_INTERVAL: u64 = 300;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    #[default]
+    Stable,
+    Prerelease,
+}
+
+impl std::fmt::Display for UpdateChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stable => f.write_str("stable"),
+            Self::Prerelease => f.write_str("prerelease"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoUpdateConfig {
+    pub enabled: bool,
+    pub channel: UpdateChannel,
+    pub check_interval: u64,
+}
+
+impl Default for AutoUpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            channel: UpdateChannel::Stable,
+            check_interval: 21_600,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalConfig {
     #[serde(default = "default_net_static_path")]
     pub net_static_path: String,
+    #[serde(default)]
+    pub auto_update: AutoUpdateConfig,
     /// 所有独立上报实例，包括 id="primary"。
     pub reporters: Vec<ReporterConfig>,
 }
@@ -122,6 +160,9 @@ fn platform_config_dir() -> PathBuf {
 
 impl LocalConfig {
     pub fn validate(&self) -> Result<()> {
+        if self.auto_update.check_interval < MIN_UPDATE_CHECK_INTERVAL {
+            bail!("auto_update.check_interval must be >= {MIN_UPDATE_CHECK_INTERVAL} seconds");
+        }
         if self.reporters.is_empty() {
             bail!("至少需要一个 [[reporters]]");
         }
@@ -840,6 +881,7 @@ mod tests {
     fn base_config() -> LocalConfig {
         LocalConfig {
             net_static_path: "/tmp/x.json".into(),
+            auto_update: AutoUpdateConfig::default(),
             reporters: vec![ReporterConfig {
                 id: "primary".into(),
                 protocol: "probe".into(),
@@ -902,6 +944,49 @@ mod tests {
     fn rejects_zero_intervals() {
         let mut cfg = base_config();
         cfg.reporters[0].intervals.collect = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn auto_update_defaults_to_disabled_stable_channel() {
+        let text = r#"
+            net_static_path = "/tmp/x.json"
+            [[reporters]]
+            id = "primary"
+            protocol = "probe"
+            server_id = "s1"
+            secret = "sec"
+            worker_url = "https://example.com/report"
+            config_version = ""
+            report_interval = 60
+            reset_day = 1
+            interfaces = []
+            disks = []
+            report_gpu = false
+            report_errors = true
+            report_self = false
+            [reporters.intervals]
+            collect = 10
+            ping = 30
+            slow = 60
+            gpu = 60
+            ip = 600
+            diskio = 10
+        "#;
+        let cfg: LocalConfig = toml::from_str(text).unwrap();
+        assert_eq!(cfg.auto_update, AutoUpdateConfig::default());
+    }
+
+    #[test]
+    fn example_config_stays_valid() {
+        let cfg: LocalConfig = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_too_frequent_update_checks() {
+        let mut cfg = base_config();
+        cfg.auto_update.check_interval = MIN_UPDATE_CHECK_INTERVAL - 1;
         assert!(cfg.validate().is_err());
     }
 

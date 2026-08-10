@@ -51,7 +51,7 @@ jobs:
           published_prerelease=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
             --json isPrerelease --jq '.isPrerelease' 2>/dev/null || true)
           complete=true
-          for name in probe-rs-linux-x86_64 probe-rs-linux-aarch64 probe-rs-windows-x86_64.exe; do
+          for name in probe-rs-linux-x86_64 probe-rs-linux-aarch64 probe-rs-windows-x86_64.exe SHA256SUMS; do
             if ! grep -Fxq "$name" <<<"$assets"; then
               complete=false
             fi
@@ -140,6 +140,13 @@ jobs:
           pattern: probe-rs-*
           path: dist
           merge-multiple: true
+      - name: Generate SHA-256 checksums
+        working-directory: dist
+        run: |
+          sha256sum \
+            probe-rs-linux-x86_64 \
+            probe-rs-linux-aarch64 \
+            probe-rs-windows-x86_64.exe > SHA256SUMS
       - name: 一次性发布全部架构产物
         uses: softprops/action-gh-release@v2
         with:
@@ -154,3 +161,4 @@ jobs:
             dist/probe-rs-linux-x86_64
             dist/probe-rs-linux-aarch64
             dist/probe-rs-windows-x86_64.exe
+            dist/SHA256SUMS

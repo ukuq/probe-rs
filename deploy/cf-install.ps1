@@ -48,7 +48,11 @@ param(
     [string]$BinarySource,
 
     [Alias("auto_update")]
-    [string]$AutoUpdate,
+    [string]$AutoUpdate = "0",
+
+    [Alias("update_channel")]
+    [ValidateSet("stable", "prerelease")]
+    [string]$UpdateChannel = "stable",
 
     [Alias("rx_correction")]
     [string]$RxCorrection,
@@ -98,9 +102,9 @@ if (-not [Uri]::TryCreate($WorkerUrl, [UriKind]::Absolute, [ref]$parsedWorkerUrl
     throw "-Url must be an absolute HTTP(S) URL."
 }
 
-foreach ($ignored in @("AutoUpdate", "RxCorrection", "TxCorrection")) {
+foreach ($ignored in @("RxCorrection", "TxCorrection")) {
     if ($PSBoundParameters.ContainsKey($ignored)) {
-        Write-Host "Ignoring -$ignored; probe-rs handles updates/correction through its own protocol."
+        Write-Host "Ignoring -$ignored; correction is handled by the CF protocol."
     }
 }
 
@@ -111,6 +115,14 @@ function ConvertTo-TomlString {
     # quotes, backslashes and control characters.
     return ConvertTo-Json -InputObject $Value -Compress
 }
+
+$AutoUpdateEnabled = switch -Regex ($AutoUpdate.Trim()) {
+    '^(1|true|yes)$' { $true; break }
+    '^(0|false|no|)$' { $false; break }
+    default { throw "-AutoUpdate must be 0 or 1." }
+}
+$UpdateSettingsSpecified = $PSBoundParameters.ContainsKey("AutoUpdate") -or
+    $PSBoundParameters.ContainsKey("UpdateChannel")
 
 function New-CfReporterBlock {
     $effectiveCollect = [Math]::Max(1, $CollectInterval)
@@ -161,6 +173,33 @@ function New-CfReporterBlock {
     return $lines -join [Environment]::NewLine
 }
 
+function Set-AutoUpdateBlock {
+    param([string]$Text)
+
+    if (-not $UpdateSettingsSpecified -and
+        $Text -match '(?m)^[ \t]*\[auto_update\][ \t]*$') {
+        return $Text
+    }
+
+    $block = @(
+        "[auto_update]",
+        ("enabled = {0}" -f $AutoUpdateEnabled.ToString().ToLowerInvariant()),
+        ("channel = {0}" -f (ConvertTo-TomlString $UpdateChannel)),
+        "check_interval = 21600",
+        ""
+    ) -join [Environment]::NewLine
+    $without = [regex]::Replace(
+        $Text,
+        '(?ms)^[ \t]*\[auto_update\][ \t]*\r?\n.*?(?=^[ \t]*\[|\z)',
+        ''
+    )
+    $firstReporter = [regex]::Match($without, '(?m)^[ \t]*\[\[reporters\]\][ \t]*\r?$')
+    if ($firstReporter.Success) {
+        return $without.Insert($firstReporter.Index, $block)
+    }
+    return $without.TrimEnd() + [Environment]::NewLine + [Environment]::NewLine + $block
+}
+
 function Remove-ReporterBlock {
     param([string]$Text, [string]$Id)
 
@@ -206,6 +245,7 @@ function Write-CfConfig {
                 $updated = Remove-ReporterBlock $existing $ReporterId
                 $content = $updated.TrimEnd() + [Environment]::NewLine + [Environment]::NewLine +
                     (New-CfReporterBlock) + [Environment]::NewLine
+                $content = Set-AutoUpdateBlock $content
                 [IO.File]::WriteAllText($ConfigPath, $content, $Utf8NoBom)
                 Write-Host "Preserved other Reporters and upserted CF Reporter '$ReporterId'."
                 return
@@ -215,6 +255,11 @@ function Write-CfConfig {
 
     $lines = New-Object 'System.Collections.Generic.List[string]'
     $lines.Add(("net_static_path = {0}" -f (ConvertTo-TomlString $NetStaticPath)))
+    $lines.Add("")
+    $lines.Add("[auto_update]")
+    $lines.Add(("enabled = {0}" -f $AutoUpdateEnabled.ToString().ToLowerInvariant()))
+    $lines.Add(("channel = {0}" -f (ConvertTo-TomlString $UpdateChannel)))
+    $lines.Add("check_interval = 21600")
     $lines.Add("")
     $lines.Add((New-CfReporterBlock))
     [IO.File]::WriteAllLines($ConfigPath, $lines, $Utf8NoBom)
