@@ -310,6 +310,32 @@ impl NetStatic {
         rx_gb: f64,
         tx_gb: f64,
     ) {
+        self.store_correction(reporter_id, period_start, raw_monthly, rx_gb, tx_gb, true);
+    }
+
+    /// Apply an installer/operator supplied correction without scheduling a
+    /// CF protocol acknowledgement. The server did not issue this correction,
+    /// so presenting it as a remote-command confirmation would be incorrect.
+    pub fn apply_local_correction(
+        &self,
+        reporter_id: &str,
+        period_start: i64,
+        raw_monthly: (u64, u64),
+        rx_gb: f64,
+        tx_gb: f64,
+    ) {
+        self.store_correction(reporter_id, period_start, raw_monthly, rx_gb, tx_gb, false);
+    }
+
+    fn store_correction(
+        &self,
+        reporter_id: &str,
+        period_start: i64,
+        raw_monthly: (u64, u64),
+        rx_gb: f64,
+        tx_gb: f64,
+        confirm_pending: bool,
+    ) {
         const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
         let rx_bytes = (rx_gb * GIB).round() as i64;
         let tx_bytes = (tx_gb * GIB).round() as i64;
@@ -323,13 +349,13 @@ impl NetStatic {
                     tx_offset: tx_bytes - raw_monthly.1 as i64,
                     rx_gb,
                     tx_gb,
-                    confirm_pending: true,
+                    confirm_pending,
                 },
             );
             inner.dirty = true;
         }
         self.flush();
-        tracing::info!(rx_gb, tx_gb, "流量校正已应用");
+        tracing::info!(reporter_id, rx_gb, tx_gb, confirm_pending, "流量校正已应用");
     }
 
     /// 待回传的校正确认值（GB 原值）

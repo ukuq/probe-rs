@@ -720,11 +720,14 @@ impl SharedConfig {
 
     #[cfg(test)]
     pub fn apply_remote(&self, remote: RemoteConfig) -> Result<()> {
-        self.apply_remote_for("primary", remote)
+        self.apply_remote_for("primary", remote).map(|_| ())
     }
 
     /// 远端配置只写入产生它的 Reporter；全局采集配置永不受上报端影响。
-    pub fn apply_remote_for(&self, reporter_id: &str, remote: RemoteConfig) -> Result<()> {
+    /// Returns true only when a new config_version was successfully persisted
+    /// and applied. Callers can use this to trigger one-shot side effects
+    /// without reacting to idempotent responses.
+    pub fn apply_remote_for(&self, reporter_id: &str, remote: RemoteConfig) -> Result<bool> {
         {
             let current = self.inner.read().expect("config lock poisoned");
             let version = current
@@ -732,7 +735,7 @@ impl SharedConfig {
                 .ok_or_else(|| anyhow::anyhow!("Reporter 不存在: {reporter_id}"))?
                 .config_version;
             if remote.config_version.is_empty() || remote.config_version == version {
-                return Ok(());
+                return Ok(false);
             }
         }
         validate_remote(&remote)?;
@@ -743,7 +746,7 @@ impl SharedConfig {
                 .ok_or_else(|| anyhow::anyhow!("Reporter 不存在: {reporter_id}"))?
                 .config_version
         {
-            return Ok(());
+            return Ok(false);
         }
         let RemoteConfig {
             config_version,
@@ -819,7 +822,7 @@ impl SharedConfig {
         });
         self.config_tx.send_replace(full);
         tracing::info!(reporter_id, config_version, "Reporter 远端配置已应用");
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -857,7 +860,7 @@ pub fn load(path: &Path) -> Result<LocalConfig> {
 }
 
 /// tmp + rename 原子写
-fn persist(path: &Path, cfg: &LocalConfig) -> Result<()> {
+pub(crate) fn persist(path: &Path, cfg: &LocalConfig) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -1327,21 +1330,24 @@ ping = 30
         let (shared, rx, _config_rx) = SharedConfig::new(cfg, path.clone());
 
         // 版本相同或为空：忽略（!= 语义，空版本号视为无版本）
-        shared
-            .apply_remote(RemoteConfig {
-                config_version: String::new(),
-                intervals: None,
-                report_interval: Some(1),
-                reset_day: Some(5),
-                interfaces: None,
-                disks: None,
-                pings: None,
-                report_gpu: None,
-                report_errors: None,
-                report_self: None,
-                ext: None,
-            })
-            .unwrap();
+        assert!(!shared
+            .apply_remote_for(
+                "primary",
+                RemoteConfig {
+                    config_version: String::new(),
+                    intervals: None,
+                    report_interval: Some(1),
+                    reset_day: Some(5),
+                    interfaces: None,
+                    disks: None,
+                    pings: None,
+                    report_gpu: None,
+                    report_errors: None,
+                    report_self: None,
+                    ext: None,
+                }
+            )
+            .unwrap());
         assert_eq!(shared.get().reporter("primary").unwrap().reset_day, 1);
 
         // 零值间隔：整体拒绝
@@ -1363,21 +1369,25 @@ ping = 30
         assert_eq!(shared.get().reporter("primary").unwrap().config_version, "");
 
         // 合法：应用并落盘
-        shared
-            .apply_remote(RemoteConfig {
-                config_version: "2026-08-06T15:00:00+08:00".into(),
-                intervals: None,
-                report_interval: Some(20),
-                reset_day: Some(15),
-                interfaces: None,
-                disks: None,
-                pings: None,
-                report_gpu: None,
-                report_errors: None,
-                report_self: None,
-                ext: None,
-            })
+        let applied = shared
+            .apply_remote_for(
+                "primary",
+                RemoteConfig {
+                    config_version: "2026-08-06T15:00:00+08:00".into(),
+                    intervals: None,
+                    report_interval: Some(20),
+                    reset_day: Some(15),
+                    interfaces: None,
+                    disks: None,
+                    pings: None,
+                    report_gpu: None,
+                    report_errors: None,
+                    report_self: None,
+                    ext: None,
+                },
+            )
             .unwrap();
+        assert!(applied);
         let after = shared.get();
         let primary = after.reporter("primary").unwrap();
         assert_eq!(primary.config_version, "2026-08-06T15:00:00+08:00");
@@ -1391,6 +1401,31 @@ ping = 30
             "2026-08-06T15:00:00+08:00"
         );
         assert_eq!(on_disk.reporters[0].report_interval, 20);
+
+        // The same CF config version is idempotent and must not trigger
+        // one-shot work such as an update check again.
+        assert!(!shared
+            .apply_remote_for(
+                "primary",
+                RemoteConfig {
+                    config_version: "2026-08-06T15:00:00+08:00".into(),
+                    intervals: None,
+                    report_interval: Some(30),
+                    reset_day: None,
+                    interfaces: None,
+                    disks: None,
+                    pings: None,
+                    report_gpu: None,
+                    report_errors: None,
+                    report_self: None,
+                    ext: None,
+                }
+            )
+            .unwrap());
+        assert_eq!(
+            shared.get().reporter("primary").unwrap().intervals.report,
+            20
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

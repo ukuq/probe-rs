@@ -46,6 +46,7 @@ enum CheckOutcome {
 
 pub fn spawn(
     mut config_rx: watch::Receiver<LocalConfig>,
+    mut check_trigger_rx: watch::Receiver<u64>,
     shutdown_tx: watch::Sender<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -65,6 +66,10 @@ pub fn spawn(
                         let desired = config_rx.borrow().auto_update.clone();
                         check_now = desired.enabled && desired != settings;
                         settings = desired;
+                    }
+                    changed = check_trigger_rx.changed() => {
+                        if changed.is_err() { return; }
+                        tracing::debug!("update trigger ignored because automatic updates are disabled");
                     }
                     changed = shutdown_rx.changed() => {
                         if changed.is_err() || *shutdown_rx.borrow() { return; }
@@ -122,6 +127,11 @@ pub fn spawn(
                         );
                     }
                 }
+                changed = check_trigger_rx.changed() => {
+                    if changed.is_err() { return; }
+                    check_now = true;
+                    tracing::info!("automatic update check requested by CF config change");
+                }
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() { return; }
                 }
@@ -165,7 +175,11 @@ async fn check_and_apply(settings: &AutoUpdateConfig) -> Result<CheckOutcome> {
         .with_context(|| format!("failed to download {asset_name}"))?;
     verify_sha256(&binary, &expected, asset_name)?;
 
-    let suffix = asset_name.ends_with(".exe").then_some(".exe").unwrap_or("");
+    let suffix = if asset_name.ends_with(".exe") {
+        ".exe"
+    } else {
+        ""
+    };
     let staging = tokio::task::spawn_blocking(move || -> Result<tempfile::NamedTempFile> {
         use std::io::Write;
 

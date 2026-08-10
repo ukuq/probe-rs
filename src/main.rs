@@ -1,6 +1,7 @@
 mod buffer;
 mod collector;
 mod config;
+mod install_cli;
 mod model;
 mod netstatic;
 mod reporter;
@@ -29,15 +30,24 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if install_cli::run_if_requested()? {
+        return Ok(());
+    }
+
     #[cfg(windows)]
     if std::env::args_os().any(|arg| arg == "--tray") {
         return tray::run();
     }
 
+    let default_filter = if std::env::args_os().any(|arg| arg == "--debug") {
+        "debug"
+    } else {
+        "info"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter)),
         )
         .init();
 
@@ -80,9 +90,11 @@ async fn main() -> Result<()> {
         .map(|spec| spec.id.as_str());
     let net = netstatic::NetStatic::load_with_legacy_reporter(&net_static_path, legacy_cf_reporter);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (update_check_tx, update_check_rx) = watch::channel(0_u64);
 
     updater::spawn(
         shared.subscribe_config(),
+        update_check_rx,
         shutdown_tx.clone(),
         shutdown_rx.clone(),
     );
@@ -273,6 +285,7 @@ async fn main() -> Result<()> {
             slow_rx.clone(),
             diskio_rx.clone(),
             shutdown_rx.clone(),
+            update_check_tx.clone(),
             AGENT_VERSION.to_string(),
             komari_tx,
         );

@@ -23,6 +23,8 @@ param(
 
     [switch]$NoStart,
 
+    [switch]$DebugLog,
+
     [switch]$Purge
 )
 
@@ -213,9 +215,13 @@ function Install-Probe {
         Write-Host "Keeping existing config: $ConfigPath"
     }
 
+    $agentArguments = ('--config "{0}"' -f $ConfigPath)
+    if ($DebugLog) {
+        $agentArguments += ' --debug'
+    }
     $taskAction = New-ScheduledTaskAction `
         -Execute $InstalledBinary `
-        -Argument ('--config "{0}"' -f $ConfigPath) `
+        -Argument $agentArguments `
         -WorkingDirectory $InstallDir
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal `

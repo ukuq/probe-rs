@@ -1,51 +1,58 @@
-#!/usr/bin/env bash
-# probe-rs CF 模式一键安装脚本（自包含单文件）
-#
-# 与 CF-Server-Monitor 官方 install.sh 参数完全一致——把管道里的 URL 换成这个脚本即可：
-#   curl -sL https://<你的地址>/cf-install.sh | bash -s install \
-#     -id=<CF后台分配的UUID> -secret=<API_SECRET> -url=https://<worker>/update \
-#     -collect_interval=0 -interval=60 -reset_day=1 \
-#     -ct=gd-ct-dualstack.ip.zstaticcdn.com -cu=gd-cu-dualstack.ip.zstaticcdn.com \
-#     -cm=gd-cm-dualstack.ip.zstaticcdn.com -bd=ip.zstaticcdn.com
-#
-# 额外参数（官方没有，可选）：
-#   -bin=<路径或URL>   指定 probe-rs 二进制来源；缺省从 GitHub Releases 按架构下载
-# 官方参数里的 -auto_update 映射为全局自动更新开关；
-# -rx_correction/-tx_correction 忽略（校正由服务端运行时下发，agent 原生支持）。
-#
-# 卸载：bash cf-install.sh uninstall [--purge]
-set -euo pipefail
+#!/bin/sh
+# probe-rs CF mode installer. POSIX sh compatible, including:
+#   curl -fsSL <url>/cf-install.sh | sh -s -- install -id=... -secret=... -url=...
+set -eu
 
 BIN_DST=/usr/local/bin/probe-rs
 CONF_DIR=/etc/probe-rs
 DATA_DIR=/var/lib/probe-rs
 UNIT_DST=/etc/systemd/system/probe-rs.service
-RELEASE_BASE="https://github.com/ukuq/probe-rs/releases/latest/download"
+CONFIG_PATH=$CONF_DIR/config.toml
+SCRIPT_VERSION=v0.1.3-beta.2
+GITHUB_REPO=https://github.com/ukuq/probe-rs
+
+log() { printf '%s\n' "[probe-rs] $*"; }
+die() { printf '%s\n' "[probe-rs] error: $*" >&2; exit 1; }
 
 usage() {
-    cat <<'EOF'
-用法: bash cf-install.sh install -id=<UUID> -secret=<SECRET> -url=<https://.../update> [选项]
-      bash cf-install.sh uninstall [--purge]
-
-选项（与官方一致）:
-  -id=               CF 后台分配的服务器 UUID（必填）
-  -secret=           API_SECRET（必填）
-  -url=              上报地址，形如 https://<worker>/update（必填）
-  -collect_interval= 采样间隔秒（0 兼容映射为 1 秒；缺省 0）
-  -interval=         上报间隔秒（缺省 60）
-  -reset_day=        月流量账期重置日 1-31，0 = 不重置（缺省 1）
-  -ct= -cu= -cm= -bd=  电信/联通/移动/BGP 探测节点 host[:port]
-  -auto_update=      自动更新开关：0/1（缺省 0）
-  -rx_correction= -tx_correction=  忽略（校正由服务端运行时下发）
-额外:
-  -bin=              二进制来源（本地路径或 URL），缺省 GitHub Releases
-  -reporter_id=      已有配置中追加/更新的 Reporter id（缺省 cf）
-  -update_channel=   stable / prerelease（缺省 stable）
-EOF
+    printf '%s\n' \
+        'Usage: sh cf-install.sh install -id=<UUID> -secret=<SECRET> -url=<HTTP(S) URL> [options]' \
+        '       sh cf-install.sh uninstall [--purge]' \
+        '' \
+        'CF-compatible options:' \
+        '  -collect_interval= / -collect=       collection seconds (0 maps to 1)' \
+        '  -interval=                           report seconds' \
+        '  -reset_day=                          0-31' \
+        '  -ct= -cu= -cm= -bd=                 ping targets' \
+        '  -interface= / -interfaces= / -iface= comma-separated interface globs' \
+        '  -auto_update= / -auto-update=        0/1' \
+        '  -rx_correction= -tx_correction=      current billing-period totals in GiB' \
+        '  -debug=                              0/1' \
+        '  -install-version=                    release tag (default: script version)' \
+        '  -install-ghproxy=                    GitHub proxy URL prefix' \
+        '  -no_start= / -no-start=              0/1' \
+        '' \
+        'probe-rs options:' \
+        '  -reporter_id= / --reporter-id=       upsert one CF Reporter' \
+        '  -replace_cf=                         replace all CF Reporters only' \
+        '  -update_channel=                     stable/prerelease' \
+        '  -bin=                                local path or HTTP(S) binary URL'
 }
 
-log() { echo "[probe-rs] $*"; }
-die() { echo "[probe-rs] 错误: $*" >&2; exit 1; }
+parse_bool() {
+    case "$2" in
+        1|true|TRUE|yes|YES) eval "$1=true" ;;
+        0|false|FALSE|no|NO|'') eval "$1=false" ;;
+        *) die "$3 must be 0 or 1" ;;
+    esac
+}
+
+normalize_uint() {
+    case "$2" in ''|*[!0-9]*) die "$1 must be a non-negative integer" ;; esac
+    normalized=$(printf '%s' "$2" | sed 's/^0*//')
+    [ -n "$normalized" ] || normalized=0
+    printf '%s' "$normalized"
+}
 
 do_uninstall() {
     systemctl disable --now probe-rs 2>/dev/null || true
@@ -53,302 +60,209 @@ do_uninstall() {
     systemctl daemon-reload 2>/dev/null || true
     if [ "${1:-}" = "--purge" ]; then
         rm -rf "$CONF_DIR" "$DATA_DIR"
-        log "已卸载并清除配置与数据"
+        log "uninstalled probe-rs and removed its config/data"
     else
-        log "已卸载（保留 $CONF_DIR 与 $DATA_DIR，加 --purge 全清）"
+        log "uninstalled probe-rs; config/data were kept"
     fi
 }
 
-CMD="${1:-}"
-[ $# -gt 0 ] && shift || true
-case "$CMD" in
-    uninstall) [ "$(id -u)" = 0 ] || die "需要 root"; do_uninstall "${1:-}"; exit 0 ;;
+COMMAND=${1:-}
+[ "$#" -gt 0 ] && shift || true
+case "$COMMAND" in
+    uninstall)
+        [ "$(id -u)" = 0 ] || die "root is required"
+        do_uninstall "${1:-}"
+        exit 0
+        ;;
     install) ;;
     *) usage; exit 1 ;;
 esac
 
-ID=""; SECRET=""; URL=""; COLLECT=0; REPORT=60; RESET_DAY=1
-CT=""; CU=""; CM=""; BD=""; BIN=""; REPORTER_ID="cf"
-AUTO_UPDATE=false; UPDATE_CHANNEL=stable
-UPDATE_SETTINGS_SET=false
+ID= SECRET= URL= BIN=
+COLLECT= REPORT= RESET_DAY= INTERFACES=
+CT= CU= CM= BD=
+AUTO_UPDATE= UPDATE_CHANNEL= RX_CORRECTION= TX_CORRECTION=
+REPORTER_ID= INSTALL_VERSION=$SCRIPT_VERSION GH_PROXY=
+DEBUG=false NO_START=false REPLACE_CF=false
+COLLECT_SET=false REPORT_SET=false RESET_SET=false INTERFACES_SET=false
+CT_SET=false CU_SET=false CM_SET=false BD_SET=false
+AUTO_UPDATE_SET=false UPDATE_CHANNEL_SET=false REPORTER_ID_SET=false
+RX_SET=false TX_SET=false DEBUG_SET=false
+
 for arg in "$@"; do
     case "$arg" in
-        -id=*)              ID="${arg#-id=}" ;;
-        -secret=*)          SECRET="${arg#-secret=}" ;;
-        -url=*)             URL="${arg#-url=}" ;;
-        -collect_interval=*) COLLECT="${arg#-collect_interval=}" ;;
-        -interval=*)        REPORT="${arg#-interval=}" ;;
-        -reset_day=*)       RESET_DAY="${arg#-reset_day=}" ;;
-        -ct=*)              CT="${arg#-ct=}" ;;
-        -cu=*)              CU="${arg#-cu=}" ;;
-        -cm=*)              CM="${arg#-cm=}" ;;
-        -bd=*)              BD="${arg#-bd=}" ;;
-        -bin=*)             BIN="${arg#-bin=}" ;;
-        -reporter_id=*|--reporter-id=*) REPORTER_ID="${arg#*=}" ;;
-        -auto_update=*)
-            UPDATE_SETTINGS_SET=true
-            case "${arg#*=}" in
-                1|true|TRUE|yes|YES) AUTO_UPDATE=true ;;
-                0|false|FALSE|no|NO|'') AUTO_UPDATE=false ;;
-                *) die "-auto_update must be 0 or 1" ;;
-            esac ;;
-        -update_channel=*|--update-channel=*) UPDATE_CHANNEL="${arg#*=}"; UPDATE_SETTINGS_SET=true ;;
-        -rx_correction=*|-tx_correction=*)
-            log "参数 $arg 忽略（见脚本头注释）" ;;
-        *) die "未知参数: $arg" ;;
+        -id=*) ID=${arg#*=} ;;
+        -secret=*) SECRET=${arg#*=} ;;
+        -url=*) URL=${arg#*=} ;;
+        -collect_interval=*|-collect=*) COLLECT=${arg#*=}; COLLECT_SET=true ;;
+        -interval=*) REPORT=${arg#*=}; REPORT_SET=true ;;
+        -reset_day=*) RESET_DAY=${arg#*=}; RESET_SET=true ;;
+        -ct=*) CT=${arg#*=}; CT_SET=true ;;
+        -cu=*) CU=${arg#*=}; CU_SET=true ;;
+        -cm=*) CM=${arg#*=}; CM_SET=true ;;
+        -bd=*) BD=${arg#*=}; BD_SET=true ;;
+        -interface=*|-interfaces=*|-iface=*) INTERFACES=${arg#*=}; INTERFACES_SET=true ;;
+        -auto_update=*|-auto-update=*)
+            AUTO_UPDATE=${arg#*=}; AUTO_UPDATE_SET=true
+            parse_bool AUTO_UPDATE "$AUTO_UPDATE" "auto_update"
+            ;;
+        -update_channel=*|--update-channel=*)
+            UPDATE_CHANNEL=${arg#*=}; UPDATE_CHANNEL_SET=true
+            ;;
+        -rx_correction=*) RX_CORRECTION=${arg#*=}; RX_SET=true ;;
+        -tx_correction=*) TX_CORRECTION=${arg#*=}; TX_SET=true ;;
+        -reporter_id=*|--reporter-id=*)
+            REPORTER_ID=${arg#*=}; REPORTER_ID_SET=true
+            ;;
+        -replace_cf=*|--replace-cf=*)
+            REPLACE_CF=${arg#*=}
+            parse_bool REPLACE_CF "$REPLACE_CF" "replace_cf"
+            ;;
+        -debug=*)
+            DEBUG=${arg#*=}; DEBUG_SET=true
+            parse_bool DEBUG "$DEBUG" "debug"
+            ;;
+        -no_start=*|-no-start=*)
+            NO_START=${arg#*=}
+            parse_bool NO_START "$NO_START" "no_start"
+            ;;
+        -install-version=*|--install-version=*) INSTALL_VERSION=${arg#*=} ;;
+        -install-ghproxy=*|--install-ghproxy=*) GH_PROXY=${arg#*=} ;;
+        -bin=*|--bin=*) BIN=${arg#*=} ;;
+        *) die "unknown option: $arg" ;;
     esac
 done
 
-case "$REPORTER_ID" in
-    ''|*[!A-Za-z0-9_.-]*) die "reporter id must use A-Z, a-z, 0-9, _, . or -" ;;
-esac
-case "$UPDATE_CHANNEL" in
-    stable|prerelease) ;;
-    *) die "update channel must be stable or prerelease" ;;
-esac
+[ "$(id -u)" = 0 ] || die "root is required"
+[ -n "$ID" ] || die "missing -id="
+[ -n "$SECRET" ] || die "missing -secret="
+[ -n "$URL" ] || die "missing -url="
+command -v systemctl >/dev/null 2>&1 || die "systemd is required"
 
-[ "$(id -u)" = 0 ] || die "需要 root（sudo 或 root 执行）"
-[ -n "$ID" ] || die "缺少 -id="
-[ -n "$SECRET" ] || die "缺少 -secret="
-[ -n "$URL" ] || die "缺少 -url="
-command -v systemctl >/dev/null || die "仅支持 systemd 系统"
-# 内部采集与上报严格分离，collect 至少 1 秒；0 映射为实时 1 秒，前导零需剥掉
-case "$COLLECT" in ''|*[!0-9]*) COLLECT=1 ;; esac
-case "$REPORT" in ''|*[!0-9]*) REPORT=60 ;; esac
-case "$RESET_DAY" in ''|*[!0-9]*) RESET_DAY=1 ;; esac
-COLLECT=$((10#$COLLECT)); REPORT=$((10#$REPORT)); RESET_DAY=$((10#$RESET_DAY))
-[ "$COLLECT" -lt 1 ] && COLLECT=1
-[ "$REPORT" -lt 1 ] && REPORT=60
-
-# TOML 字符串转义（\ 与 " 防注入/解析失败）
-toml_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
-ID=$(toml_escape "$ID"); SECRET=$(toml_escape "$SECRET"); URL=$(toml_escape "$URL")
-CT=$(toml_escape "$CT"); CU=$(toml_escape "$CU"); CM=$(toml_escape "$CM"); BD=$(toml_escape "$BD")
-
-# ---- 二进制 ----
-TMP_BIN=$(mktemp /tmp/probe-rs.XXXXXX)
-if [ -z "$BIN" ]; then
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64|amd64)   arch=x86_64 ;;
-        aarch64|arm64)  arch=aarch64 ;;
-        *) die "不支持的架构: $arch" ;;
-    esac
-    BIN="$RELEASE_BASE/probe-rs-linux-$arch"
+if [ "$COLLECT_SET" = true ]; then
+    COLLECT=$(normalize_uint collect_interval "$COLLECT")
+    [ "$COLLECT" -gt 0 ] || COLLECT=1
 fi
+if [ "$REPORT_SET" = true ]; then
+    REPORT=$(normalize_uint interval "$REPORT")
+    [ "$REPORT" -gt 0 ] || die "interval must be at least 1"
+fi
+if [ "$RESET_SET" = true ]; then
+    RESET_DAY=$(normalize_uint reset_day "$RESET_DAY")
+    [ "$RESET_DAY" -le 31 ] || die "reset_day must be between 0 and 31"
+fi
+if [ "$REPORTER_ID_SET" = true ]; then
+    case "$REPORTER_ID" in ''|*[!A-Za-z0-9_.-]*) die "invalid reporter_id" ;; esac
+fi
+if [ "$UPDATE_CHANNEL_SET" = true ]; then
+    case "$UPDATE_CHANNEL" in stable|prerelease) ;; *) die "invalid update_channel" ;; esac
+fi
+if [ "$DEBUG_SET" = false ] && [ -f "$UNIT_DST" ] && grep -q ' --debug' "$UNIT_DST"; then
+    DEBUG=true
+fi
+
+install -d -m 0755 "$DATA_DIR"
+install -d -m 0750 "$CONF_DIR"
+
+TMP_BIN=$(mktemp /tmp/probe-rs.XXXXXX)
+TMP_SUM=
+INSTALL_COMPLETE=false
+WAS_ACTIVE=false
+cleanup() {
+    status=$?
+    trap - 0 HUP INT TERM
+    rm -f "$TMP_BIN"
+    [ -z "$TMP_SUM" ] || rm -f "$TMP_SUM"
+    if [ "$status" -ne 0 ] && [ "$WAS_ACTIVE" = true ] && [ "$INSTALL_COMPLETE" = false ]; then
+        systemctl start probe-rs 2>/dev/null || true
+    fi
+    exit "$status"
+}
+trap cleanup 0
+trap 'exit 1' HUP INT TERM
+
+arch=$(uname -m)
+case "$arch" in
+    x86_64|amd64) asset=probe-rs-linux-x86_64 ;;
+    aarch64|arm64) asset=probe-rs-linux-aarch64 ;;
+    *) die "unsupported architecture: $arch" ;;
+esac
+
+if [ -z "$BIN" ]; then
+    case "$INSTALL_VERSION" in
+        latest) release_base=$GITHUB_REPO/releases/latest/download ;;
+        '') die "install-version must not be empty" ;;
+        *)
+            case "$INSTALL_VERSION" in v*) tag=$INSTALL_VERSION ;; *) tag=v$INSTALL_VERSION ;; esac
+            case "$tag" in *[!A-Za-z0-9._-]*) die "invalid install-version" ;; esac
+            release_base=$GITHUB_REPO/releases/download/$tag
+            ;;
+    esac
+    BIN=$release_base/$asset
+    SUM_URL=$release_base/SHA256SUMS
+    if [ -n "$GH_PROXY" ]; then
+        BIN=${GH_PROXY%/}/$BIN
+        SUM_URL=${GH_PROXY%/}/$SUM_URL
+    fi
+fi
+
 if [ -f "$BIN" ]; then
     cp -f "$BIN" "$TMP_BIN"
 else
-    log "下载二进制: $BIN"
-    curl -fSL --connect-timeout 10 -o "$TMP_BIN" "$BIN" || die "二进制下载失败（可用 -bin= 指定本地路径）"
-fi
-install -m 0755 "$TMP_BIN" "$BIN_DST"
-rm -f "$TMP_BIN"
-
-# ---- 配置 ----
-install -d -m 0755 "$DATA_DIR"
-install -d -m 0750 "$CONF_DIR"
-CONFIG_PATH="$CONF_DIR/config.toml"
-
-remove_reporter_block() {
-    cfg="$1"; target="$2"; tmp=$(mktemp "$CONF_DIR/config.toml.XXXXXX")
-    awk -v target="$target" '
-        function flush() {
-            if (in_reporter && !drop) printf "%s", block
-            block=""; drop=0
-        }
-        /^[[:space:]]*\[\[reporters\]\][[:space:]]*$/ {
-            if (in_reporter) flush()
-            in_reporter=1; block=$0 ORS; next
-        }
-        {
-            if (in_reporter && $0 ~ /^[[:space:]]*\[/ &&
-                $0 !~ /^[[:space:]]*\[\[?reporters(\.|\]\])/) {
-                flush(); in_reporter=0
-            }
-            if (in_reporter) {
-                block=block $0 ORS
-                if ($0 ~ /^[[:space:]]*id[[:space:]]*=/) {
-                    value=$0
-                    sub(/^[^=]*=[[:space:]]*/, "", value)
-                    sub(/[[:space:]]*#.*$/, "", value)
-                    sub(/[[:space:]]+$/, "", value)
-                    double_quoted="\"" target "\""
-                    single_quoted=sprintf("%c%s%c", 39, target, 39)
-                    if (value == double_quoted || value == single_quoted) drop=1
-                }
-            } else print
-        }
-        END { if (in_reporter) flush() }
-    ' "$cfg" > "$tmp"
-    mv -f "$tmp" "$cfg"
-}
-strip_seeded_sample_reporters() {
-    cfg="$1"; tmp=$(mktemp "$CONF_DIR/config.toml.XXXXXX")
-    awk '
-        function flush() {
-            if (in_reporter && !seeded) printf "%s", block
-            block=""; seeded=0
-        }
-        /^[[:space:]]*\[\[reporters\]\][[:space:]]*$/ {
-            if (in_reporter) flush()
-            in_reporter=1; block=$0 ORS; next
-        }
-        {
-            if (in_reporter && $0 ~ /^[[:space:]]*\[/ &&
-                $0 !~ /^[[:space:]]*\[\[?reporters(\.|\]\])/) {
-                flush(); in_reporter=0
-            }
-            if (in_reporter) {
-                block=block $0 ORS
-                if ($0 ~ /^[[:space:]]*server_id[[:space:]]*=[[:space:]]*"cf-server-uuid"/) seeded=1
-                if ($0 ~ /^[[:space:]]*worker_url[[:space:]]*=[[:space:]]*"https:\/\/monitor\.example\.com\/update"/) seeded=1
-                if ($0 ~ /^[[:space:]]*worker_url[[:space:]]*=[[:space:]]*"https:\/\/komari\.example\.com"/) seeded=1
-                if ($0 ~ /^[[:space:]]*worker_url[[:space:]]*=[[:space:]]*"http:\/\/127\.0\.0\.1:8080\/report"/) seeded=1
-            } else print
-        }
-        END { if (in_reporter) flush() }
-    ' "$cfg" > "$tmp"
-    mv -f "$tmp" "$cfg"
-}
-
-upsert_auto_update_config() {
-    cfg="$1"; tmp=$(mktemp "$CONF_DIR/config.toml.XXXXXX")
-    if [ "$UPDATE_SETTINGS_SET" = false ] && grep -q '^[[:space:]]*\[auto_update\][[:space:]]*$' "$cfg"; then
-        rm -f "$tmp"
-        return
+    command -v curl >/dev/null 2>&1 || die "curl is required"
+    log "downloading $BIN"
+    curl -fSL --connect-timeout 10 -o "$TMP_BIN" "$BIN" || die "binary download failed"
+    if [ -n "${SUM_URL:-}" ]; then
+        command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
+        TMP_SUM=$(mktemp /tmp/probe-rs-sha.XXXXXX)
+        curl -fSL --connect-timeout 10 -o "$TMP_SUM" "$SUM_URL" || die "checksum download failed"
+        expected=$(awk -v name="$asset" '$2 == name || $2 == "*" name { print $1; exit }' "$TMP_SUM")
+        [ -n "$expected" ] || die "checksum for $asset is missing"
+        actual=$(sha256sum "$TMP_BIN" | awk '{print $1}')
+        [ "$actual" = "$expected" ] || die "binary checksum mismatch"
     fi
-    awk -v enabled="$AUTO_UPDATE" -v channel="$UPDATE_CHANNEL" '
-        BEGIN { in_auto=0; inserted=0 }
-        /^[[:space:]]*\[auto_update\][[:space:]]*$/ { in_auto=1; next }
-        in_auto && /^[[:space:]]*\[/ { in_auto=0 }
-        in_auto { next }
-        !inserted && /^[[:space:]]*\[\[reporters\]\][[:space:]]*$/ {
-            print "[auto_update]"
-            print "enabled = " enabled
-            print "channel = \"" channel "\""
-            print "check_interval = 21600"
-            print ""
-            inserted=1
-        }
-        { print }
-        END {
-            if (!inserted) {
-                print ""
-                print "[auto_update]"
-                print "enabled = " enabled
-                print "channel = \"" channel "\""
-                print "check_interval = 21600"
-            }
-        }
-    ' "$cfg" > "$tmp"
-    mv -f "$tmp" "$cfg"
-}
+fi
+chmod 0755 "$TMP_BIN"
 
-if [ -s "$CONFIG_PATH" ] && grep -q '^[[:space:]]*\[\[reporters\]\]' "$CONFIG_PATH"; then
-    strip_seeded_sample_reporters "$CONFIG_PATH"
+if command -v pgrep >/dev/null 2>&1 && pgrep -x cf-probe >/dev/null 2>&1; then
+    log "warning: official cf-probe is still running; using the same credentials will duplicate reports"
+fi
+if systemctl is-active --quiet probe-rs 2>/dev/null; then
+    WAS_ACTIVE=true
+    systemctl stop probe-rs
 fi
 
+install -m 0755 "$TMP_BIN" "$BIN_DST"
 
-if [ -s "$CONFIG_PATH" ] &&
-   grep -q '^[[:space:]]*\[\[reporters\]\]' "$CONFIG_PATH" &&
-   ! awk '
-       /^[[:space:]]*\[intervals\][[:space:]]*$/ || /^[[:space:]]*\[\[pings\]\][[:space:]]*$/ { found=1; exit }
-       /^[[:space:]]*\[/ { exit }
-       /^[[:space:]]*(server_id|enable_gpu)[[:space:]]*=/ { found=1 }
-       END { exit found ? 0 : 1 }
-   ' "$CONFIG_PATH"; then
-    # 新 schema 中每路声明需求，实际 worker 配置由所有 Reporter 聚合。
-    remove_reporter_block "$CONFIG_PATH" "$REPORTER_ID"
-    {
-        echo ""
-        echo "[[reporters]]"
-        echo "id = \"$REPORTER_ID\""
-        echo 'protocol = "cf"'
-        echo "server_id = \"$ID\""
-        echo "secret = \"$SECRET\""
-        echo "worker_url = \"$URL\""
-        echo 'config_version = ""'
-        echo "report_interval = $REPORT"
-        echo "reset_day = $RESET_DAY"
-        echo "interfaces = []"
-        echo "disks = []"
-        echo "report_gpu = true"
-        echo "report_errors = true"
-        echo "report_self = false"
-        echo ""
-        echo "[reporters.intervals]"
-        echo "collect = $COLLECT"
-        echo "ping = 30"
-        echo "slow = 60"
-        echo "gpu = 60"
-        echo "ip = 600"
-        echo "diskio = 10"
-        for pair in "ct:$CT" "cu:$CU" "cm:$CM" "bd:$BD"; do
-            name="${pair%%:*}"; target="${pair#*:}"
-            [ -n "$target" ] || continue
-            echo ""
-            echo "[[reporters.pings]]"
-            echo "name = \"$name\""
-            echo 'type = "tcp"'
-            echo "target = \"$target\""
-            echo "interval = 30"
-        done
-        echo ""
-        echo "[reporters.ext.cf]"
-        echo "correction = true"
-        echo "batch = true"
-    } >> "$CONFIG_PATH"
-    log "preserved other Reporters and upserted CF Reporter '$REPORTER_ID'"
-else
-    # 缺失配置或旧的根连接 schema 都直接覆盖为新 canonical 格式，不做兼容迁移。
-{
-    echo "net_static_path = \"$DATA_DIR/net_static.json\""
-    echo ""
-    echo "[[reporters]]"
-    echo "id = \"$REPORTER_ID\""
-    echo 'protocol = "cf"'
-    echo "server_id = \"$ID\""
-    echo "secret = \"$SECRET\""
-    echo "worker_url = \"$URL\""
-    echo 'config_version = ""'
-    echo "report_interval = $REPORT"
-    echo "reset_day = $RESET_DAY"
-    echo "interfaces = []"
-    echo "disks = []"
-    echo "report_gpu = true"
-    echo "report_errors = true"
-    echo "report_self = false"
-    echo ""
-    echo "[reporters.intervals]"
-    echo "collect = $COLLECT"
-    echo "ping = 30"
-    echo "slow = 60"
-    echo "gpu = 60"
-    echo "ip = 600"
-    echo "diskio = 10"
-    for pair in "ct:$CT" "cu:$CU" "cm:$CM" "bd:$BD"; do
-        name="${pair%%:*}"; target="${pair#*:}"
-        [ -n "$target" ] || continue
-        echo ""
-        echo "[[reporters.pings]]"
-        echo "name = \"$name\""
-        echo 'type = "tcp"'
-        echo "target = \"$target\""
-        echo "interval = 30"
-    done
-    echo ""
-    echo "[reporters.ext.cf]"
-    echo "correction = true"
-    echo "batch = true"
-} > "$CONFIG_PATH"
-    log "wrote a fresh canonical config with CF Reporter '$REPORTER_ID'"
-fi
-upsert_auto_update_config "$CONFIG_PATH"
+set -- configure-cf --config "$CONFIG_PATH" --net-static-path "$DATA_DIR/net_static.json" \
+    --server-id "$ID" --secret "$SECRET" --url "$URL"
+[ "$COLLECT_SET" = false ] || set -- "$@" --collect "$COLLECT"
+[ "$REPORT_SET" = false ] || set -- "$@" --report-interval "$REPORT"
+[ "$RESET_SET" = false ] || set -- "$@" --reset-day "$RESET_DAY"
+[ "$INTERFACES_SET" = false ] || set -- "$@" --interfaces "$INTERFACES"
+[ "$CT_SET" = false ] || set -- "$@" --ct "$CT"
+[ "$CU_SET" = false ] || set -- "$@" --cu "$CU"
+[ "$CM_SET" = false ] || set -- "$@" --cm "$CM"
+[ "$BD_SET" = false ] || set -- "$@" --bd "$BD"
+[ "$AUTO_UPDATE_SET" = false ] || set -- "$@" --auto-update "$AUTO_UPDATE"
+[ "$UPDATE_CHANNEL_SET" = false ] || set -- "$@" --update-channel "$UPDATE_CHANNEL"
+[ "$REPORTER_ID_SET" = false ] || set -- "$@" --reporter-id "$REPORTER_ID"
+[ "$REPLACE_CF" = false ] || set -- "$@" --replace-cf
+SELECTED_REPORTER=$($BIN_DST "$@")
+[ -n "$SELECTED_REPORTER" ] || die "CF Reporter selection failed"
 chmod 600 "$CONFIG_PATH"
 
-# ---- systemd unit ----
-cat > "$UNIT_DST" <<'EOF'
+if [ "$RX_SET" = true ] || [ "$TX_SET" = true ]; then
+    set -- set-traffic-correction --config "$CONFIG_PATH" --reporter-id "$SELECTED_REPORTER"
+    [ "$RX_SET" = false ] || set -- "$@" --rx-gib "$RX_CORRECTION"
+    [ "$TX_SET" = false ] || set -- "$@" --tx-gib "$TX_CORRECTION"
+    $BIN_DST "$@"
+    log "applied local traffic correction to Reporter '$SELECTED_REPORTER'"
+fi
+
+DEBUG_ARG=
+[ "$DEBUG" = false ] || DEBUG_ARG=' --debug'
+cat > "$UNIT_DST" <<EOF
 [Unit]
 Description=probe-rs server monitoring agent
 After=network-online.target
@@ -356,12 +270,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/probe-rs
+ExecStart=$BIN_DST$DEBUG_ARG
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=-/var/lib/probe-rs -/etc/probe-rs -/usr/local/bin
+ReadWritePaths=-$DATA_DIR -$CONF_DIR /usr/local/bin
 ProtectHome=true
 PrivateTmp=true
 
@@ -370,11 +284,18 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
+if [ "$NO_START" = true ]; then
+    systemctl disable --now probe-rs >/dev/null 2>&1 || true
+    INSTALL_COMPLETE=true
+    log "installed without starting; Reporter '$SELECTED_REPORTER' is configured"
+    exit 0
+fi
 systemctl enable probe-rs >/dev/null 2>&1 || true
 systemctl restart probe-rs
+INSTALL_COMPLETE=true
 sleep 1
 if systemctl is-active --quiet probe-rs; then
-    log "安装完成，服务运行中。状态: systemctl status probe-rs；日志: journalctl -u probe-rs -f"
+    log "installed and running; Reporter '$SELECTED_REPORTER' is configured"
 else
-    die "服务启动失败，排查: journalctl -u probe-rs -n 20 --no-pager"
+    die "service failed to start; run: journalctl -u probe-rs -n 20 --no-pager"
 fi

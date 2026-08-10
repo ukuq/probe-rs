@@ -221,6 +221,7 @@ pub struct ReporterRunner {
     slow_rx: watch::Receiver<Option<SlowBlock>>,
     diskio_rx: watch::Receiver<Option<crate::model::DiskIoRecord>>,
     shutdown_rx: watch::Receiver<bool>,
+    update_check_tx: watch::Sender<u64>,
     agent_version: String,
     komari_tx: Option<watch::Sender<KomariOut>>,
     last_dynamic: Option<DynamicRecord>,
@@ -244,6 +245,7 @@ impl ReporterRunner {
         slow_rx: watch::Receiver<Option<SlowBlock>>,
         diskio_rx: watch::Receiver<Option<crate::model::DiskIoRecord>>,
         shutdown_rx: watch::Receiver<bool>,
+        update_check_tx: watch::Sender<u64>,
         agent_version: String,
         komari_tx: Option<watch::Sender<KomariOut>>,
     ) -> Self {
@@ -261,6 +263,7 @@ impl ReporterRunner {
             slow_rx,
             diskio_rx,
             shutdown_rx,
+            update_check_tx,
             agent_version,
             komari_tx,
             last_dynamic: None,
@@ -381,10 +384,12 @@ impl ReporterRunner {
                     self.last_static = None;
                 }
                 if let Some(remote) = action.config {
-                    if let Err(error) = self.cfg.apply_remote_for(&self.id, remote) {
-                        tracing::warn!(reporter_id = %self.id, %error, "remote config rejected");
-                    } else {
-                        self.last_static = None;
+                    match self.cfg.apply_remote_for(&self.id, remote) {
+                        Ok(true) => self.last_static = None,
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(reporter_id = %self.id, %error, "remote config rejected");
+                        }
                     }
                 }
                 true
@@ -624,10 +629,17 @@ impl ReporterRunner {
                         &spec.intervals,
                         &current_pings,
                     );
-                    if let Err(error) = self.cfg.apply_remote_for(&self.id, remote) {
-                        tracing::warn!(reporter_id = %self.id, %error, "CF config rejected");
-                    } else {
-                        self.last_static = None;
+                    match self.cfg.apply_remote_for(&self.id, remote) {
+                        Ok(true) => {
+                            self.last_static = None;
+                            self.update_check_tx.send_modify(|generation| {
+                                *generation = generation.wrapping_add(1);
+                            });
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(reporter_id = %self.id, %error, "CF config rejected");
+                        }
                     }
                 }
                 let current = self
