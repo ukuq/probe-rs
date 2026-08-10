@@ -77,13 +77,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             name: probe-rs-linux-x86_64
             os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             name: probe-rs-linux-aarch64
             os: ubuntu-latest
-            linker: aarch64-linux-gnu-gcc
           - target: x86_64-pc-windows-msvc
             name: probe-rs-windows-x86_64.exe
             os: windows-latest
@@ -106,21 +105,40 @@ jobs:
           if ($installed -notcontains '${{ matrix.target }}') {
             throw 'Rust target is not installed: ${{ matrix.target }}'
           }
-      - name: 安装交叉链接器（aarch64）
-        if: matrix.linker
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: 安装 Linux 静态交叉编译工具
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
       - name: 构建（Linux）
         if: runner.os == 'Linux'
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
         run: |
-          cargo +stable build --release --target "${{ matrix.target }}"
+          cross build --locked --release --target "${{ matrix.target }}"
           cp "target/${{ matrix.target }}/release/probe-rs" "${{ matrix.name }}"
+      - name: 验证 Linux 产物为静态链接且不依赖 glibc
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="${{ matrix.name }}"
+          file "$binary"
+          dynamic=$(readelf -d "$binary" 2>&1)
+          if grep -q '(NEEDED)' <<<"$dynamic"; then
+            echo "Linux artifact contains dynamic dependencies:" >&2
+            echo "$dynamic" >&2
+            exit 1
+          fi
+          glibc_refs=$(strings "$binary" | grep -E 'GLIBC_[0-9]+\.[0-9]+' || true)
+          if [ -n "$glibc_refs" ]; then
+            echo "Linux artifact unexpectedly references glibc:" >&2
+            echo "$glibc_refs" >&2
+            exit 1
+          fi
       - name: 构建（Windows）
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cargo +stable build --release --target "${{ matrix.target }}"
+          cargo +stable build --locked --release --target "${{ matrix.target }}"
           Copy-Item "target/${{ matrix.target }}/release/probe-rs.exe" "${{ matrix.name }}"
       - name: 保存构建产物
         uses: actions/upload-artifact@v4

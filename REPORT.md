@@ -40,7 +40,7 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
     "boot_time": 1754300000000,
     "ipv4": "203.0.113.10",
     "ipv6": "2001:db8::10",
-    "agent_version": "0.1.3-beta.2",
+    "agent_version": "0.1.3-beta.3",
     "config": {
       "global": {
         "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
