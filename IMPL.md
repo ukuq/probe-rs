@@ -68,8 +68,9 @@ probe-rs/
 ### 3.2 快照传递（worker/mod.rs）
 
 - 每个 worker 持有一个 `watch::Sender<T>`，主采集/调度器持 `Receiver`。
-- `watch` 语义正好是"只关心最新值"，旧值被覆盖即丢弃——符合"异步只发快照"。
-- 采集端为每个异步源记录"上次摘取的 ts"，快照 ts 更新才把数据带入 dynamic 记录（新鲜度去重）；失败 = 快照 ts 停滞。
+- `watch` 语义正好是“只关心最新值”，旧值被覆盖即丢弃——符合“异步只发快照”。
+- 采集端为每个异步源记录“上次摘取的 ts”，快照 ts 更新才把数据带入 dynamic 记录（新鲜度去重）；失败 = 快照 ts 停滞。
+- 公网 IPv4/IPv6 各自携带真实测量时间；失败保留旧测量但不刷新时间戳，Reporter 按 IP 采集周期与上报周期过滤过期地址。
 
 ### 3.3 缓冲（buffer.rs）
 
@@ -78,11 +79,11 @@ probe-rs/
 
 ### 3.4 netstatic
 
-- 存储：`BTreeMap<String, VecDeque<Entry>>`，Entry = `{ts_ms, rx, tx}`。
+- 存储：每网卡 `VecDeque<Entry>` 明细 + `archived_totals` 永久归档基数，Entry = `{ts_ms, rx, tx}`。
 - 采样 task 每 2s：读 /proc/net/dev → 与上一帧 per-iface 计数器算 delta → `current < prev` 记 0（纪律 2）→ append 内存 + 标记 dirty。
-- 修剪：append 时顺手弹出队首 `ts < now - 31d` 的条目。
+- 修剪：append 时把队首 `ts < now - 31d` 的条目先累加到该网卡归档基数，再从明细弹出。
 - 落盘：每 10min 全量重写 `net_static.json`（tmp + rename 原子写，spawn_blocking）；启动时加载。
-- 查询：`sum(period_start..=now)` 按白名单网卡过滤求和——月流量就是这个调用。
+- 查询：`sum(period_start..=now)` 按白名单网卡过滤求和；`period_start=0` 额外加归档基数，实现真正永久累计。
 - 内存优化（可选二期）：小时粒度合并，见设计书 §5.4。
 
 ### 3.5 账期计算（config.rs 或 netstatic）
@@ -199,7 +200,7 @@ Windows 使用同一套 CF 协议逻辑；CF 一键安装默认启用 GPU 采集
 
 脚本默认下载 `probe-rs-windows-x86_64.exe`，也可用 `-BinarySource`/`-Bin` 指定本地文件或 URL；卸载使用 `.\deploy\cf-install.ps1 uninstall`，加 `-Purge` 可清除配置与流量数据。也可以通过通用 `deploy/install.ps1` 安装后，手动将 `%ProgramData%\probe-rs\config.toml` 的 `protocol` 改为 `"cf"`。
 
-**上报映射**（reporter_cf.rs）：顶层 `{id, secret, metrics, samples[]}`；ram/swap/disk 字节→MB；load 转空格字符串；GPU → `gpu_info:[{id,name,info}]`（显存/温度丢弃）；ping 按组名落 `ping_ct/cu/cm/bd` + `loss_*`（bgp 是 bd 别名，未配置为 `false`，已配置但失败为 `null`）；`ip_v4/v6` 不可达报数值 `0`；`dynamic[]` → `samples[]`（`ext.cf.batch=false` 时只发单条 metrics）。空上报周期复用最近一次独立采集快照，避免 CF 将缺失动态字段写成假 0，但不会由 report 触发采集。errors/self/virtualization 无落点，CF 模式下不产生。
+**上报映射**（reporter_cf.rs）：顶层 `{id, secret, metrics, samples[]}`；ram/swap/disk 字节→MB；load 转空格字符串；GPU → `gpu_info:[{id,name,info}]`（`id` 来自采集端稳定设备标识，显存/温度丢弃，利用率未知的设备不输出）；ping 按组名落 `ping_ct/cu/cm/bd` + `loss_*`（bgp 是 bd 别名，未配置为 `false`，已配置但失败或缓存过期为 `null`）；`ip_v4/v6` 不可达报数值 `0`；`dynamic[]` → `samples[]`（`ext.cf.batch=false` 时只发单条 metrics）。顶层 dynamic/slow/GPU/Ping/disk I/O 快照按各自采集周期与上报周期校验新鲜度，过期字段不再输出；带 `ts` 的 `samples[]` 仍保留历史批量语义，report 不会触发采集。errors/self/virtualization 无落点，CF 模式下不产生。
 
 **配置下发**：请求头 `X-Agent-Config-Schema: 3` + `X-Agent-Config-Md5`（复用 `config_version` 字段存 MD5，空 = `none`）。响应 204 = 无变更；200 + URL-encoded body → 解析 collect_interval/report_interval/reset_day/custom_ct/cu/cm/bd/interface，合成 `RemoteConfig`（config_version 取响应头 MD5）走 `apply_remote_for`。`collect=0` 兼容映射为当前 CF Reporter 的 1 秒采集需求，随后参与机器级最小值聚合；逗号分隔的 interface 拆成多个过滤项。`custom_*` 字段缺席时保留对应 Ping，出现空值时清除；非空值只替换对应线路并保留原 interval，`bd` 兼容旧名 `bgp`，HTTP(S) URL 推断为 HTTP 探测，其余按 TCP 探测。CF 未覆盖的 ping/slow/gpu/ip 子间隔与输出开关保持该 Reporter 现值。
 
@@ -209,9 +210,9 @@ Windows 使用同一套 CF 协议逻辑；CF 一键安装默认启用 GPU 采集
 
 对接 komari 面板的 WS v2 JSON-RPC（`/api/clients/v2/rpc?token=<secret>`，worker_url 填面板地址）。
 
-- **上行**：`agent.report`（最新值快照，字节单位；无 ts/批量语义，断线期间数据不保留）+ `agent.basicInfo`（连接建立与 static 刷新时）；errors 事件拼进 report 的 `message` 字段
+- **上行**：`agent.report`（最新值快照，字节单位；无 ts/批量语义，断线期间数据不保留）+ `agent.basicInfo`（持久保留最新一份，连接建立及静态信息变化时发送）；errors 事件拼进 report 的 `message` 字段。GPU 未采到的字段不输出，平均利用率只统计有效 usage
 - **下行**：不执行远程控制调用，但**友好回绝**（不干等）：exec → POST task/result "Remote control is disabled."(exit -1)；terminal → 拨终端 WS 发说明即关闭（否则面板空转 30s）。我们从不调 agent.pull 声明远控能力
 - **Ping**：收到 `agent.ping` 后按 `type + target` 写入该 Komari Reporter 的 `ext.komari.learned_pings`；最多 5 个，按 `last_seen_at` LRU 淘汰。下发请求本身不探测，只读取全局 Ping worker 快照；首轮无缓存回 `-1`，配置热重建后后续任务返回新鲜缓存（最大年龄为本地 ping 周期的 2 倍，且至少 10s）。HTTP 裸 host 自动补 `http://`，path/query/fragment 仍拒绝
 - komari 的月流量由面板自算；自动学习目标跟随该 Reporter 的 `intervals.ping`，与其他 Reporter 目标统一去重聚合；无面板配置下发通道（仅 Ping 目标发现会写本地 TOML）
-- **保活**：komari 服务端读超时 11s 且只有数据帧续期（ping 无效）→ 心跳为每 5s 重发最新 report 文本帧
+- **保活**：komari 服务端读超时 11s 且只有数据帧续期（WebSocket ping 无效）→ 每 5s 发送无参数、无 `id` 的 `agent.heartbeat` notification；不重发旧 report，也不调用 `agent.pull`
 - 映射见 reporter_komari.rs（纯函数）；WS 机械（重连/心跳/下行忽略）在 worker/komari.rs

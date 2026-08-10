@@ -203,6 +203,8 @@ pub struct PingRecord {
 pub struct GpuRecord {
     /// 测量时刻，毫秒时间戳
     pub ts: i64,
+    /// 采集端稳定设备标识；NVIDIA 使用 nvidia-smi index，其他平台使用可复现后备标识。
+    pub id: String,
     pub name: String,
     /// 利用率 0-100
     pub usage: Option<f64>,

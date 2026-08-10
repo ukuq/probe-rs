@@ -229,16 +229,17 @@ pub fn build_metrics(
     let gpu_info = if gpus.is_empty() {
         None
     } else {
-        Some(
-            gpus.iter()
-                .enumerate()
-                .map(|(i, g)| CfGpu {
-                    id: i.to_string(),
+        let values: Vec<_> = gpus
+            .iter()
+            .filter_map(|g| {
+                g.usage.map(|usage| CfGpu {
+                    id: g.id.clone(),
                     name: g.name.clone(),
-                    info: g.usage.map(round2).unwrap_or(0.0),
+                    info: round2(usage),
                 })
-                .collect(),
-        )
+            })
+            .collect();
+        (!values.is_empty()).then_some(values)
     };
     CfMetrics {
         cpu: dyn_latest.and_then(|d| d.cpu_usage).map(round2),
@@ -648,6 +649,41 @@ mod tests {
         assert_eq!(sv["metrics"]["net_in_speed"], 11_200);
         assert!(build_samples(std::slice::from_ref(&d), false).is_empty());
         assert_eq!(build_samples(&[d], true).len(), 1);
+    }
+
+    #[test]
+    fn gpu_with_unknown_usage_is_not_reported_as_zero() {
+        let st = static_stub();
+        let gpus = vec![
+            GpuRecord {
+                ts: 1,
+                id: "3".into(),
+                name: "unknown".into(),
+                usage: None,
+                mem_total: Some(8),
+                mem_used: Some(4),
+                temp: Some(40.0),
+            },
+            GpuRecord {
+                ts: 1,
+                id: "7".into(),
+                name: "measured".into(),
+                usage: Some(42.345),
+                mem_total: None,
+                mem_used: None,
+                temp: None,
+            },
+        ];
+        let metrics = build_metrics(&st, None, None, &gpus, &HashMap::new(), None, &[]);
+        let value = serde_json::to_value(metrics).unwrap();
+        assert_eq!(value["gpu_info"].as_array().unwrap().len(), 1);
+        assert_eq!(value["gpu_info"][0]["id"], "7");
+        assert_eq!(value["gpu_info"][0]["name"], "measured");
+        assert_eq!(value["gpu_info"][0]["info"], 42.35);
+
+        let metrics = build_metrics(&st, None, None, &gpus[..1], &HashMap::new(), None, &[]);
+        let value = serde_json::to_value(metrics).unwrap();
+        assert!(value.get("gpu_info").is_none());
     }
 
     #[test]

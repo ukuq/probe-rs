@@ -21,7 +21,7 @@ use crate::model::{
 };
 use crate::netstatic::{period_start_ms, NetStatic};
 use crate::reporter::Reporter;
-use crate::worker::komari::KomariOut;
+use crate::worker::komari::{KomariOut, TimedKomariReport};
 use crate::worker::ping::PingSnapshot;
 use crate::worker::public_ip::IpSnapshot;
 
@@ -299,7 +299,8 @@ impl ReporterRunner {
                 }
                 changed = self.ip_rx.changed() => {
                     if changed.is_err() { return; }
-                    self.last_static = None;
+                    // 每次成功测量都会刷新 IP 时间戳；是否需要重报 static
+                    // 由下一个 report tick 比较过滤后的实际地址决定。
                 }
                 changed = self.gpu_name_rx.changed() => {
                     if changed.is_err() { return; }
@@ -361,7 +362,7 @@ impl ReporterRunner {
             })
             .collect();
         let errors = self.scope_errors(&batch.errors, spec);
-        let include_static = self.static_due();
+        let include_static = self.static_due(spec);
         let static_info = include_static.then(|| self.refresh_static(spec));
         let report = Report {
             server_id: spec.server_id.clone(),
@@ -409,7 +410,7 @@ impl ReporterRunner {
             );
             return false;
         };
-        let refreshed = self.static_due();
+        let refreshed = self.static_due(spec);
         if refreshed {
             self.refresh_static(spec);
             self.last_static = Some(Instant::now());
@@ -419,34 +420,94 @@ impl ReporterRunner {
             .clone()
             .unwrap_or_else(|| self.refresh_static(spec));
         let errors = self.scope_errors(&batch.errors, spec);
-        let gpus = self.gpu_rx.borrow();
-        let gpu_slice = if spec.report_gpu {
-            gpus.as_slice()
-        } else {
-            &[]
-        };
-        let slow = self.slow_rx.borrow();
-        let scoped_slow = slow.as_ref().map(|slow| self.scope_slow(slow, spec));
-        let report = crate::reporter_komari::build_report(
-            &static_info,
-            dynamic.last().or(self.last_dynamic.as_ref()),
-            scoped_slow.as_ref(),
-            gpu_slice,
-            &errors,
-            crate::model::now_millis(),
-        );
-        drop(gpus);
         let basic_info = refreshed
             .then(|| crate::reporter_komari::build_basic_info(&static_info, &self.agent_version));
-        tx.send_replace(KomariOut {
-            report: Some(report),
+
+        let now_ms = crate::model::now_millis();
+        let Some(dyn_latest) = dynamic.last().or(self.last_dynamic.as_ref()) else {
+            tracing::warn!(reporter_id = %self.id, "Komari report 缺少 dynamic 快照，已清空待发报告");
+            publish_komari(&tx, None, basic_info);
+            return true;
+        };
+        let Some(dynamic_valid_until) = snapshot_valid_until(
+            dyn_latest.ts,
+            spec.intervals.collect,
+            spec.intervals.report,
+            now_ms,
+        ) else {
+            tracing::warn!(
+                reporter_id = %self.id,
+                measured_at = dyn_latest.ts,
+                "Komari dynamic 快照已过期，已清空待发报告"
+            );
+            publish_komari(&tx, None, basic_info);
+            return true;
+        };
+
+        let slow = self.slow_rx.borrow();
+        let Some(slow_record) = slow.as_ref() else {
+            tracing::warn!(reporter_id = %self.id, "Komari report 缺少 slow 快照，已清空待发报告");
+            publish_komari(&tx, None, basic_info);
+            return true;
+        };
+        let Some(slow_valid_until) = snapshot_valid_until(
+            slow_record.ts,
+            spec.intervals.slow,
+            spec.intervals.report,
+            now_ms,
+        ) else {
+            tracing::warn!(
+                reporter_id = %self.id,
+                measured_at = slow_record.ts,
+                "Komari slow 快照已过期，已清空待发报告"
+            );
+            publish_komari(&tx, None, basic_info);
+            return true;
+        };
+        let scoped_slow = self.scope_slow(slow_record, spec);
+        drop(slow);
+
+        let gpus = self.gpu_rx.borrow();
+        let mut report_valid_until = dynamic_valid_until.min(slow_valid_until);
+        let fresh_gpus: Vec<GpuRecord> = if spec.report_gpu {
+            gpus.iter()
+                .filter_map(|gpu| {
+                    snapshot_valid_until(gpu.ts, spec.intervals.gpu, spec.intervals.report, now_ms)
+                        .map(|valid_until| {
+                            report_valid_until = report_valid_until.min(valid_until);
+                            gpu.clone()
+                        })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if spec.report_gpu && !gpus.is_empty() && fresh_gpus.is_empty() {
+            tracing::warn!(reporter_id = %self.id, "Komari GPU 快照已过期，本轮不携带 GPU 数据");
+        }
+        let report = crate::reporter_komari::build_report(
+            &static_info,
+            Some(dyn_latest),
+            Some(&scoped_slow),
+            &fresh_gpus,
+            &errors,
+            now_ms,
+        );
+        drop(gpus);
+        publish_komari(
+            &tx,
+            Some(TimedKomariReport {
+                payload: report,
+                measured_at_ms: dyn_latest.ts,
+                valid_until_ms: report_valid_until,
+            }),
             basic_info,
-        });
+        );
         true
     }
 
     async fn report_cf(&mut self, spec: &ReporterSpec, dynamic: &[DynamicRecord]) -> bool {
-        if self.static_due() {
+        if self.static_due(spec) {
             self.refresh_static(spec);
             self.last_static = Some(Instant::now());
         }
@@ -454,40 +515,71 @@ impl ReporterRunner {
             .static_cache
             .clone()
             .unwrap_or_else(|| self.refresh_static(spec));
+        let now_ms = crate::model::now_millis();
+        let dyn_latest = dynamic
+            .last()
+            .or(self.last_dynamic.as_ref())
+            .filter(|record| {
+                snapshot_valid_until(
+                    record.ts,
+                    spec.intervals.collect,
+                    spec.intervals.report,
+                    now_ms,
+                )
+                .is_some()
+            });
         let metrics = {
             let slow = self.slow_rx.borrow();
             let gpus = self.gpu_rx.borrow();
             let pings = self.ping_rx.borrow();
             let diskio = self.diskio_rx.borrow();
-            let max_age = (spec.intervals.diskio.max(1) * 3 * 1000) as i64;
-            let now = crate::model::now_millis();
             let diskio = diskio
                 .as_ref()
-                .filter(|record| now - record.ts <= max_age)
-                .map(|record| self.scope_diskio(record, spec));
-            let slow = slow.as_ref().map(|slow| self.scope_slow(slow, spec));
-            let gpu_slice = if spec.report_gpu {
-                gpus.as_slice()
-            } else {
-                &[]
-            };
-            let scoped_pings: HashMap<String, PingRecord> = spec
-                .pings
-                .iter()
-                .filter_map(|target| {
-                    pings.get(&target.task_id).map(|ping| {
-                        let mut scoped = ping.clone();
-                        scoped.name.clone_from(&target.target.name);
-                        (scoped.name.clone(), scoped)
-                    })
+                .filter(|record| {
+                    snapshot_valid_until(
+                        record.ts,
+                        spec.intervals.diskio,
+                        spec.intervals.report,
+                        now_ms,
+                    )
+                    .is_some()
                 })
-                .collect();
+                .map(|record| self.scope_diskio(record, spec));
+            let slow = slow
+                .as_ref()
+                .filter(|record| {
+                    snapshot_valid_until(
+                        record.ts,
+                        spec.intervals.slow,
+                        spec.intervals.report,
+                        now_ms,
+                    )
+                    .is_some()
+                })
+                .map(|record| self.scope_slow(record, spec));
+            let fresh_gpus: Vec<GpuRecord> = if spec.report_gpu {
+                gpus.iter()
+                    .filter(|record| {
+                        snapshot_valid_until(
+                            record.ts,
+                            spec.intervals.gpu,
+                            spec.intervals.report,
+                            now_ms,
+                        )
+                        .is_some()
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let scoped_pings = scope_fresh_cf_pings(&pings, spec, now_ms);
             let ping_targets: Vec<_> = spec.pings.iter().map(|ping| ping.target.clone()).collect();
             crate::reporter_cf::build_metrics(
                 &static_info,
-                dynamic.last().or(self.last_dynamic.as_ref()),
+                dyn_latest,
                 slow.as_ref(),
-                gpu_slice,
+                &fresh_gpus,
                 &scoped_pings,
                 diskio.as_ref(),
                 &ping_targets,
@@ -671,14 +763,35 @@ impl ReporterRunner {
             .collect()
     }
 
-    fn static_due(&self) -> bool {
-        self.last_static
+    fn static_due(&self, spec: &ReporterSpec) -> bool {
+        if self
+            .last_static
             .is_none_or(|last| last.elapsed() >= STATIC_REFRESH)
             || self.static_cache.is_none()
+        {
+            return true;
+        }
+        let current = self.ip_rx.borrow();
+        let (ipv4, ipv6) = fresh_public_ips(
+            &current,
+            spec.intervals.ip,
+            spec.intervals.report,
+            crate::model::now_millis(),
+        );
+        self.static_cache
+            .as_ref()
+            .is_some_and(|cached| cached.ipv4 != ipv4 || cached.ipv6 != ipv6)
     }
 
     fn refresh_static(&mut self, spec: &ReporterSpec) -> StaticInfo {
-        let (ipv4, ipv6) = self.ip_rx.borrow().clone();
+        let current = self.ip_rx.borrow();
+        let (ipv4, ipv6) = fresh_public_ips(
+            &current,
+            spec.intervals.ip,
+            spec.intervals.report,
+            crate::model::now_millis(),
+        );
+        drop(current);
         let gpu_name = if spec.report_gpu {
             self.gpu_name_rx.borrow().clone()
         } else {
@@ -748,6 +861,27 @@ fn scope_diskio_record(
     scoped
 }
 
+fn fresh_public_ips(
+    snapshot: &IpSnapshot,
+    source_interval: u64,
+    report_interval: u64,
+    now_ms: i64,
+) -> (Option<String>, Option<String>) {
+    let fresh = |measurement: &crate::worker::public_ip::IpMeasurement| {
+        snapshot_valid_until(
+            measurement.measured_at_ms,
+            source_interval,
+            report_interval,
+            now_ms,
+        )
+        .map(|_| measurement.address.clone())
+    };
+    (
+        snapshot.ipv4.as_ref().and_then(fresh),
+        snapshot.ipv6.as_ref().and_then(fresh),
+    )
+}
+
 fn scope_ping_aliases(ping: &PingRecord, spec: &ReporterSpec) -> Vec<PingRecord> {
     spec.pings
         .iter()
@@ -756,6 +890,30 @@ fn scope_ping_aliases(ping: &PingRecord, spec: &ReporterSpec) -> Vec<PingRecord>
             let mut scoped = ping.clone();
             scoped.name.clone_from(&target.target.name);
             scoped
+        })
+        .collect()
+}
+
+fn scope_fresh_cf_pings(
+    pings: &PingSnapshot,
+    spec: &ReporterSpec,
+    now_ms: i64,
+) -> HashMap<String, PingRecord> {
+    spec.pings
+        .iter()
+        .filter_map(|target| {
+            let interval = target.target.interval.unwrap_or(spec.intervals.ping);
+            pings
+                .get(&target.task_id)
+                .filter(|record| {
+                    snapshot_valid_until(record.ts, interval, spec.intervals.report, now_ms)
+                        .is_some()
+                })
+                .map(|ping| {
+                    let mut scoped = ping.clone();
+                    scoped.name.clone_from(&target.target.name);
+                    (scoped.name.clone(), scoped)
+                })
         })
         .collect()
 }
@@ -804,6 +962,46 @@ fn report_interval_changed(current: &mut u64, next: u64) -> bool {
     }
 }
 
+/// 更新 Komari 待发报告，同时持久保留最近一次 basicInfo，供断线重连使用。
+fn publish_komari(
+    tx: &watch::Sender<KomariOut>,
+    report: Option<TimedKomariReport>,
+    basic_info: Option<serde_json::Value>,
+) {
+    tx.send_modify(|out| {
+        out.report = report;
+        if let Some(info) = basic_info {
+            out.basic_info = Some(info);
+        }
+    });
+}
+
+/// 计算快照有效截止时间。
+///
+/// 采集快于上报时不能因上报周期很长而放宽有效期；采集慢于上报时则允许
+/// 在下一次采集前复用快照。额外两秒用于 ticker 抖动和任务切换。
+fn snapshot_valid_until(
+    measured_at_ms: i64,
+    source_interval: u64,
+    report_interval: u64,
+    now_ms: i64,
+) -> Option<i64> {
+    const GRACE_SECS: u64 = 2;
+    const GRACE_MS: i64 = (GRACE_SECS * 1_000) as i64;
+
+    if measured_at_ms <= 0 || measured_at_ms > now_ms.saturating_add(GRACE_MS) {
+        return None;
+    }
+    let source = source_interval.max(1);
+    let report = report_interval.max(1);
+    let max_age_secs = source
+        .saturating_add(source.min(report))
+        .saturating_add(GRACE_SECS);
+    let max_age_ms = max_age_secs.saturating_mul(1_000).min(i64::MAX as u64) as i64;
+    let valid_until = measured_at_ms.saturating_add(max_age_ms);
+    (now_ms <= valid_until).then_some(valid_until)
+}
+
 /// First tick is immediate.
 fn ticker(secs: u64) -> Interval {
     let mut ticker = interval(Duration::from_secs(secs.max(1)));
@@ -824,6 +1022,7 @@ mod tests {
     use super::*;
     use crate::config::ScopedPingTarget;
     use crate::model::{PingKind, PingTarget};
+    use crate::worker::public_ip::IpMeasurement;
 
     fn reporter_with_ping_aliases() -> ReporterSpec {
         let task_id = "tcp:example.com:80";
@@ -883,12 +1082,100 @@ mod tests {
     }
 
     #[test]
+    fn cf_ping_scoping_drops_expired_cache_but_keeps_configured_aliases_fresh() {
+        let spec = reporter_with_ping_aliases();
+        let task_id = spec.pings[0].task_id.clone();
+        let pings = HashMap::from([(
+            task_id.clone(),
+            PingRecord {
+                ts: 10_000,
+                name: task_id,
+                rtt: 12,
+                loss: 0,
+            },
+        )]);
+
+        let fresh = scope_fresh_cf_pings(&pings, &spec, 72_000);
+        assert_eq!(fresh.len(), 2);
+        assert_eq!(fresh["first"].rtt, 12);
+        assert_eq!(fresh["second"].rtt, 12);
+
+        let expired = scope_fresh_cf_pings(&pings, &spec, 72_001);
+        assert!(expired.is_empty());
+    }
+
+    #[test]
     fn report_interval_changes_only_when_value_differs() {
         let mut current = 30;
         assert!(!report_interval_changed(&mut current, 30));
         assert_eq!(current, 30);
         assert!(report_interval_changed(&mut current, 60));
         assert_eq!(current, 60);
+    }
+
+    #[test]
+    fn komari_publication_keeps_basic_info_for_reconnects() {
+        let (tx, rx) = watch::channel(KomariOut::default());
+        publish_komari(&tx, None, Some(serde_json::json!({ "cpu_name": "test" })));
+        publish_komari(
+            &tx,
+            Some(TimedKomariReport {
+                payload: serde_json::json!({ "cpu": { "usage": 1 } }),
+                measured_at_ms: 10_000,
+                valid_until_ms: 14_000,
+            }),
+            None,
+        );
+
+        let current = rx.borrow();
+        assert_eq!(current.basic_info.as_ref().unwrap()["cpu_name"], "test");
+        assert!(current.report.is_some());
+    }
+
+    #[test]
+    fn snapshot_freshness_does_not_expand_to_slow_report_interval() {
+        let measured = 100_000;
+        assert_eq!(
+            snapshot_valid_until(measured, 1, 60, 104_000),
+            Some(104_000)
+        );
+        assert_eq!(snapshot_valid_until(measured, 1, 60, 104_001), None);
+    }
+
+    #[test]
+    fn snapshot_freshness_allows_slow_source_reuse_between_reports() {
+        let measured = 100_000;
+        assert_eq!(
+            snapshot_valid_until(measured, 60, 3, 165_000),
+            Some(165_000)
+        );
+        assert_eq!(snapshot_valid_until(measured, 60, 3, 165_001), None);
+    }
+
+    #[test]
+    fn snapshot_freshness_rejects_invalid_or_future_timestamp() {
+        assert_eq!(snapshot_valid_until(0, 1, 60, 100_000), None);
+        assert_eq!(snapshot_valid_until(102_001, 1, 60, 100_000), None);
+    }
+
+    #[test]
+    fn public_ip_freshness_expires_each_address_independently() {
+        let snapshot = IpSnapshot {
+            ipv4: Some(IpMeasurement {
+                address: "192.0.2.1".into(),
+                measured_at_ms: 100_000,
+            }),
+            ipv6: Some(IpMeasurement {
+                address: "2001:db8::1".into(),
+                measured_at_ms: 110_000,
+            }),
+        };
+        let (ipv4, ipv6) = fresh_public_ips(&snapshot, 60, 3, 170_000);
+        assert_eq!(ipv4, None);
+        assert_eq!(ipv6.as_deref(), Some("2001:db8::1"));
+
+        let (ipv4, ipv6) = fresh_public_ips(&snapshot, 60, 3, 175_001);
+        assert_eq!((ipv4, ipv6), (None, None));
     }
 
     #[test]

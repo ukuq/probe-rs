@@ -3,7 +3,7 @@
 //! 月流量完全由客户端计算：上报时按 Reporter 批量查询各采样时间点。
 //! 增量正确性纪律见 DESIGN.md §5.3。
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,6 +21,15 @@ const RETAIN: chrono::Duration = chrono::Duration::days(31);
 struct Entry {
     /// 毫秒时间戳
     ts: i64,
+    rx: u64,
+    tx: u64,
+}
+
+/// 已移出 31 天明细窗口的永久累计。`through_ms` 用于避免历史查询把
+/// 查询结束时间之后才归档的总量提前计入。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+struct ArchivedTotal {
+    through_ms: i64,
     rx: u64,
     tx: u64,
 }
@@ -43,11 +52,38 @@ pub struct Correction {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct StoreFile {
     interfaces: BTreeMap<String, VecDeque<Entry>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    archived_totals: BTreeMap<String, ArchivedTotal>,
     #[serde(default)]
     corrections: BTreeMap<String, Correction>,
     /// Compatibility with the pre-multi-reporter on-disk format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     correction: Option<Correction>,
+}
+
+fn archive_before(store: &mut StoreFile, interface: &str, cutoff: i64) -> bool {
+    let Some(entries) = store.interfaces.get_mut(interface) else {
+        return false;
+    };
+    let mut archived = ArchivedTotal::default();
+    let mut removed = false;
+    while entries.front().is_some_and(|entry| entry.ts < cutoff) {
+        let entry = entries.pop_front().expect("checked ledger entry");
+        archived.through_ms = archived.through_ms.max(entry.ts);
+        archived.rx = archived.rx.saturating_add(entry.rx);
+        archived.tx = archived.tx.saturating_add(entry.tx);
+        removed = true;
+    }
+    if removed {
+        let total = store
+            .archived_totals
+            .entry(interface.to_string())
+            .or_default();
+        total.through_ms = total.through_ms.max(archived.through_ms);
+        total.rx = total.rx.saturating_add(archived.rx);
+        total.tx = total.tx.saturating_add(archived.tx);
+    }
+    removed
 }
 
 struct Inner {
@@ -82,7 +118,7 @@ impl NetStatic {
             .unwrap_or_default();
         let cutoff = crate::model::now_millis() - RETAIN.num_milliseconds();
         let mut store = store;
-        let migrated = if let Some(reporter_id) = legacy_reporter_id {
+        let mut migrated = if let Some(reporter_id) = legacy_reporter_id {
             if let Some(legacy) = store.correction.take() {
                 store
                     .corrections
@@ -95,10 +131,9 @@ impl NetStatic {
         } else {
             false
         };
-        for entries in store.interfaces.values_mut() {
-            while entries.front().is_some_and(|e| e.ts < cutoff) {
-                entries.pop_front();
-            }
+        let interfaces: Vec<_> = store.interfaces.keys().cloned().collect();
+        for interface in interfaces {
+            migrated |= archive_before(&mut store, &interface, cutoff);
         }
         Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -128,15 +163,17 @@ impl NetStatic {
             if rx_delta == 0 && tx_delta == 0 {
                 continue;
             }
-            let entries = inner.store.interfaces.entry(name).or_default();
-            entries.push_back(Entry {
-                ts: now,
-                rx: rx_delta,
-                tx: tx_delta,
-            });
-            while entries.front().is_some_and(|e| e.ts < cutoff) {
-                entries.pop_front();
-            }
+            inner
+                .store
+                .interfaces
+                .entry(name.clone())
+                .or_default()
+                .push_back(Entry {
+                    ts: now,
+                    rx: rx_delta,
+                    tx: tx_delta,
+                });
+            archive_before(&mut inner.store, &name, cutoff);
             inner.dirty = true;
         }
     }
@@ -146,14 +183,22 @@ impl NetStatic {
         let inner = self.inner.lock().expect("netstatic lock poisoned");
         let mut rx = 0u64;
         let mut tx = 0u64;
+        if start_ms <= 0 {
+            for (name, total) in &inner.store.archived_totals {
+                if filter.includes(name) && total.through_ms <= now_ms {
+                    rx = rx.saturating_add(total.rx);
+                    tx = tx.saturating_add(total.tx);
+                }
+            }
+        }
         for (name, entries) in &inner.store.interfaces {
             if !filter.includes(name) {
                 continue;
             }
             for e in entries {
                 if e.ts >= start_ms && e.ts <= now_ms {
-                    rx += e.rx;
-                    tx += e.tx;
+                    rx = rx.saturating_add(e.rx);
+                    tx = tx.saturating_add(e.tx);
                 }
             }
         }
@@ -179,22 +224,45 @@ impl NetStatic {
             points.sort_unstable();
         }
 
-        for (name, entries) in &inner.store.interfaces {
+        let interface_names: BTreeSet<_> = inner
+            .store
+            .interfaces
+            .keys()
+            .chain(inner.store.archived_totals.keys())
+            .collect();
+        for name in interface_names {
             if !filter.includes(name) {
                 continue;
             }
             for (&start, points) in &groups {
-                let mut entries = entries.iter().filter(|entry| entry.ts >= start).peekable();
+                let mut entries = inner
+                    .store
+                    .interfaces
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .filter(|entry| entry.ts >= start)
+                    .peekable();
+                let archived = (start <= 0)
+                    .then(|| inner.store.archived_totals.get(name))
+                    .flatten();
+                let mut archived_added = false;
                 let mut total = NetBytes::default();
                 for &(end, index) in points {
+                    if !archived_added && archived.is_some_and(|value| value.through_ms <= end) {
+                        let archived = archived.expect("checked archived total");
+                        total.rx = total.rx.saturating_add(archived.rx);
+                        total.tx = total.tx.saturating_add(archived.tx);
+                        archived_added = true;
+                    }
                     while entries.peek().is_some_and(|entry| entry.ts <= end) {
                         let entry = entries.next().expect("peeked ledger entry");
-                        total.rx += entry.rx;
-                        total.tx += entry.tx;
+                        total.rx = total.rx.saturating_add(entry.rx);
+                        total.tx = total.tx.saturating_add(entry.tx);
                     }
                     snapshots[index].interfaces.insert(name.clone(), total);
-                    snapshots[index].total.rx += total.rx;
-                    snapshots[index].total.tx += total.tx;
+                    snapshots[index].total.rx = snapshots[index].total.rx.saturating_add(total.rx);
+                    snapshots[index].total.tx = snapshots[index].total.tx.saturating_add(total.tx);
                 }
             }
         }
@@ -433,6 +501,70 @@ mod tests {
     #[test]
     fn period_zero_means_forever() {
         assert_eq!(period_start_ms(0, at(2026, 8, 5)), 0);
+    }
+
+    #[test]
+    fn reset_zero_survives_detail_pruning_and_restart() {
+        let (_, path) = tmp_ns("lifetime");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let now = crate::model::now_millis();
+        let old = now - chrono::Duration::days(32).num_milliseconds();
+        let recent = now - 1_000;
+        let store = StoreFile {
+            interfaces: BTreeMap::from([
+                (
+                    "eth0".into(),
+                    [
+                        Entry {
+                            ts: old,
+                            rx: 10,
+                            tx: 20,
+                        },
+                        Entry {
+                            ts: recent,
+                            rx: 1,
+                            tx: 2,
+                        },
+                    ]
+                    .into(),
+                ),
+                (
+                    "eth1".into(),
+                    [Entry {
+                        ts: old + 1,
+                        rx: 100,
+                        tx: 200,
+                    }]
+                    .into(),
+                ),
+            ]),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+
+        let ns = NetStatic::load(&path);
+        let all = IfaceFilter::new(&[]);
+        let eth0 = IfaceFilter::new(&["eth0".into()]);
+        let month_start = now - RETAIN.num_milliseconds();
+        assert_eq!(ns.query(&all, 0, now), (111, 222));
+        assert_eq!(ns.query(&eth0, 0, now), (11, 22));
+        assert_eq!(ns.query(&all, month_start, now), (1, 2));
+
+        let snapshots = ns.query_batch("cf", &all, &[(0, old - 1), (0, now), (month_start, now)]);
+        assert_eq!((snapshots[0].total.rx, snapshots[0].total.tx), (0, 0));
+        assert_eq!((snapshots[1].total.rx, snapshots[1].total.tx), (111, 222));
+        assert_eq!((snapshots[2].total.rx, snapshots[2].total.tx), (1, 2));
+        assert_eq!(snapshots[1].interfaces["eth0"].rx, 11);
+        assert_eq!(snapshots[1].interfaces["eth1"].rx, 100);
+
+        ns.flush();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("archived_totals"));
+        let reloaded = NetStatic::load(&path);
+        assert_eq!(reloaded.query(&all, 0, now), (111, 222));
+        assert_eq!(reloaded.query(&all, month_start, now), (1, 2));
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     fn tmp_ns(tag: &str) -> (NetStatic, PathBuf) {

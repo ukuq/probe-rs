@@ -24,17 +24,34 @@ use crate::config::SharedConfig;
 use crate::model::PingKind;
 use crate::worker::ping::PingSnapshot;
 
-/// scheduler → worker 的输出：最新报告 / 最新 basicInfo（各自只留最新一份）
+/// 一份带测量时间和有效期的 Komari 报告。
+///
+/// Komari wire 没有指标时间戳，断线重连时只能在本地拒绝补发过期报告。
+#[derive(Debug, Clone)]
+pub struct TimedKomariReport {
+    pub payload: Value,
+    pub measured_at_ms: i64,
+    pub valid_until_ms: i64,
+}
+
+impl TimedKomariReport {
+    fn is_fresh(&self, now_ms: i64) -> bool {
+        const CLOCK_SKEW_MS: i64 = 2_000;
+        now_ms >= self.measured_at_ms.saturating_sub(CLOCK_SKEW_MS) && now_ms <= self.valid_until_ms
+    }
+}
+
+/// scheduler → worker 的输出：最新有效报告 / 最新 basicInfo（各自只留最新一份）。
+/// basicInfo 会持久保留，确保任意一次重连都能先恢复静态信息。
 #[derive(Debug, Clone, Default)]
 pub struct KomariOut {
-    pub report: Option<Value>,
+    pub report: Option<TimedKomariReport>,
     pub basic_info: Option<Value>,
 }
 
 const RECONNECT: Duration = Duration::from_secs(5);
-/// komari 服务端的读超时是 11s（web/api/client readWait），且只有**数据帧**能续期
-/// （gorilla 内部吞 ping）。所以心跳必须每 ~5s 重发一次最新 report 文本帧——
-/// 与官方 agent 的高频上报保活行为一致
+/// Komari 服务端的读超时是 11s，且只有文本/二进制数据帧能让当前读循环续期。
+/// 使用不带参数的 notification 保活，不能重发旧 report，也不能调用 agent.pull。
 const HEARTBEAT: Duration = Duration::from_secs(5);
 
 pub fn spawn(
@@ -97,17 +114,27 @@ async fn run_session(
     tracing::info!("komari WS 已连接");
     // 连上先发 basicInfo + 最新 report（如果有）；先取快照再 await（watch::Ref 不是 Send）
     let initial = out_rx.borrow().clone();
+    let mut sent_basic_info = None;
     if let Some(bi) = initial.basic_info {
         ws.send(Message::Text(
-            crate::reporter_komari::basic_info_frame(bi).into(),
+            crate::reporter_komari::basic_info_frame(bi.clone()).into(),
         ))
         .await?;
+        sent_basic_info = Some(bi);
     }
     if let Some(rep) = initial.report {
-        ws.send(Message::Text(
-            crate::reporter_komari::report_frame(rep).into(),
-        ))
-        .await?;
+        if rep.is_fresh(crate::model::now_millis()) {
+            ws.send(Message::Text(
+                crate::reporter_komari::report_frame(rep.payload).into(),
+            ))
+            .await?;
+        } else {
+            tracing::debug!(
+                measured_at = rep.measured_at_ms,
+                valid_until = rep.valid_until_ms,
+                "Komari 重连时跳过过期 report"
+            );
+        }
     }
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.tick().await; // 跳过立即触发
@@ -136,19 +163,29 @@ async fn run_session(
             r = out_rx.changed() => {
                 if r.is_err() { return Ok(()); }
                 let out = out_rx.borrow().clone();
-                if let Some(bi) = out.basic_info {
-                    ws.send(Message::Text(crate::reporter_komari::basic_info_frame(bi).into())).await?;
+                if out.basic_info != sent_basic_info {
+                    if let Some(bi) = out.basic_info {
+                        ws.send(Message::Text(crate::reporter_komari::basic_info_frame(bi.clone()).into())).await?;
+                        sent_basic_info = Some(bi);
+                    } else {
+                        sent_basic_info = None;
+                    }
                 }
                 if let Some(rep) = out.report {
-                    ws.send(Message::Text(crate::reporter_komari::report_frame(rep).into())).await?;
+                    if rep.is_fresh(crate::model::now_millis()) {
+                        ws.send(Message::Text(crate::reporter_komari::report_frame(rep.payload).into())).await?;
+                    } else {
+                        tracing::debug!(
+                            measured_at = rep.measured_at_ms,
+                            valid_until = rep.valid_until_ms,
+                            "跳过已经过期的 Komari report"
+                        );
+                    }
                 }
             }
             _ = heartbeat.tick() => {
-                // 重发最新 report 作数据帧心跳（WS Ping 续不了 komari 的读超时）
-                let latest = out_rx.borrow().report.clone();
-                if let Some(rep) = latest {
-                    ws.send(Message::Text(crate::reporter_komari::report_frame(rep).into())).await?;
-                }
+                // 只让服务端读循环继续：不写指标、不拉取事件、不声明远控能力。
+                ws.send(Message::Text(crate::reporter_komari::heartbeat_frame().into())).await?;
             }
         }
     }
@@ -362,6 +399,19 @@ mod tests {
     use super::*;
     use crate::config::LocalConfig;
     use crate::model::PingRecord;
+
+    #[test]
+    fn timed_report_expires_and_rejects_large_clock_reversal() {
+        let report = TimedKomariReport {
+            payload: serde_json::json!({"cpu": {"usage": 1}}),
+            measured_at_ms: 10_000,
+            valid_until_ms: 14_000,
+        };
+        assert!(report.is_fresh(10_000));
+        assert!(report.is_fresh(14_000));
+        assert!(!report.is_fresh(14_001));
+        assert!(!report.is_fresh(7_999));
+    }
 
     #[test]
     fn komari_ping_learns_first_then_reads_collection_cache() {

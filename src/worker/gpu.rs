@@ -19,6 +19,7 @@ use crate::model::{GpuRecord, Intervals};
 /// 一卡一条的采样结果；mem/temp 仅 nvidia 路径有，macOS 为 None
 #[derive(Debug, Clone)]
 pub struct GpuSample {
+    pub id: String,
     pub name: String,
     pub usage: Option<f64>,
     pub mem_total: Option<u64>,
@@ -54,7 +55,8 @@ async fn run_once(
     buffers: &Buffers,
 ) {
     match query_gpu().await {
-        Ok(gpus) if !gpus.is_empty() => {
+        Ok(mut gpus) if !gpus.is_empty() => {
+            gpus.sort_by(|a, b| a.id.cmp(&b.id));
             let ts = crate::model::now_millis();
             name_tx.send_if_modified(|cur| {
                 let name = Some(gpus[0].name.clone());
@@ -69,6 +71,7 @@ async fn run_once(
                 gpus.into_iter()
                     .map(|g| GpuRecord {
                         ts,
+                        id: g.id,
                         name: g.name,
                         usage: g.usage,
                         mem_total: g.mem_total,
@@ -118,10 +121,14 @@ fn parse_nvidia_smi(out: &str) -> Vec<GpuSample> {
             if parts.len() < 6 {
                 return None;
             }
+            if parts[0].is_empty() {
+                return None;
+            }
             let n = parts.len();
             let num = |s: &str| s.parse::<f64>().ok();
             let mib = |s: &str| s.parse::<u64>().ok().map(|v| v * 1024 * 1024);
             Some(GpuSample {
+                id: parts[0].to_string(),
                 name: parts[1..n - 4].join(", "),
                 usage: num(parts[n - 4]).map(|v| v.clamp(0.0, 100.0)),
                 mem_total: mib(parts[n - 3]),
@@ -143,19 +150,45 @@ async fn query_gpu() -> anyhow::Result<Vec<GpuSample>> {
     Ok(usages
         .into_iter()
         .enumerate()
-        .map(|(i, usage)| GpuSample {
-            name: names
+        .map(|(i, usage)| {
+            let name = names
                 .get(i)
                 .or_else(|| names.last())
                 .cloned()
-                .unwrap_or_else(|| "Apple GPU".to_string()),
-            usage: Some(usage),
-            // Apple Silicon 统一内存无独立显存；温度需 sudo powermetrics
-            mem_total: None,
-            mem_used: None,
-            temp: None,
+                .unwrap_or_else(|| "Apple GPU".to_string());
+            GpuSample {
+                id: fallback_gpu_id(&name, i),
+                name,
+                usage: Some(usage),
+                // Apple Silicon 统一内存无独立显存；温度需 sudo powermetrics
+                mem_total: None,
+                mem_used: None,
+                temp: None,
+            }
         })
         .collect())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn fallback_gpu_id(name: &str, occurrence: usize) -> String {
+    let mut slug = String::with_capacity(name.len());
+    let mut separator = false;
+    for ch in name.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            separator = false;
+        } else if !separator && !slug.is_empty() {
+            slug.push('-');
+            separator = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        slug.push_str("gpu");
+    }
+    format!("macos:{slug}:{occurrence}")
 }
 
 #[cfg(target_os = "macos")]
@@ -228,10 +261,24 @@ mod tests {
         let out = "0, NVIDIA A100-SXM4-80GB, 42, 81920, 10240, 55\n1, NVIDIA A100-SXM4-80GB, 0, 81920, 128, 41\n";
         let gpus = super::parse_nvidia_smi(out);
         assert_eq!(gpus.len(), 2);
+        assert_eq!(gpus[0].id, "0");
+        assert_eq!(gpus[1].id, "1");
         assert_eq!(gpus[0].name, "NVIDIA A100-SXM4-80GB");
         assert!((gpus[0].usage.unwrap() - 42.0).abs() < f64::EPSILON);
         assert_eq!(gpus[0].mem_total, Some(81920 * 1024 * 1024));
         assert_eq!(gpus[0].mem_used, Some(10240 * 1024 * 1024));
         assert_eq!(gpus[0].temp, Some(55.0));
+    }
+
+    #[test]
+    fn fallback_id_is_reproducible_and_distinguishes_identical_names() {
+        assert_eq!(
+            super::fallback_gpu_id("Apple M2 Max", 0),
+            "macos:apple-m2-max:0"
+        );
+        assert_eq!(
+            super::fallback_gpu_id("Apple M2 Max", 1),
+            "macos:apple-m2-max:1"
+        );
     }
 }
