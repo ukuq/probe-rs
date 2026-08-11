@@ -54,6 +54,7 @@ async fn main() -> Result<()> {
     let config_path = parse_config_arg();
     let local = config::load(&config_path).context("failed to load config")?;
     let initial_specs = local.reporter_specs();
+    let agent_clock = Arc::new(reporter::AgentClock::default());
     tracing::info!(
         path = %config_path.display(),
         reporters = initial_specs.len(),
@@ -253,6 +254,7 @@ async fn main() -> Result<()> {
                 AGENT_VERSION,
                 &spec.id,
                 &spec.protocol,
+                Arc::clone(&agent_clock),
             )
             .with_context(|| format!("failed to initialize Reporter {}", spec.id))?,
         );

@@ -323,6 +323,9 @@ impl ReporterRunner {
         let Some(spec) = self.cfg.get().reporter(&self.id) else {
             return;
         };
+        // Every protocol participates in refreshing the same Agent-wide clock.
+        // The shared interval guard ensures only one non-blocking NTP query runs.
+        self.reporter.refresh_time();
         let batch = self.buffers.read(&self.id);
         let dynamic = self.scope_dynamic_batch(&batch.dynamic, &spec);
         if let Some(latest) = dynamic.last() {
@@ -495,13 +498,17 @@ impl ReporterRunner {
         if spec.report_gpu && !gpus.is_empty() && fresh_gpus.is_empty() {
             tracing::warn!(reporter_id = %self.id, "Komari GPU 快照已过期，本轮不携带 GPU 数据");
         }
+        let report_time = self.reporter.report_time();
+        let outbound_now_ms = report_time.accurate_ts.unwrap_or(report_time.local_ts);
+        let clock_offset_ms = report_time.offset_ms.unwrap_or(0);
         let report = crate::reporter_komari::build_report(
             &static_info,
             Some(dyn_latest),
             scoped_slow.as_ref(),
             &fresh_gpus,
             &errors,
-            now_ms,
+            outbound_now_ms,
+            clock_offset_ms,
         );
         drop(gpus);
         publish_komari(
@@ -526,6 +533,9 @@ impl ReporterRunner {
             .clone()
             .unwrap_or_else(|| self.refresh_static(spec));
         let now_ms = crate::model::now_millis();
+        let report_time = self.reporter.report_time();
+        let outbound_now_ms = report_time.accurate_ts.unwrap_or(report_time.local_ts);
+        let clock_offset_ms = report_time.offset_ms.unwrap_or(0);
         let dyn_latest = dynamic
             .last()
             .or(self.last_dynamic.as_ref())
@@ -593,9 +603,12 @@ impl ReporterRunner {
                 &scoped_pings,
                 diskio.as_ref(),
                 &ping_targets,
+                outbound_now_ms,
+                clock_offset_ms,
             )
         };
-        let samples = crate::reporter_cf::build_samples(dynamic, spec.ext.cf.batch);
+        let samples =
+            crate::reporter_cf::build_samples(dynamic, spec.ext.cf.batch, clock_offset_ms);
 
         if let Some((rx_gb, tx_gb)) = self.netstatic.confirm_pending(&self.id) {
             if spec.ext.cf.correction {

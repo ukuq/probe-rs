@@ -48,7 +48,7 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
     "boot_time": 1754300000000,
     "ipv4": "203.0.113.10",
     "ipv6": "2001:db8::10",
-    "agent_version": "0.1.3-beta.4",
+    "agent_version": "0.1.3-beta.5",
     "config": {
       "global": {
         "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
@@ -127,7 +127,7 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
 | `round_trip_ms` | number \| null | 最近一次成功校准请求的往返耗时；误差量级约为其一半 |
 | `sample_age_ms` | number \| null | 最近校准样本到本次组包的单调时钟年龄 |
 
-Agent 不修改系统时间。它每 10 分钟并行查询 `time.cloudflare.com`、`time.google.com`、`time.nist.gov`、`ntp.aliyun.com`，按成功样本的偏差中位数选源；NTP 样本最长使用 24 小时。UDP/123 被阻断或全部 NTP 查询失败时，才回退到原生服务端 `server_time`，并通过 `source` 明示。校准成功后，准确时间锚定在单调时钟上继续推进，因此本机墙钟随后发生跳变时，下一次上报的 `offset_ms` 会立即反映出来。公共 NTP 是未认证 UDP，多源中位数能排除单个异常源，但不能抵御控制本机网络的攻击者。
+Agent 不修改系统时间。全部 Reporter 共享一个 Agent 级校准器；任一路上报都能触发每 10 分钟一次的后台刷新，并行查询 `time.cloudflare.com`、`time.google.com`、`time.nist.gov`、`ntp.aliyun.com`，按成功样本的偏差中位数选源。NTP 样本最长使用 24 小时；UDP/123 被阻断或全部 NTP 查询失败时，才回退到原生服务端 `server_time`，并通过 `source` 明示。校准成功后，准确时间锚定在单调时钟上继续推进，因此本机墙钟随后发生跳变时，下一次上报的 `offset_ms` 会立即反映出来。CF 出站的 `timestamp`、`boot_time` 与 `samples[].ts` 使用相同偏差换算；Komari 协议没有墙钟时间戳，其 `uptime` 用纠正后的当前时间与同偏差纠正后的启动时间计算。公共 NTP 是未认证 UDP，多源中位数能排除单个异常源，但不能抵御控制本机网络的攻击者。
 
 ## static 字段
 
@@ -149,7 +149,7 @@ Agent 不修改系统时间。它每 10 分钟并行查询 `time.cloudflare.com`
 | `boot_time` | number | 毫秒时间戳 | /proc/stat btime | |
 | `ipv4` | string \| null | — | cloudflare trace (tcp4) | 查询失败保留旧值 |
 | `ipv6` | string \| null | — | cloudflare trace (tcp6) | 无 v6 出口为 null |
-| `agent_version` | string | — | 编译注入 | |
+| `agent_version` | string | — | 编译注入 | 原生为版本号；CF 出站格式为 `<版本>_probe-rs` |
 | `config` | object | — | 当前生效配置 | 供服务端展示/核对，字段见下 |
 
 ### static.config 字段（当前生效配置回执）

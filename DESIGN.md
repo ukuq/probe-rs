@@ -143,7 +143,7 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 ### 3.2 规则
 
 - **每个 report tick 必报**：`dynamic` 为空数组也照发，天然承担心跳职能，服务端按"最后收到时间"判离线。
-- **原生协议时间校准**：Agent 每 10 分钟并行查询 Cloudflare / Google / NIST / Aliyun NTP，按偏差中位数选源并生成单调时钟锚点；UDP/123 不通时才回退到响应 `server_time`。上报同时带本地时间、准确时间、差值与来源，但不修改系统时钟。
+- **Agent 级时间校准**：全部 Reporter 共享校准器，每 10 分钟并行查询 Cloudflare / Google / NIST / Aliyun NTP，按偏差中位数选源并生成单调时钟锚点；UDP/123 不通时才回退到原生响应 `server_time`。原生上报同时带本地时间、准确时间、差值与来源；CF 出站墙钟字段按偏差换算；Komari 的 uptime 在统一纠正时间域计算。Agent 不修改系统时钟。
 - **`static` 可省略**：未到期且无变化时不带，服务端保留旧值。
 - **`dynamic` 每条带 `ts`**：采集时刻时间戳，不是上报时刻。
 - **三段结构**：`static` obj + `dynamic[]`（fast，ts = tick 时刻）+ `async[]`（kind 区分来源，ts = 各自测量时刻）——两个数组的 ts 语义各自单一，异步频率互不迁就。

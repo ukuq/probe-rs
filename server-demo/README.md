@@ -21,19 +21,20 @@ deno run --allow-net server.ts 9000   # 指定端口
 - **趋势图**：CPU%（面积+线）、网速（↓↑ 双系列 + legend
   点击隔离）、探测延迟（按目标分色，端点标注）
 - **交互**：crosshair + tooltip（悬停查看任意时刻全系列数值，键盘 focus 亦可）
-- **明细表格**：图表的 table 双生，承载全部当前值，并展示 NTP/服务端校准来源、本地时间、准确时间及快慢偏差（tabular-nums）
+- **明细表格**：图表的 table 双生，承载全部当前值，并展示
+  NTP/服务端校准来源、本地时间、准确时间及快慢偏差（tabular-nums）
 
 配色与图表规范遵循 dataviz 方法（dark 调色板经 `validate_palette.js`
 六项检查）。
 
 ## 接口
 
-| 接口                            | 说明                                                                   |
-| ------------------------------- | ---------------------------------------------------------------------- |
-| `POST /report`                  | agent 上报；响应携带毫秒级 `server_time` 与该实例的待下发配置 |
-| `GET /`                         | 监控面板（3s 自动刷新）                                                |
-| `GET /api/servers`              | 全部 Reporter 实例最新数据 JSON                                        |
-| `POST /api/config/:instance_id` | 设置该 Reporter 的待下发配置；`instance_id` 由 `/api/servers` 返回     |
+| 接口                            | 说明                                                               |
+| ------------------------------- | ------------------------------------------------------------------ |
+| `POST /report`                  | agent 上报；响应携带毫秒级 `server_time` 与该实例的待下发配置      |
+| `GET /`                         | 监控面板（3s 自动刷新）                                            |
+| `GET /api/servers`              | 全部 Reporter 实例最新数据 JSON                                    |
+| `POST /api/config/:instance_id` | 设置该 Reporter 的待下发配置；`instance_id` 由 `/api/servers` 返回 |
 
 ## 演示流程
 

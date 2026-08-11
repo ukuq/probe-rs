@@ -994,7 +994,6 @@ document.getElementById('theme-btn').onclick = function () {
 
 /* ---- CF 协议换算（对齐 agent 端 reporter_cf.rs；CF 预览 tab 用） ----
    注意：这是 agent 线协议映射的 JS 镜像，改 reporter_cf.rs 时需同步 */
-var CF_COMPAT_VERSION = '0.0.0'; // 同步 reporter_cf.rs 的 CF_COMPAT_VERSION
 var serverStatics = {};   // instance_id -> 最新 static
 var serverLatest = {};    // instance_id -> serversView 条目（异步快照兜底用）
 function cfMb(b) { return b == null ? null : Math.floor(b / 1048576); }
@@ -1029,6 +1028,7 @@ function cfBody(r) {
   var g = gatherLatest(r);
   var rep = g.rep, st = g.st, last = g.last, slow = g.slow, gpus = g.gpus, pings = g.pings, dio = g.dio;
   var dyn = g.dyn;
+  var tm = rep.time || {}, clockOffset = tm.offset_ms == null ? 0 : tm.offset_ms;
   function pingOf(names) {
     for (var i = 0; i < names.length; i++) {
       var p = pings[names[i]];
@@ -1058,14 +1058,14 @@ function cfBody(r) {
     m.disk = dk;
   }
   set('load_avg', cfLoad(last.load));
-  m.boot_time = st.boot_time || 0;
+  m.boot_time = st.boot_time ? st.boot_time + clockOffset : 0;
   set('net_rx', last.net_rx); set('net_tx', last.net_tx);
   set('net_rx_monthly', last.net_rx_monthly); set('net_tx_monthly', last.net_tx_monthly);
   set('net_in_speed', last.net_rx_speed); set('net_out_speed', last.net_tx_speed);
   m.os = st.os || ''; m.arch = st.arch || ''; m.kernel_version = st.kernel || '';
   m.cpu_info = st.cpu_name || ''; m.cpu_cores = st.cpu_cores || 0;
-  m.agent_version = CF_COMPAT_VERSION + '_probe-rs_' + (st.agent_version || '?');
-  m.timestamp = r.received_at;
+  m.agent_version = (st.agent_version || '?') + '_probe-rs';
+  m.timestamp = tm.accurate_ts == null ? r.received_at : tm.accurate_ts;
   if (gpus.length) {
     m.gpu_info = gpus.map(function (g, i) {
       return { id: String(i), name: g.name, info: cfRound2(g.usage) || 0 };
@@ -1096,7 +1096,7 @@ function cfBody(r) {
       sset('net_rx', d.net_rx); sset('net_tx', d.net_tx);
       sset('net_in_speed', d.net_rx_speed); sset('net_out_speed', d.net_tx_speed);
       sset('net_rx_monthly', d.net_rx_monthly); sset('net_tx_monthly', d.net_tx_monthly);
-      return { ts: d.ts, metrics: sm };
+      return { ts: d.ts + clockOffset, metrics: sm };
     });
   }
   var out = { id: r.server_id, secret: '<API_SECRET>', metrics: m };
@@ -1108,6 +1108,9 @@ function cfBody(r) {
 function komariFrames(r) {
   var g = gatherLatest(r);
   var rep = g.rep, st = g.st, last = g.last, slow = g.slow, gpus = g.gpus;
+  var tm = rep.time || {}, clockOffset = tm.offset_ms == null ? 0 : tm.offset_ms;
+  var reportNow = tm.accurate_ts == null ? r.received_at : tm.accurate_ts;
+  var reportBoot = st.boot_time ? st.boot_time + clockOffset : 0;
   var network = {};
   if (last.net_tx_speed != null) network.up = last.net_tx_speed;
   if (last.net_rx_speed != null) network.down = last.net_rx_speed;
@@ -1119,7 +1122,7 @@ function komariFrames(r) {
     swap: { total: st.swap_total || 0, used: last.swap_used || 0 },
     disk: { total: st.disk_total || 0, used: (slow && slow.disk_used) || 0 },
     network: network,
-    uptime: st.boot_time ? Math.max(0, Math.floor((r.received_at - st.boot_time) / 1000)) : 0,
+    uptime: reportBoot ? Math.max(0, Math.floor((reportNow - reportBoot) / 1000)) : 0,
     process: (slow && slow.processes) || 0,
     message: (rep.errors || []).map(function (e) { return '[' + e.source + '] ' + e.msg; }).join('; '),
   };
@@ -2098,7 +2101,7 @@ var EXAMPLE_JSON5 = \`{
     "boot_time": 1754300000000,             // ms 时间戳
     "ipv4": "203.0.113.10",                 // 查询失败保留旧值
     "ipv6": "2001:db8::10",                 // 可选；无 v6 出口为 null
-    "agent_version": "0.1.3-beta.4",
+    "agent_version": "0.1.3-beta.5",
     "config": {                             // 当前生效配置（供服务端展示/核对）
       "global": {                           // Agent 全局实际采集；与任何 Reporter 的上报周期无关
         "intervals": {

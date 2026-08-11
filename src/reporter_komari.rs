@@ -17,6 +17,7 @@ pub fn build_report(
     gpus: &[GpuRecord],
     errors: &[ErrorRecord],
     now_ms: i64,
+    clock_offset_ms: i64,
 ) -> Value {
     let d = dyn_latest.cloned().unwrap_or_default();
     let mut network = json!({});
@@ -38,7 +39,7 @@ pub fn build_report(
         "swap": { "total": st.swap_total, "used": d.swap_used.unwrap_or(0) },
         "disk": { "total": st.disk_total },
         "network": network,
-        "uptime": ((now_ms - st.boot_time).max(0) / 1000) as u64,
+        "uptime": ((now_ms - st.boot_time.saturating_add(clock_offset_ms)).max(0) / 1000) as u64,
         "message": errors.iter().map(|e| format!("[{}] {}", e.source, e.msg))
             .collect::<Vec<_>>().join("; "),
     });
@@ -210,7 +211,7 @@ mod tests {
             source: "gpu".into(),
             msg: "x".into(),
         }];
-        let v = build_report(&st, Some(&d), Some(&slow), &[], &errs, 1900);
+        let v = build_report(&st, Some(&d), Some(&slow), &[], &errs, 2200, 300);
         assert_eq!(v["cpu"]["usage"], 12.3);
         assert_eq!(v["ram"]["total"], 16_000_000_000u64);
         assert_eq!(v["ram"]["used"], 8_000_000_000u64);
@@ -219,7 +220,7 @@ mod tests {
         assert_eq!(v["network"]["up"], 512); // up = tx
         assert_eq!(v["network"]["totalDown"], 100);
         assert_eq!(v["connections"]["tcp"], 3);
-        assert_eq!(v["uptime"], 1); // (1900-900)/1000
+        assert_eq!(v["uptime"], 1); // (accurate 2200 - corrected boot 1200)/1000
         assert_eq!(v["process"], 99);
         assert_eq!(v["message"], "[gpu] x");
         assert!(v.get("gpu").is_none());
@@ -251,7 +252,7 @@ mod tests {
                 temp: None,
             },
         ];
-        let report = build_report(&stub(), None, None, &gpus, &[], 1_900);
+        let report = build_report(&stub(), None, None, &gpus, &[], 1_900, 0);
         assert_eq!(report["gpu"]["count"], 2);
         assert_eq!(report["gpu"]["average_usage"], 50.0);
         assert_eq!(report["gpu"]["detailed_info"][0]["memory_total"], 8_000);
@@ -266,7 +267,7 @@ mod tests {
             .get("memory_total")
             .is_none());
 
-        let report = build_report(&stub(), None, None, &gpus[1..], &[], 1_900);
+        let report = build_report(&stub(), None, None, &gpus[1..], &[], 1_900, 0);
         assert!(report["gpu"].get("average_usage").is_none());
     }
 
@@ -277,7 +278,7 @@ mod tests {
             mem_used: Some(4_000),
             ..Default::default()
         };
-        let report = build_report(&stub(), Some(&dynamic), None, &[], &[], 1_900);
+        let report = build_report(&stub(), Some(&dynamic), None, &[], &[], 1_900, 0);
 
         assert_eq!(report["cpu"]["usage"], 12.5);
         assert_eq!(report["ram"]["used"], 4_000);

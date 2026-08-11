@@ -76,7 +76,7 @@ pub struct CfMetrics {
     pub kernel_version: String,
     pub cpu_info: String,
     pub cpu_cores: u32,
-    /// 探针标识（CF 存库展示；形如 0.0.0_probe-rs_<版本>，可与官方探针区分）
+    /// 探针标识（CF 存库展示；形如 <版本>_probe-rs，可与官方探针区分）
     pub agent_version: String,
     /// 上报时刻（毫秒），CF 映射为 last_updated
     pub timestamp: i64,
@@ -160,13 +160,9 @@ pub struct CfDynMetrics {
 
 const MIB: u64 = 1024 * 1024;
 
-/// CF 服务端展示使用的探针版本前缀。
-/// 上报标识 = "{CF_COMPAT_VERSION}_probe-rs_{本版本}"（CF 允许的字符集：0-9A-Za-z.+_-）
-pub const CF_COMPAT_VERSION: &str = "0.0.0";
-
 /// CF 探针标识：头部与 body 的 agent_version 统一用它
 pub fn cf_agent_version(our_version: &str) -> String {
-    format!("{CF_COMPAT_VERSION}_probe-rs_{our_version}")
+    format!("{our_version}_probe-rs")
 }
 
 fn mb(bytes: u64) -> u64 {
@@ -182,6 +178,7 @@ fn load_str(load: [f64; 3]) -> String {
 }
 
 /// 组装顶层 metrics：static（缓存复用）+ 最新 dynamic + 各异步快照
+#[allow(clippy::too_many_arguments)]
 pub fn build_metrics(
     st: &StaticInfo,
     dyn_latest: Option<&DynamicRecord>,
@@ -190,6 +187,8 @@ pub fn build_metrics(
     pings: &HashMap<String, PingRecord>,
     diskio: Option<&DiskIoRecord>,
     ping_targets: &[PingTarget],
+    timestamp: i64,
+    clock_offset_ms: i64,
 ) -> CfMetrics {
     let disk = diskio.and_then(|d| {
         let any = d.read_bps.is_some() || d.write_bps.is_some() || d.read_iops.is_some();
@@ -251,7 +250,7 @@ pub fn build_metrics(
         disk_used: slow.and_then(|s| s.disk_used).map(mb),
         disk,
         load_avg: dyn_latest.and_then(|d| d.load).map(load_str),
-        boot_time: st.boot_time,
+        boot_time: st.boot_time.saturating_add(clock_offset_ms),
         net_rx: dyn_latest.and_then(|d| d.net_rx),
         net_tx: dyn_latest.and_then(|d| d.net_tx),
         net_rx_monthly: dyn_latest.and_then(|d| d.net_rx_monthly),
@@ -264,7 +263,7 @@ pub fn build_metrics(
         cpu_info: st.cpu_name.clone(),
         cpu_cores: st.cpu_cores,
         agent_version: cf_agent_version(&st.agent_version),
-        timestamp: crate::model::now_millis(),
+        timestamp,
         gpu_info,
         processes: slow.and_then(|s| s.processes),
         tcp_conn: slow.and_then(|s| s.tcp_conn),
@@ -291,9 +290,9 @@ pub fn build_metrics(
 }
 
 /// dynamic 记录 → samples[] 元素
-pub fn build_sample(d: &DynamicRecord) -> CfSample {
+pub fn build_sample(d: &DynamicRecord, clock_offset_ms: i64) -> CfSample {
     CfSample {
-        ts: d.ts,
+        ts: d.ts.saturating_add(clock_offset_ms),
         metrics: CfDynMetrics {
             cpu: d.cpu_usage.map(round2),
             ram_used: d.mem_used.map(mb),
@@ -310,11 +309,18 @@ pub fn build_sample(d: &DynamicRecord) -> CfSample {
 }
 
 /// 本地 batch 开关可以显式关闭批量回放。
-pub fn build_samples(dynamic: &[DynamicRecord], batch: bool) -> Vec<CfSample> {
+pub fn build_samples(
+    dynamic: &[DynamicRecord],
+    batch: bool,
+    clock_offset_ms: i64,
+) -> Vec<CfSample> {
     if !batch {
         return Vec::new();
     }
-    dynamic.iter().map(build_sample).collect()
+    dynamic
+        .iter()
+        .map(|record| build_sample(record, clock_offset_ms))
+        .collect()
 }
 
 /// CF 配置推送（解析自 URL-encoded body）
@@ -624,11 +630,22 @@ mod tests {
                 interval: None,
             })
             .collect::<Vec<_>>();
-        let m = build_metrics(&st, Some(&d), Some(&slow), &[], &pings, None, &ping_targets);
+        let m = build_metrics(
+            &st,
+            Some(&d),
+            Some(&slow),
+            &[],
+            &pings,
+            None,
+            &ping_targets,
+            2_000,
+            250,
+        );
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["cpu"], 12.35);
-        assert_eq!(v["agent_version"], "0.0.0_probe-rs_0.1.0");
-        assert!(v["timestamp"].as_i64().unwrap() > 0);
+        assert_eq!(v["agent_version"], "0.1.0_probe-rs");
+        assert_eq!(v["timestamp"], 2_000);
+        assert_eq!(v["boot_time"], 1_786_000_000_250_i64);
         assert_eq!(v["ram_total"], 12884); // 13510758768 / 2^20（向下取整）
         assert_eq!(v["ram_used"], 925);
         assert_eq!(v["load_avg"], "0.10 0.20 0.30");
@@ -643,12 +660,12 @@ mod tests {
         assert_eq!(v["loss_cm"], false);
         assert_eq!(v["tcp_conn"], 1);
         assert!(v.get("gpu_info").is_none()); // 无 GPU → 缺席
-        let s = build_sample(&d);
+        let s = build_sample(&d, 250);
         let sv = serde_json::to_value(&s).unwrap();
-        assert_eq!(sv["ts"], 1000);
+        assert_eq!(sv["ts"], 1250);
         assert_eq!(sv["metrics"]["net_in_speed"], 11_200);
-        assert!(build_samples(std::slice::from_ref(&d), false).is_empty());
-        assert_eq!(build_samples(&[d], true).len(), 1);
+        assert!(build_samples(std::slice::from_ref(&d), false, 250).is_empty());
+        assert_eq!(build_samples(&[d], true, 250).len(), 1);
     }
 
     #[test]
@@ -674,14 +691,24 @@ mod tests {
                 temp: None,
             },
         ];
-        let metrics = build_metrics(&st, None, None, &gpus, &HashMap::new(), None, &[]);
+        let metrics = build_metrics(&st, None, None, &gpus, &HashMap::new(), None, &[], 1_900, 0);
         let value = serde_json::to_value(metrics).unwrap();
         assert_eq!(value["gpu_info"].as_array().unwrap().len(), 1);
         assert_eq!(value["gpu_info"][0]["id"], "7");
         assert_eq!(value["gpu_info"][0]["name"], "measured");
         assert_eq!(value["gpu_info"][0]["info"], 42.35);
 
-        let metrics = build_metrics(&st, None, None, &gpus[..1], &HashMap::new(), None, &[]);
+        let metrics = build_metrics(
+            &st,
+            None,
+            None,
+            &gpus[..1],
+            &HashMap::new(),
+            None,
+            &[],
+            1_900,
+            0,
+        );
         let value = serde_json::to_value(metrics).unwrap();
         assert!(value.get("gpu_info").is_none());
     }

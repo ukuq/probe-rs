@@ -1,7 +1,7 @@
 //! 上报器：POST /report，X-Secret 认证，失败丢弃（由调用方 drain 后不重试），
 //! 响应体非空时解析为远端配置
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -57,7 +57,13 @@ pub struct Reporter {
     agent_version: String,
     reporter_id: String,
     protocol: String,
-    clock: Mutex<ClockState>,
+    clock: Arc<AgentClock>,
+}
+
+/// Agent-wide calibrated clock shared by every Reporter protocol.
+#[derive(Default)]
+pub struct AgentClock {
+    state: Mutex<ClockState>,
 }
 
 #[derive(Default)]
@@ -118,6 +124,103 @@ struct NtpSample {
     accurate_at_anchor: i64,
     round_trip_ms: u64,
     offset_nanos: i128,
+}
+
+impl AgentClock {
+    /// Snapshot both the local wall clock and the best calibrated clock.
+    pub fn report_time(&self) -> ReportTime {
+        let local_ts = crate::model::now_millis();
+        let clock = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let calibration = clock
+            .ntp
+            .as_ref()
+            .filter(|sample| sample.anchor.elapsed() <= MAX_CALIBRATION_AGE)
+            .or_else(|| {
+                clock
+                    .server
+                    .as_ref()
+                    .filter(|sample| sample.anchor.elapsed() <= MAX_CALIBRATION_AGE)
+            });
+        match calibration {
+            Some(calibration) => calibration.snapshot(local_ts, calibration.anchor.elapsed()),
+            None => ReportTime {
+                local_ts,
+                accurate_ts: None,
+                offset_ms: None,
+                source: None,
+                round_trip_ms: None,
+                sample_age_ms: None,
+            },
+        }
+    }
+
+    fn update_server_clock(
+        &self,
+        server_time: i64,
+        round_trip: Duration,
+        anchor: Instant,
+        reporter_id: &str,
+    ) {
+        let calibration = ClockCalibration::from_server_time(server_time, round_trip, anchor);
+        let snapshot = calibration.snapshot(crate::model::now_millis(), anchor.elapsed());
+        tracing::debug!(
+            reporter_id,
+            offset_ms = snapshot.offset_ms,
+            round_trip_ms = snapshot.round_trip_ms,
+            "native server fallback time calibrated"
+        );
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .server = Some(calibration);
+    }
+
+    fn begin_ntp_refresh(&self) -> bool {
+        let now = Instant::now();
+        let mut clock = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if clock
+            .last_ntp_attempt
+            .is_some_and(|last| now.duration_since(last) < NTP_REFRESH_INTERVAL)
+        {
+            return false;
+        }
+        clock.last_ntp_attempt = Some(now);
+        true
+    }
+
+    fn update_ntp_clock(&self, sample: NtpSample) {
+        let server = sample.server;
+        let calibration = ClockCalibration::from_ntp(sample);
+        let snapshot =
+            calibration.snapshot(crate::model::now_millis(), calibration.anchor.elapsed());
+        tracing::debug!(
+            server,
+            offset_ms = snapshot.offset_ms,
+            round_trip_ms = snapshot.round_trip_ms,
+            "agent clock calibrated from NTP"
+        );
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .ntp = Some(calibration);
+    }
+
+    /// Start a non-blocking NTP refresh if the shared refresh interval elapsed.
+    pub fn refresh_ntp(self: &Arc<Self>) {
+        if !self.begin_ntp_refresh() {
+            return;
+        }
+        let clock = Arc::clone(self);
+        tokio::spawn(async move {
+            match query_ntp_servers().await {
+                Ok(sample) => clock.update_ntp_clock(sample),
+                Err(error) => tracing::debug!(
+                    %error,
+                    "NTP calibration unavailable; native server time remains the fallback"
+                ),
+            }
+        });
+    }
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -297,6 +400,7 @@ impl Reporter {
         agent_version: &str,
         reporter_id: &str,
         protocol: &str,
+        clock: Arc<AgentClock>,
     ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(TIMEOUT)
@@ -310,106 +414,24 @@ impl Reporter {
             agent_version: agent_version.to_string(),
             reporter_id: reporter_id.to_string(),
             protocol: protocol.to_string(),
-            clock: Mutex::new(ClockState::default()),
+            clock,
         })
     }
 
     /// 返回本次原生协议上报的时间状态。准确时间锚定在单调时钟上，
     /// 因此校准后本机墙钟发生跳变时，offset_ms 会在下一次上报反映出来。
     pub fn report_time(&self) -> ReportTime {
-        let local_ts = crate::model::now_millis();
-        let clock = self.clock.lock().unwrap_or_else(|error| error.into_inner());
-        let calibration = clock
-            .ntp
-            .as_ref()
-            .filter(|sample| sample.anchor.elapsed() <= MAX_CALIBRATION_AGE)
-            .or_else(|| {
-                clock
-                    .server
-                    .as_ref()
-                    .filter(|sample| sample.anchor.elapsed() <= MAX_CALIBRATION_AGE)
-            });
-        match calibration {
-            Some(calibration) => calibration.snapshot(local_ts, calibration.anchor.elapsed()),
-            None => ReportTime {
-                local_ts,
-                accurate_ts: None,
-                offset_ms: None,
-                source: None,
-                round_trip_ms: None,
-                sample_age_ms: None,
-            },
-        }
+        self.clock.report_time()
     }
 
-    fn update_server_clock(&self, server_time: i64, round_trip: Duration, anchor: Instant) {
-        let calibration = ClockCalibration::from_server_time(server_time, round_trip, anchor);
-        let snapshot = calibration.snapshot(crate::model::now_millis(), anchor.elapsed());
-        tracing::debug!(
-            reporter_id = %self.reporter_id,
-            offset_ms = snapshot.offset_ms,
-            round_trip_ms = snapshot.round_trip_ms,
-            "native server fallback time calibrated"
-        );
-        self.clock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .server = Some(calibration);
-    }
-
-    fn begin_ntp_refresh(&self) -> bool {
-        let now = Instant::now();
-        let mut clock = self.clock.lock().unwrap_or_else(|error| error.into_inner());
-        if clock
-            .last_ntp_attempt
-            .is_some_and(|last| now.duration_since(last) < NTP_REFRESH_INTERVAL)
-        {
-            return false;
-        }
-        clock.last_ntp_attempt = Some(now);
-        true
-    }
-
-    fn update_ntp_clock(&self, sample: NtpSample) {
-        let server = sample.server;
-        let calibration = ClockCalibration::from_ntp(sample);
-        let snapshot =
-            calibration.snapshot(crate::model::now_millis(), calibration.anchor.elapsed());
-        tracing::debug!(
-            reporter_id = %self.reporter_id,
-            server,
-            offset_ms = snapshot.offset_ms,
-            round_trip_ms = snapshot.round_trip_ms,
-            "NTP time calibrated"
-        );
-        self.clock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .ntp = Some(calibration);
+    /// Let any protocol trigger the shared, non-blocking NTP refresh.
+    pub fn refresh_time(&self) {
+        self.clock.refresh_ntp();
     }
 
     /// 成功返回响应中的动作；任何失败返回 Err，调用方直接保留数据待重发
     pub async fn send(&self, report: &Report) -> Result<ResponseAction> {
-        let refresh_ntp = self.begin_ntp_refresh();
-        let ntp = async {
-            if refresh_ntp {
-                Some(query_ntp_servers().await)
-            } else {
-                None
-            }
-        };
-        let (result, ntp_result) = tokio::join!(self.send_probe(report), ntp);
-        if let Some(result) = ntp_result {
-            match result {
-                Ok(sample) => self.update_ntp_clock(sample),
-                Err(error) => tracing::debug!(
-                    reporter_id = %self.reporter_id,
-                    %error,
-                    "NTP calibration unavailable; native server time remains the fallback"
-                ),
-            }
-        }
-        result
+        self.send_probe(report).await
     }
 
     async fn send_probe(&self, report: &Report) -> Result<ResponseAction> {
@@ -443,7 +465,8 @@ impl Reporter {
         }
         let parsed: ReportResponse = serde_json::from_str(body).context("解析上报响应失败")?;
         if let Some(server_time) = parsed.server_time {
-            self.update_server_clock(server_time, round_trip, completed);
+            self.clock
+                .update_server_clock(server_time, round_trip, completed, &self.reporter_id);
         }
         Ok(ResponseAction {
             config: parsed.config,
