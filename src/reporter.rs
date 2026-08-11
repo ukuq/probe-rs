@@ -1,14 +1,29 @@
 //! 上报器：POST /report，X-Secret 认证，失败丢弃（由调用方 drain 后不重试），
 //! 响应体非空时解析为远端配置
 
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use futures::future::join_all;
+use tokio::net::{lookup_host, UdpSocket};
 
-use crate::model::{RemoteConfig, Report};
+use crate::model::{RemoteConfig, Report, ReportTime};
 use crate::reporter_cf::{CfConfirm, CfResponse, CfUpdate};
 
 const TIMEOUT: Duration = Duration::from_secs(8);
+const NTP_SERVERS: [&str; 4] = [
+    "time.cloudflare.com",
+    "time.google.com",
+    "time.nist.gov",
+    "ntp.aliyun.com",
+];
+const NTP_TIMEOUT: Duration = Duration::from_secs(2);
+const NTP_REFRESH_INTERVAL: Duration = Duration::from_secs(600);
+const MAX_CALIBRATION_AGE: Duration = Duration::from_secs(86_400);
+const NTP_UNIX_EPOCH_SECONDS: i128 = 2_208_988_800;
+const NANOS_PER_SECOND: i128 = 1_000_000_000;
+const NANOS_PER_MILLI: i128 = 1_000_000;
 
 /// 响应信封：config 缺席 = 无配置变更；next.static = true 时下次上报强制带 static
 #[derive(serde::Deserialize)]
@@ -16,6 +31,9 @@ struct ReportResponse {
     config: Option<RemoteConfig>,
     #[serde(default)]
     next: Option<NextDirective>,
+    /// 服务端生成响应时的 Unix 毫秒时间；旧服务端可省略。
+    #[serde(default)]
+    server_time: Option<i64>,
 }
 
 /// 对下一次上报的指令
@@ -39,6 +57,237 @@ pub struct Reporter {
     agent_version: String,
     reporter_id: String,
     protocol: String,
+    clock: Mutex<ClockState>,
+}
+
+#[derive(Default)]
+struct ClockState {
+    ntp: Option<ClockCalibration>,
+    server: Option<ClockCalibration>,
+    last_ntp_attempt: Option<Instant>,
+}
+
+struct ClockCalibration {
+    source: String,
+    anchor: Instant,
+    accurate_at_anchor: i64,
+    round_trip_ms: u64,
+}
+
+impl ClockCalibration {
+    fn from_server_time(server_time: i64, round_trip: Duration, anchor: Instant) -> Self {
+        let round_trip_ms = duration_millis(round_trip);
+        // server_time is stamped close to response transmission. With only one
+        // server timestamp, the request/response midpoint is the best estimate;
+        // half the RTT is also the approximate uncertainty bound.
+        let half_round_trip = round_trip_ms / 2 + round_trip_ms % 2;
+        Self {
+            source: "server".to_owned(),
+            anchor,
+            accurate_at_anchor: add_millis(server_time, half_round_trip),
+            round_trip_ms,
+        }
+    }
+
+    fn from_ntp(sample: NtpSample) -> Self {
+        Self {
+            source: format!("ntp:{}", sample.server),
+            anchor: sample.anchor,
+            accurate_at_anchor: sample.accurate_at_anchor,
+            round_trip_ms: sample.round_trip_ms,
+        }
+    }
+
+    fn snapshot(&self, local_ts: i64, age: Duration) -> ReportTime {
+        let sample_age_ms = duration_millis(age);
+        let accurate_ts = add_millis(self.accurate_at_anchor, sample_age_ms);
+        ReportTime {
+            local_ts,
+            accurate_ts: Some(accurate_ts),
+            offset_ms: Some(accurate_ts.saturating_sub(local_ts)),
+            source: Some(self.source.clone()),
+            round_trip_ms: Some(self.round_trip_ms),
+            sample_age_ms: Some(sample_age_ms),
+        }
+    }
+}
+
+struct NtpSample {
+    server: &'static str,
+    anchor: Instant,
+    accurate_at_anchor: i64,
+    round_trip_ms: u64,
+    offset_nanos: i128,
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn add_millis(timestamp: i64, millis: u64) -> i64 {
+    timestamp.saturating_add(i64::try_from(millis).unwrap_or(i64::MAX))
+}
+
+fn duration_nanos(duration: Duration) -> i128 {
+    i128::try_from(duration.as_nanos()).unwrap_or(i128::MAX)
+}
+
+fn nanos_to_millis(value: i128) -> i64 {
+    let value = value.div_euclid(NANOS_PER_MILLI);
+    i64::try_from(value).unwrap_or(if value.is_negative() {
+        i64::MIN
+    } else {
+        i64::MAX
+    })
+}
+
+fn positive_nanos_to_millis(value: i128) -> u64 {
+    let value = value.max(0);
+    let rounded_up = value / NANOS_PER_MILLI + i128::from(value % NANOS_PER_MILLI != 0);
+    u64::try_from(rounded_up).unwrap_or(u64::MAX)
+}
+
+fn unix_millis_to_ntp_timestamp(unix_millis: i64) -> [u8; 8] {
+    let unix_seconds = unix_millis.div_euclid(1000);
+    let millis = unix_millis.rem_euclid(1000) as u64;
+    let ntp_seconds =
+        (i128::from(unix_seconds) + NTP_UNIX_EPOCH_SECONDS).rem_euclid(1_i128 << 32) as u32;
+    let fraction = ((u128::from(millis) << 32) / 1000) as u32;
+    let mut encoded = [0_u8; 8];
+    encoded[..4].copy_from_slice(&ntp_seconds.to_be_bytes());
+    encoded[4..].copy_from_slice(&fraction.to_be_bytes());
+    encoded
+}
+
+fn ntp_timestamp_to_unix_nanos(timestamp: &[u8]) -> Result<i128> {
+    if timestamp.len() != 8 {
+        bail!("invalid NTP timestamp length");
+    }
+    let seconds = u32::from_be_bytes(timestamp[..4].try_into().expect("checked NTP length"));
+    let fraction = u32::from_be_bytes(timestamp[4..].try_into().expect("checked NTP length"));
+    if seconds == 0 && fraction == 0 {
+        bail!("empty NTP timestamp");
+    }
+    Ok(
+        (i128::from(seconds) - NTP_UNIX_EPOCH_SECONDS) * NANOS_PER_SECOND
+            + i128::from(fraction) * NANOS_PER_SECOND / (1_i128 << 32),
+    )
+}
+
+async fn query_ntp_servers() -> Result<NtpSample> {
+    let results = join_all(NTP_SERVERS.map(query_ntp_server)).await;
+    let mut samples = Vec::new();
+    for (server, result) in NTP_SERVERS.into_iter().zip(results) {
+        match result {
+            Ok(sample) => samples.push(sample),
+            Err(error) => tracing::debug!(server, %error, "NTP query failed"),
+        }
+    }
+    if samples.is_empty() {
+        bail!("all NTP queries failed");
+    }
+    samples.sort_by_key(|sample| sample.offset_nanos);
+    let middle = samples.len() / 2;
+    let median = if samples.len() % 2 == 0 {
+        samples[middle - 1]
+            .offset_nanos
+            .saturating_add(samples[middle].offset_nanos)
+            / 2
+    } else {
+        samples[middle].offset_nanos
+    };
+    let selected = (0..samples.len())
+        .min_by_key(|&index| {
+            (
+                samples[index].offset_nanos.abs_diff(median),
+                samples[index].round_trip_ms,
+            )
+        })
+        .expect("non-empty NTP samples");
+    Ok(samples.swap_remove(selected))
+}
+
+async fn query_ntp_server(server: &'static str) -> Result<NtpSample> {
+    tokio::time::timeout(NTP_TIMEOUT, async move {
+        let addresses: Vec<_> = lookup_host((server, 123))
+            .await
+            .with_context(|| format!("resolve NTP server {server}"))?
+            .collect();
+        let address = addresses
+            .iter()
+            .copied()
+            .find(std::net::SocketAddr::is_ipv4)
+            .or_else(|| addresses.first().copied())
+            .with_context(|| format!("NTP server {server} has no addresses"))?;
+        query_ntp_address(server, address).await
+    })
+    .await
+    .with_context(|| format!("NTP query to {server} timed out"))?
+}
+
+async fn query_ntp_address(
+    server: &'static str,
+    address: std::net::SocketAddr,
+) -> Result<NtpSample> {
+    let bind_address = if address.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind_address)
+        .await
+        .context("bind NTP UDP socket")?;
+    socket
+        .connect(address)
+        .await
+        .with_context(|| format!("connect NTP server {server}"))?;
+
+    let local_started = crate::model::now_millis();
+    let started = Instant::now();
+    let mut request = [0_u8; 48];
+    request[0] = 0x23; // leap=0, version=4, mode=3 (client)
+    request[40..48].copy_from_slice(&unix_millis_to_ntp_timestamp(local_started));
+    socket.send(&request).await.context("send NTP request")?;
+    let mut response = [0_u8; 512];
+    let received = socket
+        .recv(&mut response)
+        .await
+        .context("receive NTP response")?;
+    let anchor = Instant::now();
+    if received < 48 {
+        bail!("short NTP response: {received} bytes");
+    }
+    let header = response[0];
+    let leap = header >> 6;
+    let version = (header >> 3) & 0x07;
+    let mode = header & 0x07;
+    let stratum = response[1];
+    if leap == 3 || !(3..=4).contains(&version) || mode != 4 || !(1..=15).contains(&stratum) {
+        bail!("invalid NTP response header");
+    }
+    if response[24..32] != request[40..48] {
+        bail!("NTP originate timestamp mismatch");
+    }
+
+    let t1 = i128::from(local_started) * NANOS_PER_MILLI;
+    let elapsed = anchor.duration_since(started);
+    let elapsed_nanos = duration_nanos(elapsed);
+    let t4 = t1.saturating_add(elapsed_nanos);
+    let t2 = ntp_timestamp_to_unix_nanos(&response[32..40])?;
+    let t3 = ntp_timestamp_to_unix_nanos(&response[40..48])?;
+    if t3 < t2 {
+        bail!("NTP transmit time precedes receive time");
+    }
+    let offset_nanos = (t2.saturating_sub(t1) + t3.saturating_sub(t4)) / 2;
+    let accurate_at_anchor = nanos_to_millis(t4.saturating_add(offset_nanos));
+    let network_delay = elapsed_nanos.saturating_sub(t3.saturating_sub(t2));
+    Ok(NtpSample {
+        server,
+        anchor,
+        accurate_at_anchor,
+        round_trip_ms: positive_nanos_to_millis(network_delay),
+        offset_nanos,
+    })
 }
 
 impl Reporter {
@@ -61,11 +310,110 @@ impl Reporter {
             agent_version: agent_version.to_string(),
             reporter_id: reporter_id.to_string(),
             protocol: protocol.to_string(),
+            clock: Mutex::new(ClockState::default()),
         })
+    }
+
+    /// 返回本次原生协议上报的时间状态。准确时间锚定在单调时钟上，
+    /// 因此校准后本机墙钟发生跳变时，offset_ms 会在下一次上报反映出来。
+    pub fn report_time(&self) -> ReportTime {
+        let local_ts = crate::model::now_millis();
+        let clock = self.clock.lock().unwrap_or_else(|error| error.into_inner());
+        let calibration = clock
+            .ntp
+            .as_ref()
+            .filter(|sample| sample.anchor.elapsed() <= MAX_CALIBRATION_AGE)
+            .or_else(|| {
+                clock
+                    .server
+                    .as_ref()
+                    .filter(|sample| sample.anchor.elapsed() <= MAX_CALIBRATION_AGE)
+            });
+        match calibration {
+            Some(calibration) => calibration.snapshot(local_ts, calibration.anchor.elapsed()),
+            None => ReportTime {
+                local_ts,
+                accurate_ts: None,
+                offset_ms: None,
+                source: None,
+                round_trip_ms: None,
+                sample_age_ms: None,
+            },
+        }
+    }
+
+    fn update_server_clock(&self, server_time: i64, round_trip: Duration, anchor: Instant) {
+        let calibration = ClockCalibration::from_server_time(server_time, round_trip, anchor);
+        let snapshot = calibration.snapshot(crate::model::now_millis(), anchor.elapsed());
+        tracing::debug!(
+            reporter_id = %self.reporter_id,
+            offset_ms = snapshot.offset_ms,
+            round_trip_ms = snapshot.round_trip_ms,
+            "native server fallback time calibrated"
+        );
+        self.clock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .server = Some(calibration);
+    }
+
+    fn begin_ntp_refresh(&self) -> bool {
+        let now = Instant::now();
+        let mut clock = self.clock.lock().unwrap_or_else(|error| error.into_inner());
+        if clock
+            .last_ntp_attempt
+            .is_some_and(|last| now.duration_since(last) < NTP_REFRESH_INTERVAL)
+        {
+            return false;
+        }
+        clock.last_ntp_attempt = Some(now);
+        true
+    }
+
+    fn update_ntp_clock(&self, sample: NtpSample) {
+        let server = sample.server;
+        let calibration = ClockCalibration::from_ntp(sample);
+        let snapshot =
+            calibration.snapshot(crate::model::now_millis(), calibration.anchor.elapsed());
+        tracing::debug!(
+            reporter_id = %self.reporter_id,
+            server,
+            offset_ms = snapshot.offset_ms,
+            round_trip_ms = snapshot.round_trip_ms,
+            "NTP time calibrated"
+        );
+        self.clock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .ntp = Some(calibration);
     }
 
     /// 成功返回响应中的动作；任何失败返回 Err，调用方直接保留数据待重发
     pub async fn send(&self, report: &Report) -> Result<ResponseAction> {
+        let refresh_ntp = self.begin_ntp_refresh();
+        let ntp = async {
+            if refresh_ntp {
+                Some(query_ntp_servers().await)
+            } else {
+                None
+            }
+        };
+        let (result, ntp_result) = tokio::join!(self.send_probe(report), ntp);
+        if let Some(result) = ntp_result {
+            match result {
+                Ok(sample) => self.update_ntp_clock(sample),
+                Err(error) => tracing::debug!(
+                    reporter_id = %self.reporter_id,
+                    %error,
+                    "NTP calibration unavailable; native server time remains the fallback"
+                ),
+            }
+        }
+        result
+    }
+
+    async fn send_probe(&self, report: &Report) -> Result<ResponseAction> {
+        let started = Instant::now();
         let resp = self
             .client
             .post(&self.url)
@@ -84,6 +432,8 @@ impl Reporter {
             anyhow::bail!("上报响应 HTTP {status}");
         }
         let body = resp.text().await.context("读取上报响应失败")?;
+        let completed = Instant::now();
+        let round_trip = completed.duration_since(started);
         let body = body.trim();
         if body.is_empty() || body == "{}" {
             return Ok(ResponseAction {
@@ -92,6 +442,9 @@ impl Reporter {
             });
         }
         let parsed: ReportResponse = serde_json::from_str(body).context("解析上报响应失败")?;
+        if let Some(server_time) = parsed.server_time {
+            self.update_server_clock(server_time, round_trip, completed);
+        }
         Ok(ResponseAction {
             config: parsed.config,
             next_static: parsed.next.is_some_and(|n| n.r#static),
@@ -175,9 +528,66 @@ fn encode_header_value(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{
+        ntp_timestamp_to_unix_nanos, unix_millis_to_ntp_timestamp, ClockCalibration,
+        NANOS_PER_MILLI,
+    };
+
     #[test]
     fn reporter_header_value_percent_encodes_unicode() {
         let encoded = super::encode_header_value("本地 demo/一");
         assert_eq!(encoded, "%E6%9C%AC%E5%9C%B0%20demo%2F%E4%B8%80");
+    }
+
+    #[test]
+    fn server_clock_calibration_uses_rtt_midpoint_and_monotonic_age() {
+        let calibration = ClockCalibration::from_server_time(
+            1_000_000,
+            Duration::from_millis(80),
+            Instant::now(),
+        );
+        let snapshot = calibration.snapshot(999_500, Duration::from_millis(20));
+        assert_eq!(snapshot.accurate_ts, Some(1_000_060));
+        assert_eq!(snapshot.offset_ms, Some(560));
+        assert_eq!(snapshot.source.as_deref(), Some("server"));
+        assert_eq!(snapshot.round_trip_ms, Some(80));
+        assert_eq!(snapshot.sample_age_ms, Some(20));
+    }
+
+    #[test]
+    fn ntp_timestamp_round_trip_preserves_unix_milliseconds() {
+        let unix_millis = 1_754_300_060_123_i64;
+        let encoded = unix_millis_to_ntp_timestamp(unix_millis);
+        let decoded = ntp_timestamp_to_unix_nanos(&encoded).unwrap() / NANOS_PER_MILLI;
+        assert!((decoded - i128::from(unix_millis)).abs() <= 1);
+    }
+
+    #[tokio::test]
+    async fn ntp_client_uses_server_timestamps_instead_of_local_wall_clock() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut request = [0_u8; 48];
+            let (_, peer) = socket.recv_from(&mut request).await.unwrap();
+            let accurate = crate::model::now_millis().saturating_add(250);
+            let stamp = unix_millis_to_ntp_timestamp(accurate);
+            let mut response = [0_u8; 48];
+            response[0] = 0x24; // leap=0, version=4, mode=4 (server)
+            response[1] = 1;
+            response[24..32].copy_from_slice(&request[40..48]);
+            response[32..40].copy_from_slice(&stamp);
+            response[40..48].copy_from_slice(&stamp);
+            socket.send_to(&response, peer).await.unwrap();
+        });
+
+        let sample = super::query_ntp_address("local-test", address)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let observed_offset_ms = sample.offset_nanos / NANOS_PER_MILLI;
+        assert!((200..=300).contains(&observed_offset_ms));
+        assert_eq!(sample.server, "local-test");
     }
 }

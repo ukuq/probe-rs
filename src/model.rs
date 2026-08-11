@@ -8,6 +8,8 @@ pub struct Report {
     pub server_id: String,
     /// 人类可读的 UTC+8 时间戳版本（如 2026-08-06T15:30:45.123+08:00）
     pub config_version: String,
+    /// 本机墙钟与原生服务端校准后的时间；首次校准前准确时间相关字段为 null。
+    pub time: ReportTime,
     #[serde(rename = "static", skip_serializing_if = "Option::is_none")]
     pub static_info: Option<StaticInfo>,
     pub dynamic: Vec<DynamicRecord>,
@@ -15,6 +17,19 @@ pub struct Report {
     pub async_records: Vec<AsyncRecord>,
     /// 采集/上报错误事件（空数组 = 无错误）
     pub errors: Vec<ErrorRecord>,
+}
+
+/// 原生 probe 协议的时间状态。offset_ms = accurate_ts - local_ts：
+/// 正数表示本机时间偏慢，负数表示本机时间偏快。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReportTime {
+    pub local_ts: i64,
+    pub accurate_ts: Option<i64>,
+    pub offset_ms: Option<i64>,
+    /// ntp:<host>；UDP NTP 不可用时回退为 server；首次校准前为 null。
+    pub source: Option<String>,
+    pub round_trip_ms: Option<u64>,
+    pub sample_age_ms: Option<u64>,
 }
 
 /// 一条错误事件：来源 + 信息。同源同文去重（不重复刷屏）

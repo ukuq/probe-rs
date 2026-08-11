@@ -122,6 +122,9 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 {
   "server_id": "server-xxx",
   "config_version": "2026-08-06T15:30:45.123+08:00",
+  "time": { "local_ts": 1754300060123, "accurate_ts": 1754300060000,
+    "offset_ms": -123, "source": "ntp:time.cloudflare.com",
+    "round_trip_ms": 18, "sample_age_ms": 29982 },
   "static": { "ts": 1754300050000, "os": "Debian 12", "...": "..." },
   "dynamic": [
     { "ts": 1754300060000, "cpu_usage": 12.3, "mem_used": 4294967296,
@@ -140,6 +143,7 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 ### 3.2 规则
 
 - **每个 report tick 必报**：`dynamic` 为空数组也照发，天然承担心跳职能，服务端按"最后收到时间"判离线。
+- **原生协议时间校准**：Agent 每 10 分钟并行查询 Cloudflare / Google / NIST / Aliyun NTP，按偏差中位数选源并生成单调时钟锚点；UDP/123 不通时才回退到响应 `server_time`。上报同时带本地时间、准确时间、差值与来源，但不修改系统时钟。
 - **`static` 可省略**：未到期且无变化时不带，服务端保留旧值。
 - **`dynamic` 每条带 `ts`**：采集时刻时间戳，不是上报时刻。
 - **三段结构**：`static` obj + `dynamic[]`（fast，ts = tick 时刻）+ `async[]`（kind 区分来源，ts = 各自测量时刻）——两个数组的 ts 语义各自单一，异步频率互不迁就。
@@ -152,7 +156,7 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 ### 3.3 数据口径约定
 
 - 容量/流量一律**字节**，速率一律**字节/秒**，数值用 JSON number（不用字符串）。
-- 时间戳一律**毫秒**（含 netstatic 条目、boot_time、各数组的 ts）。
+- 时间戳一律**毫秒**（含 netstatic 条目、boot_time、各数组的 ts 与原生协议 `time`）。
 - 百分比（cpu_usage、gpu usage、loss）为 0-100 的 number。
 - 单项采集失败：该字段置 null，不中断本轮采集与上报。
 
@@ -213,11 +217,11 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 | `report_self` | 当前 Reporter 是否输出探针自身指标 |
 | `config_version` | 配置版本（人类可读的 UTC+8 时间戳字符串），幂等机制，见下 |
 
-响应信封把配置收在 `config` 一级（除 config_version 外均可选，出现的才应用），另有 `next` 一级放对下一次上报的指令（如 `next.static`）。响应只能修改产生它的 Reporter；机器级实际配置没有可直接写入口，而是每次从全部 Reporter 重新聚合，因此多路下发不会互相覆盖。🔒 连接身份与 `net_static_path` 仍只接受本地 TOML。允许远端 Ping 时，服务端必须自行限制目标范围。
+响应信封的 `server_time` 提供公共 NTP 不可用时的毫秒级兜底时间，`config` 收配置（除 config_version 外均可选，出现的才应用），`next` 放对下一次上报的指令（如 `next.static`）。响应只能修改产生该响应的 Reporter；机器级实际配置没有可直接写入口，而是每次从全部 Reporter 重新聚合，因此多路下发不会互相覆盖。🔒 连接身份与 `net_static_path` 仍只接受本地 TOML。允许远端 Ping 时，服务端必须自行限制目标范围。
 
 ### 4.2 下发机制
 
-- 搭上报便车：POST /report 的响应体携带配置对象。
+- 搭上报便车：POST /report 的响应体携带 `server_time` 与可选配置对象；时钟校准不新增外部请求。
 - agent 上报时带当前 `config_version`；服务端比对，不一致才下发。
 - **幂等**：version 与本地一致则不应用。
 - **原子**：整个配置对象全部校验通过才应用 + 落盘本地配置文件；任何一项非法（零值间隔、reset_day 越界等）整体拒绝，agent 日志记录原因。

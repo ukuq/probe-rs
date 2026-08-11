@@ -22,6 +22,14 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
 {
   "server_id": "srv-01",
   "config_version": "2026-08-06T15:30:45.123+08:00",
+  "time": {
+    "local_ts": 1754300060123,
+    "accurate_ts": 1754300060000,
+    "offset_ms": -123,
+    "source": "ntp:time.cloudflare.com",
+    "round_trip_ms": 18,
+    "sample_age_ms": 29982
+  },
 
   "static": {
     "ts": 1754300050000,
@@ -40,7 +48,7 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
     "boot_time": 1754300000000,
     "ipv4": "203.0.113.10",
     "ipv6": "2001:db8::10",
-    "agent_version": "0.1.3-beta.3",
+    "agent_version": "0.1.3-beta.4",
     "config": {
       "global": {
         "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
@@ -102,10 +110,24 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
 |---|---|---|---|
 | `server_id` | string | ✅ | 服务器 ID，本地配置 |
 | `config_version` | string | ✅ | 当前配置版本（人类可读的 UTC+8 时间戳）；服务端比对后决定是否下发新配置 |
+| `time` | object | ✅ | 本机墙钟与原生服务端时间校准状态；字段见下 |
 | `static` | object | 条件 | 启动首报必带；之后每 10 分钟或内容变化时携带；省略时服务端保留旧值 |
 | `dynamic` | array | ✅ | 同步采集记录（fast 字段），可为空数组（空也必报，承担心跳） |
 | `async` | array | ✅ | 异步记录（kind 区分来源），可为空数组 |
 | `errors` | array | ✅ | 错误事件，空数组 = 无错误 |
+
+## time 字段（原生协议时钟校准）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `local_ts` | number | 本次上报组包时的本机 Unix 毫秒墙钟 |
+| `accurate_ts` | number \| null | 根据最近一次 NTP（优先）或服务端时间（兜底）与单调时钟推算的 Unix 毫秒时间；首次校准前为 null |
+| `offset_ms` | number \| null | `accurate_ts - local_ts`；正数表示本机慢，负数表示本机快 |
+| `source` | string \| null | `ntp:<host>`；UDP/123 不可用时为 `server`；首次校准前为 null |
+| `round_trip_ms` | number \| null | 最近一次成功校准请求的往返耗时；误差量级约为其一半 |
+| `sample_age_ms` | number \| null | 最近校准样本到本次组包的单调时钟年龄 |
+
+Agent 不修改系统时间。它每 10 分钟并行查询 `time.cloudflare.com`、`time.google.com`、`time.nist.gov`、`ntp.aliyun.com`，按成功样本的偏差中位数选源；NTP 样本最长使用 24 小时。UDP/123 被阻断或全部 NTP 查询失败时，才回退到原生服务端 `server_time`，并通过 `source` 明示。校准成功后，准确时间锚定在单调时钟上继续推进，因此本机墙钟随后发生跳变时，下一次上报的 `offset_ms` 会立即反映出来。公共 NTP 是未认证 UDP，多源中位数能排除单个异常源，但不能抵御控制本机网络的攻击者。
 
 ## static 字段
 
@@ -202,12 +224,19 @@ Ping 聚合规则：机器内部按“类型 + 规范化目标”去重，TCP �
 
 ## 响应（服务端 → agent）
 
-无配置变更时返回 `200 OK`，body 为空或 `{}`。
+支持时钟校准的服务端应在每次成功响应中返回尽量靠近响应发送时刻生成的 `server_time`：
+
+```json
+{ "server_time": 1754300060011 }
+```
+
+`server_time` 是服务端 Unix 毫秒墙钟，仅在公共 NTP 不可用时作为兜底。Agent 结合请求 RTT 中点估算该样本，且不会修改系统时钟。服务端仍应由 NTP/chrony 等保持准确。旧服务端可返回空 body 或 `{}`；只要 Agent 能访问公共 NTP，仍可得到独立准确时间，否则准确时间相关字段保持 null（或保留此前未过期的校准样本）。
 
 有配置变更时：
 
 ```json
 {
+  "server_time": 1754300060011,
   "config": {
     "config_version": "2026-08-06T16:00:00.000+08:00",
     "intervals": { "collect": 2, "ping": 60, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
@@ -239,7 +268,7 @@ Ping 聚合规则：机器内部按“类型 + 规范化目标”去重，TCP �
 
 `config` 内除 `config_version` 外的字段均可选：出现的才应用，缺席的保持现值。响应只修改产生该响应的 Reporter，不会影响其他上报线路。
 
-配置收在 `config` 一级（信封后续可扩展其他指令）；`config` 缺席表示无变更。
+`server_time`、`config`、`next` 都位于响应信封一级；`config` 缺席表示无配置变更。
 
 agent 行为：校验 `config_version`、所有周期、glob 与 Ping 目标，全部通过才应用并落盘；任何一项非法则整体拒绝并记录日志。应用后重新聚合全局 worker 配置并立即生效，无需重启。
 

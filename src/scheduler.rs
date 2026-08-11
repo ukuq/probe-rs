@@ -370,6 +370,7 @@ impl ReporterRunner {
         let report = Report {
             server_id: spec.server_id.clone(),
             config_version: spec.config_version.clone(),
+            time: self.reporter.report_time(),
             static_info,
             dynamic,
             async_records,

@@ -197,9 +197,21 @@ interface ErrorRecord {
   msg: string;
 }
 
+interface ReportTime {
+  local_ts: number;
+  accurate_ts: number | null;
+  /** accurate_ts - local_ts；正数表示本机慢，负数表示本机快 */
+  offset_ms: number | null;
+  source: string | null;
+  round_trip_ms: number | null;
+  sample_age_ms: number | null;
+}
+
 interface Report {
   server_id: string;
   config_version: string;
+  /** 新 agent 必带；旧 agent 上报可缺席 */
+  time?: ReportTime;
   static?: StaticInfo;
   dynamic?: DynamicRecord[];
   async?: AsyncRecord[];
@@ -219,6 +231,7 @@ interface ServerState {
   dynamic: DynamicRecord[];
   asyncs: AsyncRecord[];
   errors: ErrorRecord[];
+  time: ReportTime | null;
   lastSeen: number;
   configVersion: string;
 }
@@ -298,6 +311,7 @@ function getServer(
       dynamic: [],
       asyncs: [],
       errors: [],
+      time: null,
       lastSeen: 0,
       configVersion: "",
     };
@@ -336,10 +350,11 @@ function handleReport(req: Request, report: Report): Response {
     "probe",
   );
   const instanceId = reporterInstanceId(reporterId, serverId);
+  const receivedAt = Date.now();
 
   rawReports.push({
     seq: ++reportSeq,
-    received_at: Date.now(),
+    received_at: receivedAt,
     instance_id: instanceId,
     reporter_id: reporterId,
     protocol,
@@ -351,9 +366,10 @@ function handleReport(req: Request, report: Report): Response {
   }
 
   const s = getServer(instanceId, reporterId, protocol, serverId);
-  s.lastSeen = Date.now();
+  s.lastSeen = receivedAt;
   s.agentVersion = req.headers.get("x-agent-version") ?? s.agentVersion;
   s.configVersion = report.config_version ?? "";
+  if (report.time) s.time = report.time;
   if (report.static) s.staticInfo = report.static;
   if (Array.isArray(report.dynamic)) {
     s.dynamic.push(...report.dynamic);
@@ -396,7 +412,8 @@ function handleReport(req: Request, report: Report): Response {
       console.log(`[static] 要求 ${serverId}/${reporterId} 下次上报带 static`);
     }
   }
-  return json(resp);
+  // 尽量靠近响应序列化时取值，agent 会结合请求 RTT 中点估算时钟偏差。
+  return json({ server_time: Date.now(), ...resp });
 }
 
 /** 生成人类可读的 UTC+8 版本字符串，如 2026-08-06T15:30:45.123+08:00 */
@@ -622,6 +639,7 @@ function serversView() {
       online: now - s.lastSeen < 90_000,
       last_seen: s.lastSeen,
       config_version: s.configVersion,
+      time: s.time,
       pending_config: pendingConfig.get(instanceId) ?? null,
       static: s.staticInfo,
       dynamic_count: s.dynamic.length,
@@ -1163,6 +1181,15 @@ function fmtS(n) { return n == null ? '–' : fmtB(n)+'/s'; }
 function pad2(n) { return String(n).padStart(2,'0'); }
 function fmtTime(ts) { var d = new Date(ts); return pad2(d.getHours())+':'+pad2(d.getMinutes())+':'+pad2(d.getSeconds()); }
 function fmtHM(ts) { var d = new Date(ts); return pad2(d.getHours())+':'+pad2(d.getMinutes()); }
+function fmtDateTimeMs(ts) { if (ts == null) return '–'; var d = new Date(ts);
+  return d.toLocaleString('zh-CN', { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0'); }
+function fmtMsSpan(ms) { var n = Math.abs(Number(ms));
+  if (n >= 60000) return (n / 60000).toFixed(2) + ' min';
+  if (n >= 1000) return (n / 1000).toFixed(3) + ' s';
+  return Math.round(n) + ' ms'; }
+function fmtClockOffset(ms) { if (ms == null) return '等待首次校准';
+  if (Math.abs(ms) <= 1) return '≤ 1 ms';
+  return (ms > 0 ? '本地慢 ' : '本地快 ') + fmtMsSpan(ms); }
 /* 配置版本展示：UTC+8 时间戳字符串缩短为 "08-06 15:30:45"，其他原样 */
 function fmtVer(v) { if (v == null || v === '') return '–'; var s = String(v);
   return /^\\d{4}-\\d{2}-\\d{2}T/.test(s) ? s.slice(5, 19).replace('T', ' ') : s; }
@@ -1351,6 +1378,7 @@ function render(data) {
   }
   data.forEach(function (s) {
     var st = s.static || {}, d = mergeLatest(s.recent || []);
+    var tm = s.time || {};
     var slow = s.slow_latest || {};
     var card = el('div', 'card' + (s.online ? '' : ' offline'));
     var head = el('div', 'card-head');
@@ -1407,6 +1435,9 @@ function render(data) {
     detailRow(tb, ['内存', fmtB(d.mem_used) + ' / ' + fmtB(st.mem_total), 'Swap', fmtB(d.swap_used) + ' / ' + fmtB(st.swap_total)]);
     detailRow(tb, ['磁盘', fmtB(slow.disk_used) + ' / ' + fmtB(st.disk_total), '累计流量', '↓ ' + fmtB(d.net_rx) + '  ↑ ' + fmtB(d.net_tx)]);
     detailRow(tb, ['月流量', '↓ ' + fmtB(d.net_rx_monthly) + '  ↑ ' + fmtB(d.net_tx_monthly), '开机时间', st.boot_time ? new Date(st.boot_time).toLocaleString('zh-CN') : '–']);
+    detailRow(tb, ['本地时间', fmtDateTimeMs(tm.local_ts), '准确时间', fmtDateTimeMs(tm.accurate_ts)]);
+    detailRow(tb, ['时间偏差', fmtClockOffset(tm.offset_ms), '校准质量', tm.round_trip_ms == null
+      ? '等待 NTP / 服务端时间' : (tm.source || '未知来源') + ' · RTT ' + tm.round_trip_ms + ' ms · 样本年龄 ' + fmtMsSpan(tm.sample_age_ms || 0)]);
     detailRow(tb, ['公网 IP', (st.ipv4 || '–') + '  /  ' + (st.ipv6 || '–'), '内核', (st.kernel || '–') + (st.virtualization ? ' · ' + st.virtualization : '')]);
     if (s.gpu_latest) {
       var g = s.gpu_latest;
@@ -2038,6 +2069,14 @@ function renderCfView(servers) {
 var EXAMPLE_JSON5 = \`{
   "server_id": "srv-01",                    // 服务器 ID（本地配置，远端不可改）
   "config_version": "2026-08-06T15:30:45.123+08:00",   // 当前配置版本（UTC+8 可读时间戳字符串），服务端按「不等」判断是否下发新配置
+  "time": {                                  // 原生服务端时间校准；offset = accurate - local
+    "local_ts": 1754300060123,               // 本机墙钟
+    "accurate_ts": 1754300060000,            // 单调时钟推算的准确时间；首次校准前为 null
+    "offset_ms": -123,                       // 负数 = 本机快，正数 = 本机慢
+    "source": "ntp:time.cloudflare.com",     // NTP 优先；UDP/123 不通时为 server
+    "round_trip_ms": 18,                     // 最近一次校准请求 RTT
+    "sample_age_ms": 29982                   // 最近校准样本到本次上报的年龄
+  },
 
   // static 可省略：首报必带，之后每 10 分钟或 IP/GPU/配置变化时携带；缺席时服务端保留旧值
   "static": {
@@ -2059,7 +2098,7 @@ var EXAMPLE_JSON5 = \`{
     "boot_time": 1754300000000,             // ms 时间戳
     "ipv4": "203.0.113.10",                 // 查询失败保留旧值
     "ipv6": "2001:db8::10",                 // 可选；无 v6 出口为 null
-    "agent_version": "0.1.3-beta.3",
+    "agent_version": "0.1.3-beta.4",
     "config": {                             // 当前生效配置（供服务端展示/核对）
       "global": {                           // Agent 全局实际采集；与任何 Reporter 的上报周期无关
         "intervals": {
