@@ -6,7 +6,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::net::{lookup_host, UdpSocket};
+use tokio::sync::watch;
+use tokio::time::MissedTickBehavior;
 
 use crate::model::{RemoteConfig, Report, ReportTime};
 use crate::reporter_cf::{CfConfirm, CfResponse, CfUpdate};
@@ -70,7 +73,6 @@ pub struct AgentClock {
 struct ClockState {
     ntp: Option<ClockCalibration>,
     server: Option<ClockCalibration>,
-    last_ntp_attempt: Option<Instant>,
 }
 
 struct ClockCalibration {
@@ -175,19 +177,6 @@ impl AgentClock {
             .server = Some(calibration);
     }
 
-    fn begin_ntp_refresh(&self) -> bool {
-        let now = Instant::now();
-        let mut clock = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if clock
-            .last_ntp_attempt
-            .is_some_and(|last| now.duration_since(last) < NTP_REFRESH_INTERVAL)
-        {
-            return false;
-        }
-        clock.last_ntp_attempt = Some(now);
-        true
-    }
-
     fn update_ntp_clock(&self, sample: NtpSample) {
         let server = sample.server;
         let calibration = ClockCalibration::from_ntp(sample);
@@ -205,21 +194,40 @@ impl AgentClock {
             .ntp = Some(calibration);
     }
 
-    /// Start a non-blocking NTP refresh if the shared refresh interval elapsed.
-    pub fn refresh_ntp(self: &Arc<Self>) {
-        if !self.begin_ntp_refresh() {
-            return;
+    async fn refresh_ntp(&self) {
+        match query_ntp_servers().await {
+            Ok(sample) => self.update_ntp_clock(sample),
+            Err(error) => tracing::debug!(
+                %error,
+                "NTP calibration unavailable; native server time remains the fallback"
+            ),
         }
+    }
+
+    /// Run the Agent-wide NTP loop independently of all Reporter intervals.
+    /// Tokio's first interval tick is immediate, then refreshes every 10 minutes.
+    pub fn spawn_ntp_refresh(
+        self: &Arc<Self>,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         let clock = Arc::clone(self);
         tokio::spawn(async move {
-            match query_ntp_servers().await {
-                Ok(sample) => clock.update_ntp_clock(sample),
-                Err(error) => tracing::debug!(
-                    %error,
-                    "NTP calibration unavailable; native server time remains the fallback"
-                ),
+            let mut ticker = tokio::time::interval(NTP_REFRESH_INTERVAL);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+                tokio::select! {
+                    _ = ticker.tick() => clock.refresh_ntp().await,
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
+                    }
+                }
             }
-        });
+        })
     }
 }
 
@@ -262,7 +270,7 @@ fn unix_millis_to_ntp_timestamp(unix_millis: i64) -> [u8; 8] {
     encoded
 }
 
-fn ntp_timestamp_to_unix_nanos(timestamp: &[u8]) -> Result<i128> {
+fn ntp_timestamp_to_unix_nanos(timestamp: &[u8], reference_unix_nanos: i128) -> Result<i128> {
     if timestamp.len() != 8 {
         bail!("invalid NTP timestamp length");
     }
@@ -271,9 +279,18 @@ fn ntp_timestamp_to_unix_nanos(timestamp: &[u8]) -> Result<i128> {
     if seconds == 0 && fraction == 0 {
         bail!("empty NTP timestamp");
     }
+    let era_seconds = 1_i128 << 32;
+    let reference_ntp_seconds =
+        reference_unix_nanos.div_euclid(NANOS_PER_SECOND) + NTP_UNIX_EPOCH_SECONDS;
+    let estimated_era = reference_ntp_seconds.div_euclid(era_seconds);
+    let absolute_seconds = (estimated_era - 1..=estimated_era + 1)
+        .map(|era| era * era_seconds + i128::from(seconds))
+        .min_by_key(|candidate| candidate.abs_diff(reference_ntp_seconds))
+        .expect("NTP era candidates are non-empty");
+
     Ok(
-        (i128::from(seconds) - NTP_UNIX_EPOCH_SECONDS) * NANOS_PER_SECOND
-            + i128::from(fraction) * NANOS_PER_SECOND / (1_i128 << 32),
+        (absolute_seconds - NTP_UNIX_EPOCH_SECONDS) * NANOS_PER_SECOND
+            + i128::from(fraction) * NANOS_PER_SECOND / era_seconds,
     )
 }
 
@@ -312,20 +329,41 @@ async fn query_ntp_servers() -> Result<NtpSample> {
 
 async fn query_ntp_server(server: &'static str) -> Result<NtpSample> {
     tokio::time::timeout(NTP_TIMEOUT, async move {
-        let addresses: Vec<_> = lookup_host((server, 123))
+        let addresses = lookup_host((server, 123))
             .await
             .with_context(|| format!("resolve NTP server {server}"))?
             .collect();
-        let address = addresses
-            .iter()
-            .copied()
-            .find(std::net::SocketAddr::is_ipv4)
-            .or_else(|| addresses.first().copied())
-            .with_context(|| format!("NTP server {server} has no addresses"))?;
-        query_ntp_address(server, address).await
+        query_ntp_addresses(server, addresses).await
     })
     .await
     .with_context(|| format!("NTP query to {server} timed out"))?
+}
+
+async fn query_ntp_addresses(
+    server: &'static str,
+    mut addresses: Vec<std::net::SocketAddr>,
+) -> Result<NtpSample> {
+    addresses.sort_unstable();
+    addresses.dedup();
+    if addresses.is_empty() {
+        bail!("NTP server {server} has no addresses");
+    }
+
+    let mut attempts = FuturesUnordered::new();
+    for address in addresses {
+        attempts.push(query_ntp_address(server, address));
+    }
+    let mut errors = Vec::new();
+    while let Some(result) = attempts.next().await {
+        match result {
+            Ok(sample) => return Ok(sample),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    bail!(
+        "all resolved addresses for NTP server {server} failed: {}",
+        errors.join("; ")
+    )
 }
 
 async fn query_ntp_address(
@@ -376,8 +414,8 @@ async fn query_ntp_address(
     let elapsed = anchor.duration_since(started);
     let elapsed_nanos = duration_nanos(elapsed);
     let t4 = t1.saturating_add(elapsed_nanos);
-    let t2 = ntp_timestamp_to_unix_nanos(&response[32..40])?;
-    let t3 = ntp_timestamp_to_unix_nanos(&response[40..48])?;
+    let t2 = ntp_timestamp_to_unix_nanos(&response[32..40], t1)?;
+    let t3 = ntp_timestamp_to_unix_nanos(&response[40..48], t1)?;
     if t3 < t2 {
         bail!("NTP transmit time precedes receive time");
     }
@@ -422,11 +460,6 @@ impl Reporter {
     /// 因此校准后本机墙钟发生跳变时，offset_ms 会在下一次上报反映出来。
     pub fn report_time(&self) -> ReportTime {
         self.clock.report_time()
-    }
-
-    /// Let any protocol trigger the shared, non-blocking NTP refresh.
-    pub fn refresh_time(&self) {
-        self.clock.refresh_ntp();
     }
 
     /// 成功返回响应中的动作；任何失败返回 Err，调用方直接保留数据待重发
@@ -583,7 +616,17 @@ mod tests {
     fn ntp_timestamp_round_trip_preserves_unix_milliseconds() {
         let unix_millis = 1_754_300_060_123_i64;
         let encoded = unix_millis_to_ntp_timestamp(unix_millis);
-        let decoded = ntp_timestamp_to_unix_nanos(&encoded).unwrap() / NANOS_PER_MILLI;
+        let reference = i128::from(unix_millis) * NANOS_PER_MILLI;
+        let decoded = ntp_timestamp_to_unix_nanos(&encoded, reference).unwrap() / NANOS_PER_MILLI;
+        assert!((decoded - i128::from(unix_millis)).abs() <= 1);
+    }
+
+    #[test]
+    fn ntp_timestamp_resolves_era_after_2036_rollover() {
+        let unix_millis = 2_208_988_800_456_i64; // 2040-01-01T00:00:00.456Z
+        let encoded = unix_millis_to_ntp_timestamp(unix_millis);
+        let reference = i128::from(unix_millis) * NANOS_PER_MILLI;
+        let decoded = ntp_timestamp_to_unix_nanos(&encoded, reference).unwrap() / NANOS_PER_MILLI;
         assert!((decoded - i128::from(unix_millis)).abs() <= 1);
     }
 
@@ -611,6 +654,39 @@ mod tests {
         server.await.unwrap();
         let observed_offset_ms = sample.offset_nanos / NANOS_PER_MILLI;
         assert!((200..=300).contains(&observed_offset_ms));
+        assert_eq!(sample.server, "local-test");
+    }
+
+    #[tokio::test]
+    async fn ntp_client_uses_a_reachable_resolved_address() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let reachable = socket.local_addr().unwrap();
+        let unavailable = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let mut request = [0_u8; 48];
+            let (_, peer) = socket.recv_from(&mut request).await.unwrap();
+            let stamp = unix_millis_to_ntp_timestamp(crate::model::now_millis());
+            let mut response = [0_u8; 48];
+            response[0] = 0x24;
+            response[1] = 1;
+            response[24..32].copy_from_slice(&request[40..48]);
+            response[32..40].copy_from_slice(&stamp);
+            response[40..48].copy_from_slice(&stamp);
+            socket.send_to(&response, peer).await.unwrap();
+        });
+
+        let sample = tokio::time::timeout(
+            Duration::from_secs(1),
+            super::query_ntp_addresses("local-test", vec![unavailable, reachable]),
+        )
+        .await
+        .expect("reachable address should not wait for the unavailable address")
+        .unwrap();
+        server.await.unwrap();
         assert_eq!(sample.server, "local-test");
     }
 }

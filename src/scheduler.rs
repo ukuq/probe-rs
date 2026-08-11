@@ -20,7 +20,7 @@ use crate::model::{
     Report, SelfRecord, SlowBlock, StaticInfo,
 };
 use crate::netstatic::{period_start_ms, NetStatic};
-use crate::reporter::Reporter;
+use crate::reporter::{AgentClock, Reporter};
 use crate::worker::komari::{KomariOut, TimedKomariReport};
 use crate::worker::ping::PingSnapshot;
 use crate::worker::public_ip::IpSnapshot;
@@ -30,6 +30,7 @@ const STATIC_REFRESH: Duration = Duration::from_secs(600);
 /// Pure collection scheduler. Reporting is handled by `ReporterRunner`.
 pub struct Scheduler {
     buffers: Arc<Buffers>,
+    clock: Arc<AgentClock>,
     intervals_rx: watch::Receiver<Intervals>,
     ping_rx: watch::Receiver<PingSnapshot>,
     gpu_rx: watch::Receiver<Vec<GpuRecord>>,
@@ -50,6 +51,7 @@ impl Scheduler {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         buffers: Arc<Buffers>,
+        clock: Arc<AgentClock>,
         intervals_rx: watch::Receiver<Intervals>,
         ping_rx: watch::Receiver<PingSnapshot>,
         gpu_rx: watch::Receiver<Vec<GpuRecord>>,
@@ -60,6 +62,7 @@ impl Scheduler {
     ) -> Self {
         Self {
             buffers,
+            clock,
             intervals_rx,
             ping_rx,
             gpu_rx,
@@ -102,7 +105,8 @@ impl Scheduler {
     }
 
     fn on_collect(&mut self) {
-        let now_ms = crate::model::now_millis();
+        let report_time = self.clock.report_time();
+        let now_ms = report_time.local_ts;
         let cpu_usage = self.cpu.sample().map(|u| (u * 100.0).round() / 100.0);
         let (_, mem_used, _, swap_used) = collector::memory();
 
@@ -150,6 +154,7 @@ impl Scheduler {
 
         self.buffers.push_dynamic(DynamicRecord {
             ts: now_ms,
+            accurate_ts: report_time.accurate_ts,
             cpu_usage,
             mem_used: Some(mem_used),
             swap_used: Some(swap_used),
@@ -227,6 +232,7 @@ pub struct ReporterRunner {
     last_dynamic: Option<DynamicRecord>,
     last_static: Option<Instant>,
     static_cache: Option<StaticInfo>,
+    static_calibrated: Option<bool>,
 }
 
 impl ReporterRunner {
@@ -269,6 +275,7 @@ impl ReporterRunner {
             last_dynamic: None,
             last_static: None,
             static_cache: None,
+            static_calibrated: None,
         }
     }
 
@@ -323,9 +330,6 @@ impl ReporterRunner {
         let Some(spec) = self.cfg.get().reporter(&self.id) else {
             return;
         };
-        // Every protocol participates in refreshing the same Agent-wide clock.
-        // The shared interval guard ensures only one non-blocking NTP query runs.
-        self.reporter.refresh_time();
         let batch = self.buffers.read(&self.id);
         let dynamic = self.scope_dynamic_batch(&batch.dynamic, &spec);
         if let Some(latest) = dynamic.last() {
@@ -500,7 +504,6 @@ impl ReporterRunner {
         }
         let report_time = self.reporter.report_time();
         let outbound_now_ms = report_time.accurate_ts.unwrap_or(report_time.local_ts);
-        let clock_offset_ms = report_time.offset_ms.unwrap_or(0);
         let report = crate::reporter_komari::build_report(
             &static_info,
             Some(dyn_latest),
@@ -508,7 +511,6 @@ impl ReporterRunner {
             &fresh_gpus,
             &errors,
             outbound_now_ms,
-            clock_offset_ms,
         );
         drop(gpus);
         publish_komari(
@@ -535,7 +537,6 @@ impl ReporterRunner {
         let now_ms = crate::model::now_millis();
         let report_time = self.reporter.report_time();
         let outbound_now_ms = report_time.accurate_ts.unwrap_or(report_time.local_ts);
-        let clock_offset_ms = report_time.offset_ms.unwrap_or(0);
         let dyn_latest = dynamic
             .last()
             .or(self.last_dynamic.as_ref())
@@ -604,11 +605,9 @@ impl ReporterRunner {
                 diskio.as_ref(),
                 &ping_targets,
                 outbound_now_ms,
-                clock_offset_ms,
             )
         };
-        let samples =
-            crate::reporter_cf::build_samples(dynamic, spec.ext.cf.batch, clock_offset_ms);
+        let samples = crate::reporter_cf::build_samples(dynamic, spec.ext.cf.batch);
 
         if let Some((rx_gb, tx_gb)) = self.netstatic.confirm_pending(&self.id) {
             if spec.ext.cf.correction {
@@ -668,10 +667,14 @@ impl ReporterRunner {
                 match response.correction {
                     Some((rx_gb, tx_gb)) if current.ext.cf.correction => {
                         let filter = net::IfaceFilter::new(&current.interfaces);
-                        let period_start = period_start_ms(current.reset_day, chrono::Local::now());
-                        let raw =
-                            self.netstatic
-                                .query(&filter, period_start, crate::model::now_millis());
+                        let report_time = self.reporter.report_time();
+                        let now_ms = report_time.accurate_ts.unwrap_or(report_time.local_ts);
+                        let at = chrono::Local
+                            .timestamp_millis_opt(now_ms)
+                            .single()
+                            .unwrap_or_else(chrono::Local::now);
+                        let period_start = period_start_ms(current.reset_day, at);
+                        let raw = self.netstatic.query(&filter, period_start, now_ms);
                         self.netstatic
                             .apply_correction(&self.id, period_start, raw, rx_gb, tx_gb);
                     }
@@ -694,13 +697,7 @@ impl ReporterRunner {
         let filter = net::IfaceFilter::new(&spec.interfaces);
         let windows: Vec<_> = records
             .iter()
-            .map(|record| {
-                let at = chrono::Local
-                    .timestamp_millis_opt(record.ts)
-                    .single()
-                    .unwrap_or_else(chrono::Local::now);
-                (period_start_ms(spec.reset_day, at), record.ts)
-            })
+            .map(|record| dynamic_traffic_window(record, spec.reset_day))
             .collect();
         let traffic = self.netstatic.query_batch(&self.id, &filter, &windows);
 
@@ -798,6 +795,7 @@ impl ReporterRunner {
             .last_static
             .is_none_or(|last| last.elapsed() >= STATIC_REFRESH)
             || self.static_cache.is_none()
+            || self.static_calibrated != Some(self.reporter.report_time().accurate_ts.is_some())
         {
             return true;
         }
@@ -832,6 +830,10 @@ impl ReporterRunner {
             spec.static_config(config.global_summary(), config.reporter_summaries());
         let mut info =
             collector::static_info(ipv4, ipv6, gpu_name, &self.agent_version, &static_config);
+        let report_time = self.reporter.report_time();
+        let clock_offset_ms = report_time.offset_ms.unwrap_or(0);
+        info.ts = info.ts.saturating_add(clock_offset_ms);
+        info.boot_time = info.boot_time.saturating_add(clock_offset_ms);
         info.disks.retain(|disk| {
             disk_selected(
                 &spec.disks,
@@ -843,6 +845,7 @@ impl ReporterRunner {
             )
         });
         info.disk_total = info.disks.iter().map(|disk| disk.total).sum();
+        self.static_calibrated = Some(report_time.accurate_ts.is_some());
         self.static_cache = Some(info.clone());
         info
     }
@@ -852,6 +855,15 @@ impl ReporterRunner {
             .push_error(format!("reporter:{}", self.id), error.to_string());
         tracing::warn!(reporter_id = %self.id, %error, "report failed; cursor retained");
     }
+}
+
+fn dynamic_traffic_window(record: &DynamicRecord, reset_day: u8) -> (i64, i64) {
+    let report_ts = record.report_ts();
+    let at = chrono::Local
+        .timestamp_millis_opt(report_ts)
+        .single()
+        .unwrap_or_else(chrono::Local::now);
+    (period_start_ms(reset_day, at), report_ts)
 }
 
 fn scope_diskio_record(
@@ -1186,6 +1198,28 @@ mod tests {
     fn snapshot_freshness_rejects_invalid_or_future_timestamp() {
         assert_eq!(snapshot_valid_until(0, 1, 60, 100_000), None);
         assert_eq!(snapshot_valid_until(102_001, 1, 60, 100_000), None);
+    }
+
+    #[test]
+    fn traffic_window_uses_the_records_calibration_at_a_billing_boundary() {
+        let local = chrono::Local
+            .with_ymd_and_hms(2026, 8, 1, 0, 0, 1)
+            .single()
+            .unwrap();
+        let accurate = chrono::Local
+            .with_ymd_and_hms(2026, 7, 31, 23, 59, 59)
+            .single()
+            .unwrap();
+        let record = DynamicRecord {
+            ts: local.timestamp_millis(),
+            accurate_ts: Some(accurate.timestamp_millis()),
+            ..Default::default()
+        };
+
+        let (period_start, end) = dynamic_traffic_window(&record, 1);
+        assert_eq!(end, accurate.timestamp_millis());
+        assert_eq!(period_start, period_start_ms(1, accurate));
+        assert_ne!(period_start, period_start_ms(1, local));
     }
 
     #[test]

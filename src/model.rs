@@ -94,6 +94,9 @@ pub struct StaticConfig {
 pub struct DynamicRecord {
     /// 采集时刻，毫秒时间戳
     pub ts: i64,
+    /// 采集时由 Agent 级时钟校准得到的毫秒时间；首次校准前缺席。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accurate_ts: Option<i64>,
     pub cpu_usage: Option<f64>,
     pub mem_used: Option<u64>,
     pub swap_used: Option<u64>,
@@ -107,6 +110,13 @@ pub struct DynamicRecord {
     pub net_tx_monthly: Option<u64>,
     /// 当前 Reporter 选中的逐网卡快照；兼容合计字段由这些网卡求和。
     pub net_interfaces: BTreeMap<String, NetInterfaceSample>,
+}
+
+impl DynamicRecord {
+    /// 出站与账期归属使用采集时保存的校准时间，不使用发送时偏差重算。
+    pub fn report_ts(&self) -> i64 {
+        self.accurate_ts.unwrap_or(self.ts)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]

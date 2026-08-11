@@ -188,7 +188,6 @@ pub fn build_metrics(
     diskio: Option<&DiskIoRecord>,
     ping_targets: &[PingTarget],
     timestamp: i64,
-    clock_offset_ms: i64,
 ) -> CfMetrics {
     let disk = diskio.and_then(|d| {
         let any = d.read_bps.is_some() || d.write_bps.is_some() || d.read_iops.is_some();
@@ -250,7 +249,7 @@ pub fn build_metrics(
         disk_used: slow.and_then(|s| s.disk_used).map(mb),
         disk,
         load_avg: dyn_latest.and_then(|d| d.load).map(load_str),
-        boot_time: st.boot_time.saturating_add(clock_offset_ms),
+        boot_time: st.boot_time,
         net_rx: dyn_latest.and_then(|d| d.net_rx),
         net_tx: dyn_latest.and_then(|d| d.net_tx),
         net_rx_monthly: dyn_latest.and_then(|d| d.net_rx_monthly),
@@ -290,9 +289,9 @@ pub fn build_metrics(
 }
 
 /// dynamic 记录 → samples[] 元素
-pub fn build_sample(d: &DynamicRecord, clock_offset_ms: i64) -> CfSample {
+pub fn build_sample(d: &DynamicRecord) -> CfSample {
     CfSample {
-        ts: d.ts.saturating_add(clock_offset_ms),
+        ts: d.report_ts(),
         metrics: CfDynMetrics {
             cpu: d.cpu_usage.map(round2),
             ram_used: d.mem_used.map(mb),
@@ -309,18 +308,11 @@ pub fn build_sample(d: &DynamicRecord, clock_offset_ms: i64) -> CfSample {
 }
 
 /// 本地 batch 开关可以显式关闭批量回放。
-pub fn build_samples(
-    dynamic: &[DynamicRecord],
-    batch: bool,
-    clock_offset_ms: i64,
-) -> Vec<CfSample> {
+pub fn build_samples(dynamic: &[DynamicRecord], batch: bool) -> Vec<CfSample> {
     if !batch {
         return Vec::new();
     }
-    dynamic
-        .iter()
-        .map(|record| build_sample(record, clock_offset_ms))
-        .collect()
+    dynamic.iter().map(build_sample).collect()
 }
 
 /// CF 配置推送（解析自 URL-encoded body）
@@ -573,6 +565,7 @@ mod tests {
         let st = static_stub();
         let d = DynamicRecord {
             ts: 1000,
+            accurate_ts: Some(1250),
             cpu_usage: Some(12.345),
             mem_used: Some(970_000_000),
             swap_used: Some(0),
@@ -639,13 +632,12 @@ mod tests {
             None,
             &ping_targets,
             2_000,
-            250,
         );
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["cpu"], 12.35);
         assert_eq!(v["agent_version"], "0.1.0_probe-rs");
         assert_eq!(v["timestamp"], 2_000);
-        assert_eq!(v["boot_time"], 1_786_000_000_250_i64);
+        assert_eq!(v["boot_time"], 1_786_000_000_000_i64);
         assert_eq!(v["ram_total"], 12884); // 13510758768 / 2^20（向下取整）
         assert_eq!(v["ram_used"], 925);
         assert_eq!(v["load_avg"], "0.10 0.20 0.30");
@@ -660,12 +652,12 @@ mod tests {
         assert_eq!(v["loss_cm"], false);
         assert_eq!(v["tcp_conn"], 1);
         assert!(v.get("gpu_info").is_none()); // 无 GPU → 缺席
-        let s = build_sample(&d, 250);
+        let s = build_sample(&d);
         let sv = serde_json::to_value(&s).unwrap();
         assert_eq!(sv["ts"], 1250);
         assert_eq!(sv["metrics"]["net_in_speed"], 11_200);
-        assert!(build_samples(std::slice::from_ref(&d), false, 250).is_empty());
-        assert_eq!(build_samples(&[d], true, 250).len(), 1);
+        assert!(build_samples(std::slice::from_ref(&d), false).is_empty());
+        assert_eq!(build_samples(&[d], true).len(), 1);
     }
 
     #[test]
@@ -691,7 +683,7 @@ mod tests {
                 temp: None,
             },
         ];
-        let metrics = build_metrics(&st, None, None, &gpus, &HashMap::new(), None, &[], 1_900, 0);
+        let metrics = build_metrics(&st, None, None, &gpus, &HashMap::new(), None, &[], 1_900);
         let value = serde_json::to_value(metrics).unwrap();
         assert_eq!(value["gpu_info"].as_array().unwrap().len(), 1);
         assert_eq!(value["gpu_info"][0]["id"], "7");
@@ -707,7 +699,6 @@ mod tests {
             None,
             &[],
             1_900,
-            0,
         );
         let value = serde_json::to_value(metrics).unwrap();
         assert!(value.get("gpu_info").is_none());

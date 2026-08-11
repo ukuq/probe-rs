@@ -147,8 +147,7 @@ impl NetStatic {
     }
 
     /// 读一次 /proc/net/dev，按网卡算 delta 并追加（由 sampler 每 2s 调用）
-    pub fn sample(&self, filter: &IfaceFilter) {
-        let now = crate::model::now_millis();
+    pub fn sample(&self, filter: &IfaceFilter, now: i64) {
         let current = read_per_iface(filter);
         let cutoff = now - RETAIN.num_milliseconds();
         let mut inner = self.inner.lock().expect("netstatic lock poisoned");

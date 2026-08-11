@@ -42,7 +42,7 @@
 | 字段 | 来源 | 备注 |
 |---|---|---|
 | `os` | /etc/os-release | |
-| `ts` | — | static 信息采集时刻，毫秒时间戳 |
+| `ts` | — | static 信息采集时刻，毫秒时间戳；缓存生成时绑定当时校准结果 |
 | `kernel` | uname -r | |
 | `arch` | 编译/运行时 | |
 | `cpu_name` | /proc/cpuinfo | |
@@ -53,7 +53,7 @@
 | `disk_total` / `disks` | statfs 去重 | 当前 Reporter 选中卷的合计与逐卷 `{id,name,mount_point,file_system,total,used}`；扩容靠周期刷新 |
 | `gpu_name` | nvidia-smi 等 | |
 | `virtualization` | systemd-detect-virt 等 | |
-| `boot_time` | /proc/stat btime | 毫秒时间戳 |
+| `boot_time` | /proc/stat btime | 毫秒时间戳；缓存生成时绑定当时校准结果 |
 | `ipv4` / `ipv6` | cloudflare trace | 公网 IP，会变，靠周期刷新 |
 | `agent_version` | 编译注入 | |
 | `config` | 全局采集摘要 + Reporter 拓扑 + 当前 Reporter 生效配置 | `global` 是实际 collector/async worker 配置；`reporters[]` 是全部线路的脱敏输出策略；同级 intervals/reset_day/... 保持当前 Reporter 视角，供服务端展示/核对 |
@@ -66,6 +66,8 @@
 
 | 字段 | 来源 | 备注 |
 |---|---|---|
+| `ts` | 本机墙钟 | collect tick 的本地毫秒时间 |
+| `accurate_ts` | Agent 时钟 | 可选；该 tick 采集时保存的校准毫秒时间，首次校准前缺席 |
 | `cpu_usage` | /proc/stat 差值 | 百分比，0-100 |
 | `mem_used` | /proc/meminfo | 字节，total − MemAvailable |
 | `swap_used` | /proc/meminfo | 字节 |
@@ -127,7 +129,8 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
     "round_trip_ms": 18, "sample_age_ms": 29982 },
   "static": { "ts": 1754300050000, "os": "Debian 12", "...": "..." },
   "dynamic": [
-    { "ts": 1754300060000, "cpu_usage": 12.3, "mem_used": 4294967296,
+    { "ts": 1754300060000, "accurate_ts": 1754300059877,
+      "cpu_usage": 12.3, "mem_used": 4294967296,
       "net_rx_speed": 102400, "net_tx_speed": 51200, "...": "..." }
   ],
   "async": [
@@ -143,12 +146,12 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 ### 3.2 规则
 
 - **每个 report tick 必报**：`dynamic` 为空数组也照发，天然承担心跳职能，服务端按"最后收到时间"判离线。
-- **Agent 级时间校准**：全部 Reporter 共享校准器，每 10 分钟并行查询 Cloudflare / Google / NIST / Aliyun NTP，按偏差中位数选源并生成单调时钟锚点；UDP/123 不通时才回退到原生响应 `server_time`。原生上报同时带本地时间、准确时间、差值与来源；CF 出站墙钟字段按偏差换算；Komari 的 uptime 在统一纠正时间域计算。Agent 不修改系统时钟。
+- **Agent 级时间校准**：Agent 启动后立即执行一次独立 NTP 任务，此后每 10 分钟刷新，不依赖 Reporter 上报周期；全部 Reporter 共享校准结果。每轮并行查询 Cloudflare / Google / NIST / Aliyun NTP；每个域名并发尝试全部 IPv4/IPv6 地址，再按偏差中位数选源并生成单调时钟锚点；UDP/123 不通时才回退到原生响应 `server_time`。NTP 的 32 位秒字段按本次请求时间解析 era，跨 2036 回绕仍保持正确。原生上报同时带本地时间、准确时间、差值与来源；CF 当前时间在组包时校准，static 与 dynamic 时间在各自生成时绑定校准结果；Komari 的 uptime 在统一纠正时间域计算。Agent 不修改系统时钟。
 - **`static` 可省略**：未到期且无变化时不带，服务端保留旧值。
-- **`dynamic` 每条带 `ts`**：采集时刻时间戳，不是上报时刻。
+- **`dynamic` 每条带 `ts` / 可选 `accurate_ts`**：`ts` 是采集时本地墙钟，`accurate_ts` 是同一 tick 保存的校准时间；不是上报时刻，重试时也不重算。
 - **三段结构**：`static` obj + `dynamic[]`（fast，ts = tick 时刻）+ `async[]`（kind 区分来源，ts = 各自测量时刻）——两个数组的 ts 语义各自单一，异步频率互不迁就。
 - **异步按新鲜度产生**：异步记录仅当对应源快照 ts 更新时才进入 `async[]`（见 §2.3 规则）；worker 失败 = ts 停滞，有记录但值相同 = 没变。
-- **月流量/累计值**：放在 `dynamic` 记录中带当前值（上报时刻向 netstatic 现查）。
+- **月流量/累计值**：放在 `dynamic` 记录中带当前值（上报时向 netstatic 现查）；netstatic 明细及每条 dynamic 的查询窗口均使用采集时的 Agent 时间，避免本地墙钟跳变跨越 `reset_day` 时错账期。
 - **上报失败有界保留**：失败的记录放回缓冲待下次重发，上限 10 条（只覆盖短暂抖动，长断网历史不补发）。
 - **数据陈旧判断交给服务端**：动态数据有 `ts`，静态数据本来不变，不报 `measured_at` 之类的额外字段。
 - **配置回执带完整 Ping 定义**：`static.config.global.pings` 是按 type + 规范化 target 聚合后的无 name/type 实际 worker 配置 `{target,interval}`，类型编码进 URI target（如 `tcp://host:80`、`https://host:443`、`icmp://host`），周期取各路最小值；`static.config.reporters[].pings` 保留每路原始 name/type/target/interval。target 用于配置核对，不脱敏；secret、worker_url 及其他线路身份仍不回传。
@@ -256,7 +259,7 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 
 | 环节 | 参数 | 说明 |
 |---|---|---|
-| 采样 | 每 2 秒 | 读 /proc/net/dev 计数器算 delta，只写内存 |
+| 采样 | 每 2 秒 | 读 /proc/net/dev 计数器算 delta，以当时 Agent 时间记 ts，只写内存 |
 | 落盘 | 每 10 分钟 | 内存增量合并写入 JSON，崩溃最多丢 10 分钟 |
 | 保留 | 31 天明细 + 永久归档基数 | 月账期可重算，`reset_day=0` 不会因明细裁剪丢失累计 |
 | 查询 | `sum(period_start ≤ ts ≤ now)` | 月流量现查；`period_start=0` 时再加所选网卡的归档基数 |

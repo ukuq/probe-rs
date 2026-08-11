@@ -146,6 +146,7 @@ interface GpuRecord {
 
 interface DynamicRecord {
   ts: number;
+  accurate_ts?: number | null;
   cpu_usage: number | null;
   mem_used: number | null;
   swap_used: number | null;
@@ -1028,7 +1029,7 @@ function cfBody(r) {
   var g = gatherLatest(r);
   var rep = g.rep, st = g.st, last = g.last, slow = g.slow, gpus = g.gpus, pings = g.pings, dio = g.dio;
   var dyn = g.dyn;
-  var tm = rep.time || {}, clockOffset = tm.offset_ms == null ? 0 : tm.offset_ms;
+  var tm = rep.time || {};
   function pingOf(names) {
     for (var i = 0; i < names.length; i++) {
       var p = pings[names[i]];
@@ -1058,7 +1059,7 @@ function cfBody(r) {
     m.disk = dk;
   }
   set('load_avg', cfLoad(last.load));
-  m.boot_time = st.boot_time ? st.boot_time + clockOffset : 0;
+  m.boot_time = st.boot_time || 0;
   set('net_rx', last.net_rx); set('net_tx', last.net_tx);
   set('net_rx_monthly', last.net_rx_monthly); set('net_tx_monthly', last.net_tx_monthly);
   set('net_in_speed', last.net_rx_speed); set('net_out_speed', last.net_tx_speed);
@@ -1096,7 +1097,7 @@ function cfBody(r) {
       sset('net_rx', d.net_rx); sset('net_tx', d.net_tx);
       sset('net_in_speed', d.net_rx_speed); sset('net_out_speed', d.net_tx_speed);
       sset('net_rx_monthly', d.net_rx_monthly); sset('net_tx_monthly', d.net_tx_monthly);
-      return { ts: d.ts + clockOffset, metrics: sm };
+      return { ts: d.accurate_ts == null ? d.ts : d.accurate_ts, metrics: sm };
     });
   }
   var out = { id: r.server_id, secret: '<API_SECRET>', metrics: m };
@@ -1108,9 +1109,9 @@ function cfBody(r) {
 function komariFrames(r) {
   var g = gatherLatest(r);
   var rep = g.rep, st = g.st, last = g.last, slow = g.slow, gpus = g.gpus;
-  var tm = rep.time || {}, clockOffset = tm.offset_ms == null ? 0 : tm.offset_ms;
+  var tm = rep.time || {};
   var reportNow = tm.accurate_ts == null ? r.received_at : tm.accurate_ts;
-  var reportBoot = st.boot_time ? st.boot_time + clockOffset : 0;
+  var reportBoot = st.boot_time || 0;
   var network = {};
   if (last.net_tx_speed != null) network.up = last.net_tx_speed;
   if (last.net_rx_speed != null) network.down = last.net_rx_speed;
@@ -2163,6 +2164,7 @@ var EXAMPLE_JSON5 = \`{
   "dynamic": [
     {
       "ts": 1754300060000,                  // 采集时刻（ms），非上报时刻
+      "accurate_ts": 1754300059877,         // 可选；采集时保存的校准时间，首次校准前缺席
       "cpu_usage": 12.35,                   // %（0-100）；首轮无前值为 null
       "mem_used": 4294967296,               // 字节，total − MemAvailable
       "swap_used": 134217728,               // 字节

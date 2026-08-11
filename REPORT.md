@@ -74,6 +74,7 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
   "dynamic": [
     {
       "ts": 1754300060000,
+      "accurate_ts": 1754300059877,
       "cpu_usage": 12.35,
       "mem_used": 4294967296,
       "swap_used": 134217728,
@@ -127,13 +128,13 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
 | `round_trip_ms` | number \| null | 最近一次成功校准请求的往返耗时；误差量级约为其一半 |
 | `sample_age_ms` | number \| null | 最近校准样本到本次组包的单调时钟年龄 |
 
-Agent 不修改系统时间。全部 Reporter 共享一个 Agent 级校准器；任一路上报都能触发每 10 分钟一次的后台刷新，并行查询 `time.cloudflare.com`、`time.google.com`、`time.nist.gov`、`ntp.aliyun.com`，按成功样本的偏差中位数选源。NTP 样本最长使用 24 小时；UDP/123 被阻断或全部 NTP 查询失败时，才回退到原生服务端 `server_time`，并通过 `source` 明示。校准成功后，准确时间锚定在单调时钟上继续推进，因此本机墙钟随后发生跳变时，下一次上报的 `offset_ms` 会立即反映出来。CF 出站的 `timestamp`、`boot_time` 与 `samples[].ts` 使用相同偏差换算；Komari 协议没有墙钟时间戳，其 `uptime` 用纠正后的当前时间与同偏差纠正后的启动时间计算。公共 NTP 是未认证 UDP，多源中位数能排除单个异常源，但不能抵御控制本机网络的攻击者。
+Agent 不修改系统时间。Agent 启动后会立即运行一次独立的 NTP 校准任务，此后每 10 分钟刷新，不依赖任何 Reporter 的上报周期；全部 Reporter 共享校准结果。每轮并行查询 `time.cloudflare.com`、`time.google.com`、`time.nist.gov`、`ntp.aliyun.com`，每个域名会并发尝试 DNS 返回的全部 IPv4/IPv6 地址，再按成功服务器样本的偏差中位数选源。NTP 样本最长使用 24 小时；UDP/123 被阻断或全部 NTP 查询失败时，才回退到原生服务端 `server_time`，并通过 `source` 明示。校准成功后，准确时间锚定在单调时钟上继续推进，因此本机墙钟随后发生跳变时，下一次上报的 `offset_ms` 会立即反映出来。CF 的 `timestamp` 使用组包时准确时间；`boot_time` 在 static 缓存生成时校准，`samples[].ts` 使用各 dynamic 记录采集时保存的 `accurate_ts`，重试不会用当前偏差移动旧记录。Komari 的 `uptime` 使用准确当前时间与缓存生成时已校准的启动时间。公共 NTP 是未认证 UDP，多源中位数能排除单个异常源，但不能抵御控制本机网络的攻击者。
 
 ## static 字段
 
 | 字段 | 类型 | 单位 | 来源 | 说明 |
 |---|---|---|---|---|
-| `ts` | number | 毫秒时间戳 | — | static 信息采集时刻 |
+| `ts` | number | 毫秒时间戳 | — | static 信息采集时刻；缓存生成时按当时校准结果换算 |
 | `os` | string | — | /etc/os-release PRETTY_NAME | |
 | `kernel` | string | — | uname -r | |
 | `arch` | string | — | 运行时 | x86_64 / aarch64 等 |
@@ -146,7 +147,7 @@ Agent 不修改系统时间。全部 Reporter 共享一个 Agent 级校准器；
 | `disks` | array | — | statfs / sysinfo | 当前 Reporter 选中的逐卷 `{id,name,mount_point,file_system,total,used}`；`disk_total` 为其 total 合计 |
 | `gpu_name` | string \| null | — | nvidia-smi 等 | 无 GPU 为 null |
 | `virtualization` | string \| null | — | systemd-detect-virt 等 | 物理机为 null |
-| `boot_time` | number | 毫秒时间戳 | /proc/stat btime | |
+| `boot_time` | number | 毫秒时间戳 | /proc/stat btime | static 缓存生成时按当时校准结果换算，之后重试不重新移动 |
 | `ipv4` | string \| null | — | cloudflare trace (tcp4) | 查询失败保留旧值 |
 | `ipv6` | string \| null | — | cloudflare trace (tcp6) | 无 v6 出口为 null |
 | `agent_version` | string | — | 编译注入 | 原生为版本号；CF 出站格式为 `<版本>_probe-rs` |
@@ -177,6 +178,7 @@ Agent 不修改系统时间。全部 Reporter 共享一个 Agent 级校准器；
 | 字段 | 类型 | 单位 | 来源 | 说明 |
 |---|---|---|---|---|
 | `ts` | number | 毫秒时间戳 | — | **采集时刻**，非上报时刻 |
+| `accurate_ts` | number（可选） | 毫秒时间戳 | Agent 时钟 | 该记录采集时保存的校准时间；首次校准前缺席；CF sample 与月流量账期优先使用此值 |
 | `cpu_usage` | number \| null | % (0-100) | /proc/stat 差值 | 首轮无前值时为 null |
 | `mem_used` | number \| null | 字节 | /proc/meminfo | total − MemAvailable |
 | `swap_used` | number \| null | 字节 | /proc/meminfo | |

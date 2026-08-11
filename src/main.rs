@@ -92,6 +92,7 @@ async fn main() -> Result<()> {
     let net = netstatic::NetStatic::load_with_legacy_reporter(&net_static_path, legacy_cf_reporter);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (update_check_tx, update_check_rx) = watch::channel(0_u64);
+    let _ntp_refresh_handle = agent_clock.spawn_ntp_refresh(shutdown_rx.clone());
 
     updater::spawn(
         shared.subscribe_config(),
@@ -104,6 +105,7 @@ async fn main() -> Result<()> {
     // filters and corrections are applied only when a payload is built.
     {
         let net = net.clone();
+        let clock = Arc::clone(&agent_clock);
         let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(net.sample_interval());
@@ -111,7 +113,9 @@ async fn main() -> Result<()> {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        net.sample(&all);
+                        let report_time = clock.report_time();
+                        let sample_time = report_time.accurate_ts.unwrap_or(report_time.local_ts);
+                        net.sample(&all, sample_time);
                         net.flush_if_due();
                     }
                     changed = shutdown_rx.changed() => {
@@ -233,6 +237,7 @@ async fn main() -> Result<()> {
 
     let collector = scheduler::Scheduler::new(
         Arc::clone(&buffers),
+        Arc::clone(&agent_clock),
         intervals_rx,
         ping_rx.clone(),
         gpu_rx.clone(),
