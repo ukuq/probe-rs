@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if install_cli::run_if_requested()? {
+    if install_cli::run_if_requested().await? {
         return Ok(());
     }
 
@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
                     _ = ticker.tick() => {
                         let report_time = clock.report_time();
                         let sample_time = report_time.accurate_ts.unwrap_or(report_time.local_ts);
-                        net.sample(&all, sample_time);
+                        net.sample(&all, sample_time, report_time.accurate_ts.is_some());
                         net.flush_if_due();
                     }
                     changed = shutdown_rx.changed() => {

@@ -34,6 +34,14 @@ struct ArchivedTotal {
     tx: u64,
 }
 
+/// Most recent sampler clock observation. Persisting the domain lets
+/// standalone maintenance commands use the same billing clock as the agent.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct LedgerTime {
+    ts: i64,
+    calibrated: bool,
+}
+
 /// 流量校正（CF 协议）：覆盖语义——当月累计 = 原始累计 + offset。
 /// 账期翻页（period_start 不匹配）自动失效；confirm_pending 控制确认回传
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -52,6 +60,8 @@ pub struct Correction {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct StoreFile {
     interfaces: BTreeMap<String, VecDeque<Entry>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ledger_time: Option<LedgerTime>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     archived_totals: BTreeMap<String, ArchivedTotal>,
     #[serde(default)]
@@ -59,6 +69,27 @@ struct StoreFile {
     /// Compatibility with the pre-multi-reporter on-disk format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     correction: Option<Correction>,
+}
+
+fn sort_entries(entries: &mut VecDeque<Entry>) -> bool {
+    if entries
+        .iter()
+        .zip(entries.iter().skip(1))
+        .all(|(left, right)| left.ts <= right.ts)
+    {
+        return false;
+    }
+    entries.make_contiguous().sort_by_key(|entry| entry.ts);
+    true
+}
+
+fn insert_entry(entries: &mut VecDeque<Entry>, entry: Entry) {
+    if entries.back().is_none_or(|last| last.ts <= entry.ts) {
+        entries.push_back(entry);
+        return;
+    }
+    let index = entries.partition_point(|existing| existing.ts <= entry.ts);
+    entries.insert(index, entry);
 }
 
 fn archive_before(store: &mut StoreFile, interface: &str, cutoff: i64) -> bool {
@@ -116,7 +147,6 @@ impl NetStatic {
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
-        let cutoff = crate::model::now_millis() - RETAIN.num_milliseconds();
         let mut store = store;
         let mut migrated = if let Some(reporter_id) = legacy_reporter_id {
             if let Some(legacy) = store.correction.take() {
@@ -131,9 +161,12 @@ impl NetStatic {
         } else {
             false
         };
-        let interfaces: Vec<_> = store.interfaces.keys().cloned().collect();
-        for interface in interfaces {
-            migrated |= archive_before(&mut store, &interface, cutoff);
+        // A previous process may have switched from a skewed local wall clock
+        // to calibrated time. Normalize old ledgers before query_batch relies
+        // on timestamp ordering. Retention is intentionally deferred until a
+        // calibrated timestamp is supplied by the running sampler.
+        for entries in store.interfaces.values_mut() {
+            migrated |= sort_entries(entries);
         }
         Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -147,10 +180,21 @@ impl NetStatic {
     }
 
     /// 读一次 /proc/net/dev，按网卡算 delta 并追加（由 sampler 每 2s 调用）
-    pub fn sample(&self, filter: &IfaceFilter, now: i64) {
+    pub fn sample(&self, filter: &IfaceFilter, now: i64, calibrated: bool) {
         let current = read_per_iface(filter);
-        let cutoff = now - RETAIN.num_milliseconds();
         let mut inner = self.inner.lock().expect("netstatic lock poisoned");
+        if calibrated
+            && inner
+                .store
+                .ledger_time
+                .is_none_or(|previous| previous.ts != now || !previous.calibrated)
+        {
+            inner.store.ledger_time = Some(LedgerTime {
+                ts: now,
+                calibrated: true,
+            });
+            inner.dirty = true;
+        }
         for (name, counters) in current {
             let (rx_delta, tx_delta) = match inner.last_counters.insert(name.clone(), counters) {
                 Some(prev) => (
@@ -162,19 +206,42 @@ impl NetStatic {
             if rx_delta == 0 && tx_delta == 0 {
                 continue;
             }
-            inner
-                .store
-                .interfaces
-                .entry(name.clone())
-                .or_default()
-                .push_back(Entry {
+            insert_entry(
+                inner.store.interfaces.entry(name.clone()).or_default(),
+                Entry {
                     ts: now,
                     rx: rx_delta,
                     tx: tx_delta,
-                });
-            archive_before(&mut inner.store, &name, cutoff);
+                },
+            );
             inner.dirty = true;
         }
+        drop(inner);
+        if calibrated {
+            self.prune(now);
+        }
+    }
+
+    fn prune(&self, now: i64) {
+        let cutoff = now - RETAIN.num_milliseconds();
+        let mut inner = self.inner.lock().expect("netstatic lock poisoned");
+        let interfaces: Vec<_> = inner.store.interfaces.keys().cloned().collect();
+        let mut archived = false;
+        for interface in interfaces {
+            archived |= archive_before(&mut inner.store, &interface, cutoff);
+        }
+        inner.dirty |= archived;
+    }
+
+    /// Latest persisted timestamp known to be in the calibrated ledger domain.
+    pub fn calibrated_time(&self) -> Option<i64> {
+        self.inner
+            .lock()
+            .expect("netstatic lock poisoned")
+            .store
+            .ledger_time
+            .filter(|time| time.calibrated)
+            .map(|time| time.ts)
     }
 
     /// 查询 [start_ms, now_ms] 窗口内白名单网卡的 (rx, tx) 合计（原始值，不含校正）
@@ -571,9 +638,19 @@ mod tests {
         let all = IfaceFilter::new(&[]);
         let eth0 = IfaceFilter::new(&["eth0".into()]);
         let month_start = now - RETAIN.num_milliseconds();
+        {
+            let inner = ns.inner.lock().unwrap();
+            assert_eq!(inner.store.interfaces["eth0"].len(), 2);
+            assert!(inner.store.archived_totals.is_empty());
+        }
         assert_eq!(ns.query(&all, 0, now), (111, 222));
         assert_eq!(ns.query(&eth0, 0, now), (11, 22));
         assert_eq!(ns.query(&all, month_start, now), (1, 2));
+
+        // Loading cannot know whether the persisted ledger used local or
+        // calibrated timestamps. Only an explicit calibrated observation may
+        // advance retention.
+        ns.prune(now);
 
         let snapshots = ns.query_batch("cf", &all, &[(0, old - 1), (0, now), (month_start, now)]);
         assert_eq!((snapshots[0].total.rx, snapshots[0].total.tx), (0, 0));
@@ -663,6 +740,81 @@ mod tests {
         assert_eq!((corrected[0].total.rx, corrected[0].total.tx), (111, 310));
         assert_eq!(corrected[0].interfaces["eth0"].rx, 3);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn load_sorts_entries_after_a_clock_domain_reversal() {
+        let (_, path) = tmp_ns("clock-reversal");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let store = StoreFile {
+            interfaces: BTreeMap::from([(
+                "eth0".into(),
+                [
+                    Entry {
+                        ts: 300,
+                        rx: 30,
+                        tx: 300,
+                    },
+                    Entry {
+                        ts: 100,
+                        rx: 1,
+                        tx: 10,
+                    },
+                    Entry {
+                        ts: 200,
+                        rx: 2,
+                        tx: 20,
+                    },
+                ]
+                .into(),
+            )]),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+
+        let ns = NetStatic::load(&path);
+        let snapshots = ns.query_batch("cf", &IfaceFilter::new(&[]), &[(0, 150), (0, 250)]);
+        assert_eq!((snapshots[0].total.rx, snapshots[0].total.tx), (1, 10));
+        assert_eq!((snapshots[1].total.rx, snapshots[1].total.tx), (3, 30));
+        let inner = ns.inner.lock().unwrap();
+        assert_eq!(
+            inner.store.interfaces["eth0"]
+                .iter()
+                .map(|entry| entry.ts)
+                .collect::<Vec<_>>(),
+            vec![100, 200, 300]
+        );
+        drop(inner);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn insertion_keeps_calibrated_entries_ordered_after_future_local_entries() {
+        let mut entries = VecDeque::from([Entry {
+            ts: 300,
+            rx: 30,
+            tx: 300,
+        }]);
+        insert_entry(
+            &mut entries,
+            Entry {
+                ts: 100,
+                rx: 1,
+                tx: 10,
+            },
+        );
+        insert_entry(
+            &mut entries,
+            Entry {
+                ts: 200,
+                rx: 2,
+                tx: 20,
+            },
+        );
+        assert_eq!(
+            entries.iter().map(|entry| entry.ts).collect::<Vec<_>>(),
+            vec![100, 200, 300]
+        );
     }
 
     #[test]

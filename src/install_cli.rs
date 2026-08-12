@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use chrono::Local;
+use chrono::{Local, TimeZone};
 
 use crate::collector::net::IfaceFilter;
 use crate::config::{self, AutoUpdateConfig, LocalConfig, UpdateChannel};
@@ -16,7 +16,7 @@ use crate::netstatic::{self, NetStatic};
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-pub fn run_if_requested() -> Result<bool> {
+pub async fn run_if_requested() -> Result<bool> {
     let mut args = std::env::args().skip(1);
     let Some(command) = args.next() else {
         return Ok(false);
@@ -28,7 +28,7 @@ pub fn run_if_requested() -> Result<bool> {
             Ok(true)
         }
         "set-traffic-correction" => {
-            set_traffic_correction(parse_correction_args(args)?)?;
+            set_traffic_correction(parse_correction_args(args)?).await?;
             Ok(true)
         }
         _ => Ok(false),
@@ -328,7 +328,16 @@ fn parse_correction_args(args: impl Iterator<Item = String>) -> Result<Correctio
     })
 }
 
-fn set_traffic_correction(options: CorrectionOptions) -> Result<()> {
+async fn set_traffic_correction(options: CorrectionOptions) -> Result<()> {
+    let clock = crate::reporter::AgentClock::default();
+    clock.refresh_ntp().await;
+    set_traffic_correction_with_clock(options, clock.report_time().accurate_ts)
+}
+
+fn set_traffic_correction_with_clock(
+    options: CorrectionOptions,
+    calibrated_now: Option<i64>,
+) -> Result<()> {
     let config = config::load(&options.config_path)?;
     let reporter = config
         .reporter(&options.reporter_id)
@@ -339,8 +348,14 @@ fn set_traffic_correction(options: CorrectionOptions) -> Result<()> {
     let ledger_path = PathBuf::from(&config.net_static_path);
     let ledger = NetStatic::load_with_legacy_reporter(&ledger_path, Some(&options.reporter_id));
     let filter = IfaceFilter::new(&reporter.interfaces);
-    let now = crate::model::now_millis();
-    let period_start = netstatic::period_start_ms(reporter.reset_day, Local::now());
+    let now = calibrated_now.or_else(|| ledger.calibrated_time()).with_context(|| {
+        "cannot determine calibrated time for traffic correction; retry with NTP available or after the agent has persisted a calibrated sample"
+    })?;
+    let at = Local
+        .timestamp_millis_opt(now)
+        .single()
+        .context("calibrated traffic correction time is outside the local date range")?;
+    let period_start = netstatic::period_start_ms(reporter.reset_day, at);
     let raw = ledger.query(&filter, period_start, now);
     let current = ledger
         .query_batch(&options.reporter_id, &filter, &[(period_start, now)])
@@ -538,45 +553,96 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         configure_cf(options(&path)).unwrap();
-        set_traffic_correction(CorrectionOptions {
-            config_path: path.clone(),
-            reporter_id: "cf".into(),
-            rx_gib: Some(3.0),
-            tx_gib: Some(4.0),
-        })
+        let now = crate::model::now_millis();
+        set_traffic_correction_with_clock(
+            CorrectionOptions {
+                config_path: path.clone(),
+                reporter_id: "cf".into(),
+                rx_gib: Some(3.0),
+                tx_gib: Some(4.0),
+            },
+            Some(now),
+        )
         .unwrap();
         let config = config::load(&path).unwrap();
         let ledger = NetStatic::load(Path::new(&config.net_static_path));
         assert_eq!(ledger.confirm_pending("cf"), None);
         let reporter = config.reporter("cf").unwrap();
-        let period = netstatic::period_start_ms(reporter.reset_day, Local::now());
+        let at = Local.timestamp_millis_opt(now).single().unwrap();
+        let period = netstatic::period_start_ms(reporter.reset_day, at);
+        assert_eq!(
+            ledger.query_monthly("cf", &IfaceFilter::new(&[]), period, now),
+            (3 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024)
+        );
+
+        set_traffic_correction_with_clock(
+            CorrectionOptions {
+                config_path: path,
+                reporter_id: "cf".into(),
+                rx_gib: Some(5.0),
+                tx_gib: None,
+            },
+            Some(now),
+        )
+        .unwrap();
+        let reloaded = NetStatic::load(Path::new(&config.net_static_path));
+        assert_eq!(reloaded.confirm_pending("cf"), None);
+        assert_eq!(
+            reloaded.query_monthly("cf", &IfaceFilter::new(&[]), period, now),
+            (5 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn local_correction_uses_the_calibrated_billing_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        configure_cf(options(&path)).unwrap();
+        let calibrated = Local
+            .with_ymd_and_hms(2026, 7, 19, 23, 59, 59)
+            .single()
+            .unwrap();
+        set_traffic_correction_with_clock(
+            CorrectionOptions {
+                config_path: path.clone(),
+                reporter_id: "cf".into(),
+                rx_gib: Some(3.0),
+                tx_gib: Some(4.0),
+            },
+            Some(calibrated.timestamp_millis()),
+        )
+        .unwrap();
+
+        let config = config::load(&path).unwrap();
+        let reporter = config.reporter("cf").unwrap();
+        let ledger = NetStatic::load(Path::new(&config.net_static_path));
+        let period = netstatic::period_start_ms(reporter.reset_day, calibrated);
         assert_eq!(
             ledger.query_monthly(
                 "cf",
                 &IfaceFilter::new(&[]),
                 period,
-                crate::model::now_millis()
+                calibrated.timestamp_millis(),
             ),
             (3 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024)
         );
 
-        set_traffic_correction(CorrectionOptions {
-            config_path: path,
-            reporter_id: "cf".into(),
-            rx_gib: Some(5.0),
-            tx_gib: None,
-        })
-        .unwrap();
-        let reloaded = NetStatic::load(Path::new(&config.net_static_path));
-        assert_eq!(reloaded.confirm_pending("cf"), None);
+        let other_period = netstatic::period_start_ms(
+            reporter.reset_day,
+            Local
+                .with_ymd_and_hms(2026, 7, 20, 0, 0, 1)
+                .single()
+                .unwrap(),
+        );
+        assert_ne!(period, other_period);
         assert_eq!(
-            reloaded.query_monthly(
+            ledger.query_monthly(
                 "cf",
                 &IfaceFilter::new(&[]),
-                period,
-                crate::model::now_millis()
+                other_period,
+                calibrated.timestamp_millis(),
             ),
-            (5 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024)
+            (0, 0)
         );
     }
 }

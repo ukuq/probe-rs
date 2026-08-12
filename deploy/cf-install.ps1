@@ -68,7 +68,7 @@ param(
     [string]$NoStart = "0",
 
     [Alias("install_version", "install-version")]
-    [string]$InstallVersion = "v0.1.3-beta.5",
+    [string]$InstallVersion = "v0.1.3-beta.6",
 
     [Alias("install_ghproxy", "install-ghproxy")]
     [string]$InstallGhProxy,

@@ -142,6 +142,19 @@ impl AgentClock {
                     .server
                     .as_ref()
                     .filter(|sample| sample.anchor.elapsed() <= MAX_CALIBRATION_AGE)
+            })
+            // Once calibrated, stay in the monotonic calibrated domain even
+            // if refreshes are temporarily unavailable. Falling back to a
+            // user-adjusted wall clock would make timestamps jump domains.
+            .or_else(|| match (clock.ntp.as_ref(), clock.server.as_ref()) {
+                (Some(ntp), Some(server)) => Some(if ntp.anchor >= server.anchor {
+                    ntp
+                } else {
+                    server
+                }),
+                (Some(ntp), None) => Some(ntp),
+                (None, Some(server)) => Some(server),
+                (None, None) => None,
             });
         match calibration {
             Some(calibration) => calibration.snapshot(local_ts, calibration.anchor.elapsed()),
@@ -194,13 +207,19 @@ impl AgentClock {
             .ntp = Some(calibration);
     }
 
-    async fn refresh_ntp(&self) {
+    pub async fn refresh_ntp(&self) -> bool {
         match query_ntp_servers().await {
-            Ok(sample) => self.update_ntp_clock(sample),
-            Err(error) => tracing::debug!(
-                %error,
-                "NTP calibration unavailable; native server time remains the fallback"
-            ),
+            Ok(sample) => {
+                self.update_ntp_clock(sample);
+                true
+            }
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "NTP calibration unavailable; native server time remains the fallback"
+                );
+                false
+            }
         }
     }
 
@@ -219,7 +238,7 @@ impl AgentClock {
                     return;
                 }
                 tokio::select! {
-                    _ = ticker.tick() => clock.refresh_ntp().await,
+                    _ = ticker.tick() => { clock.refresh_ntp().await; }
                     changed = shutdown_rx.changed() => {
                         if changed.is_err() || *shutdown_rx.borrow() {
                             return;
@@ -610,6 +629,35 @@ mod tests {
         assert_eq!(snapshot.source.as_deref(), Some("server"));
         assert_eq!(snapshot.round_trip_ms, Some(80));
         assert_eq!(snapshot.sample_age_ms, Some(20));
+    }
+
+    #[test]
+    fn calibrated_time_does_not_follow_local_wall_clock_jumps() {
+        let calibration = ClockCalibration::from_server_time(
+            1_000_000,
+            Duration::from_millis(80),
+            Instant::now(),
+        );
+        let age = Duration::from_secs(5);
+        let before_jump = calibration.snapshot(900_000, age);
+        let after_jump = calibration.snapshot(9_000_000, age);
+        assert_eq!(before_jump.accurate_ts, after_jump.accurate_ts);
+        assert_ne!(before_jump.offset_ms, after_jump.offset_ms);
+    }
+
+    #[test]
+    fn stale_calibration_does_not_fall_back_to_local_time() {
+        let clock = super::AgentClock::default();
+        clock.state.lock().unwrap().ntp = Some(ClockCalibration {
+            source: "ntp:test".into(),
+            anchor: Instant::now() - super::MAX_CALIBRATION_AGE - Duration::from_secs(1),
+            accurate_at_anchor: 1_000_000,
+            round_trip_ms: 1,
+        });
+        let snapshot = clock.report_time();
+        assert!(snapshot.accurate_ts.is_some());
+        assert_eq!(snapshot.source.as_deref(), Some("ntp:test"));
+        assert!(snapshot.sample_age_ms.unwrap() > super::MAX_CALIBRATION_AGE.as_millis() as u64);
     }
 
     #[test]
