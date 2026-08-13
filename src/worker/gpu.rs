@@ -9,12 +9,30 @@
 use std::time::Duration;
 
 use tokio::sync::watch;
-use tokio::time::interval;
 
 use std::sync::Arc;
 
 use crate::buffer::Buffers;
 use crate::model::{GpuRecord, Intervals};
+use crate::worker::ticker;
+
+/// GPU 外部命令统一超时:驱动故障时 nvidia-smi/ioreg 可长期挂起,
+/// 无超时会让 worker ticker 永久卡死(GPU 数据 ts 停滞且无自愈)。
+const GPU_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 带超时执行外部采集命令;超时经 kill_on_drop 终止子进程。
+async fn run_gpu_command(
+    command: &mut tokio::process::Command,
+) -> anyhow::Result<std::process::Output> {
+    match tokio::time::timeout(GPU_COMMAND_TIMEOUT, command.kill_on_drop(true).output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => anyhow::bail!(
+            "GPU 外部命令超时({} 秒),已终止子进程",
+            GPU_COMMAND_TIMEOUT.as_secs()
+        ),
+    }
+}
 
 /// 一卡一条的采样结果；mem/temp 仅 nvidia 路径有，macOS 为 None
 #[derive(Debug, Clone)]
@@ -28,25 +46,35 @@ pub struct GpuSample {
 }
 
 /// 启动 GPU 采集任务。channel 由调用方持有：任务可随 enable_gpu 热切换
-/// 启停重建，scheduler 侧的 rx 不受影响
+/// 启停重建，scheduler 侧的 rx 不受影响。返回 AbortHandle 供显式中止;
+/// 任务 panic 会经内部监督任务产生可观察错误。
 pub fn start(
     name_tx: watch::Sender<Option<String>>,
     gpu_tx: watch::Sender<Vec<GpuRecord>>,
     buffers: Arc<Buffers>,
     mut intervals_rx: watch::Receiver<Intervals>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(intervals_rx.borrow().gpu.max(1)));
+) -> tokio::task::AbortHandle {
+    let handle = tokio::spawn(async move {
+        let mut ticker = ticker(Duration::from_secs(intervals_rx.borrow().gpu.max(1)));
         loop {
             tokio::select! {
                 _ = ticker.tick() => run_once(&name_tx, &gpu_tx, &buffers).await,
                 r = intervals_rx.changed() => {
                     if r.is_err() { return; }
-                    ticker = interval(Duration::from_secs(intervals_rx.borrow().gpu.max(1)));
+                    ticker = crate::worker::ticker(Duration::from_secs(intervals_rx.borrow().gpu.max(1)));
                 }
             }
         }
-    })
+    });
+    let abort = handle.abort_handle();
+    tokio::spawn(async move {
+        match handle.await {
+            Ok(()) => tracing::debug!("gpu worker 正常退出"),
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => tracing::error!(error = %error, "gpu worker 异常退出(panic)"),
+        }
+    });
+    abort
 }
 
 async fn run_once(
@@ -100,13 +128,11 @@ async fn query_gpu() -> anyhow::Result<Vec<GpuSample>> {
 /// Linux/Windows：nvidia-smi（利用率 + 显存 + 温度，显存 MiB → 字节）
 #[cfg(not(target_os = "macos"))]
 async fn query_nvidia_smi() -> anyhow::Result<Vec<GpuSample>> {
-    let output = tokio::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=index,name,utilization.gpu,memory.total,memory.used,temperature.gpu",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .await?;
+    let output = run_gpu_command(tokio::process::Command::new("nvidia-smi").args([
+        "--query-gpu=index,name,utilization.gpu,memory.total,memory.used,temperature.gpu",
+        "--format=csv,noheader,nounits",
+    ]))
+    .await?;
     if !output.status.success() {
         anyhow::bail!("nvidia-smi exit {}", output.status);
     }
@@ -193,10 +219,9 @@ fn fallback_gpu_id(name: &str, occurrence: usize) -> String {
 
 #[cfg(target_os = "macos")]
 async fn gpu_names_macos() -> Vec<String> {
-    let Ok(output) = tokio::process::Command::new("system_profiler")
-        .arg("SPDisplaysDataType")
-        .output()
-        .await
+    let Ok(output) =
+        run_gpu_command(tokio::process::Command::new("system_profiler").arg("SPDisplaysDataType"))
+            .await
     else {
         return vec![];
     };
@@ -212,10 +237,16 @@ async fn gpu_names_macos() -> Vec<String> {
 
 #[cfg(target_os = "macos")]
 async fn gpu_usages_macos() -> anyhow::Result<Vec<f64>> {
-    let output = tokio::process::Command::new("ioreg")
-        .args(["-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"])
-        .output()
-        .await?;
+    let output = run_gpu_command(tokio::process::Command::new("ioreg").args([
+        "-r",
+        "-d",
+        "1",
+        "-w",
+        "0",
+        "-c",
+        "IOAccelerator",
+    ]))
+    .await?;
     let text = String::from_utf8_lossy(&output.stdout);
     let mut usages = parse_ioreg_numbers(&text, "Device Utilization %");
     if usages.is_empty() {

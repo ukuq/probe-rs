@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
-use tokio::time::{interval, interval_at};
 
 use crate::buffer::Buffers;
 use crate::collector::{self, DiskIoCounters};
 use crate::model::{DiskIoRecord, Intervals};
+use crate::worker::{ticker, ticker_at};
 
 pub fn spawn(
     mut intervals_rx: watch::Receiver<Intervals>,
@@ -24,7 +24,7 @@ pub fn spawn(
     let (tx, rx) = watch::channel::<Option<DiskIoRecord>>(None);
     let handle = tokio::spawn(async move {
         let mut prev: Option<(DiskIoCounters, i64)> = None;
-        let mut ticker = interval(Duration::from_secs(intervals_rx.borrow().diskio.max(1)));
+        let mut ticker = ticker(Duration::from_secs(intervals_rx.borrow().diskio.max(1)));
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -55,7 +55,7 @@ pub fn spawn(
                     // interval_at：从下一个完整周期开始，避免重建后的立即 tick
                     // 产生毫秒级差值（diff 另有 <200ms 守卫兜底）
                     let d = Duration::from_secs(intervals_rx.borrow().diskio.max(1));
-                    ticker = interval_at(tokio::time::Instant::now() + d, d);
+                    ticker = ticker_at(tokio::time::Instant::now() + d, d);
                 }
             }
         }

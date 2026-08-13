@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
+use crate::worker::ticker;
 use anyhow::{bail, Result};
 use tokio::sync::watch;
-use tokio::time::interval;
 
 use std::sync::Arc as StdArc;
 
@@ -28,7 +28,7 @@ pub type PingSnapshot = HashMap<String, PingRecord>;
 
 /// ping worker：每组一个 task，可整体中止（配置热加载时重建）
 pub struct PingWorker {
-    handles: Vec<tokio::task::JoinHandle<()>>,
+    aborts: Vec<tokio::task::AbortHandle>,
 }
 
 impl PingWorker {
@@ -39,23 +39,32 @@ impl PingWorker {
         buffers: StdArc<Buffers>,
         intervals_rx: watch::Receiver<Intervals>,
     ) -> Self {
-        let handles = targets
-            .into_iter()
-            .map(|t| {
-                tokio::spawn(target_loop(
-                    t,
-                    tx.clone(),
-                    buffers.clone(),
-                    intervals_rx.clone(),
-                ))
-            })
-            .collect();
-        Self { handles }
+        let mut aborts = Vec::with_capacity(targets.len());
+        for t in targets {
+            let handle = tokio::spawn(target_loop(
+                t,
+                tx.clone(),
+                buffers.clone(),
+                intervals_rx.clone(),
+            ));
+            aborts.push(handle.abort_handle());
+            // 监督:panic 必须产生可观察错误;stop() 的显式 abort 不告警。
+            tokio::spawn(async move {
+                match handle.await {
+                    Ok(()) => tracing::debug!("ping 探测任务正常退出"),
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => {
+                        tracing::error!(error = %error, "ping 探测任务异常退出(panic)");
+                    }
+                }
+            });
+        }
+        Self { aborts }
     }
 
     pub fn stop(self) {
-        for h in self.handles {
-            h.abort();
+        for abort in self.aborts {
+            abort.abort();
         }
     }
 }
@@ -69,7 +78,7 @@ async fn target_loop(
 ) {
     let kind = target.kind;
     let effective = |i: &Intervals| target.interval.unwrap_or(i.ping).max(1);
-    let mut ticker = interval(Duration::from_secs(effective(&intervals_rx.borrow())));
+    let mut ticker = ticker(Duration::from_secs(effective(&intervals_rx.borrow())));
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -91,7 +100,7 @@ async fn target_loop(
             r = intervals_rx.changed() => {
                 if r.is_err() { return; }
                 if target.interval.is_none() {
-                    ticker = interval(Duration::from_secs(effective(&intervals_rx.borrow())));
+                    ticker = crate::worker::ticker(Duration::from_secs(effective(&intervals_rx.borrow())));
                 }
             }
         }

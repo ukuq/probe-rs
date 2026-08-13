@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
-use tokio::time::interval;
+
+use crate::worker::ticker;
 
 use crate::buffer::Buffers;
 use crate::collector::{self, SelfMonitor};
@@ -29,7 +30,7 @@ pub fn spawn(
     let (self_tx, self_rx) = watch::channel::<Option<SelfRecord>>(None);
     let handle = tokio::spawn(async move {
         let mut self_monitor = SelfMonitor::new();
-        let mut ticker = interval(Duration::from_secs(intervals_rx.borrow().slow.max(1)));
+        let mut ticker = ticker(Duration::from_secs(intervals_rx.borrow().slow.max(1)));
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -81,7 +82,7 @@ pub fn spawn(
                 }
                 r = intervals_rx.changed() => {
                     if r.is_err() { return; }
-                    ticker = interval(Duration::from_secs(intervals_rx.borrow().slow.max(1)));
+                    ticker = crate::worker::ticker(Duration::from_secs(intervals_rx.borrow().slow.max(1)));
                 }
             }
         }

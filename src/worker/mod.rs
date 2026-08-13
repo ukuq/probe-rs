@@ -13,3 +13,21 @@ pub mod komari;
 pub mod ping;
 pub mod public_ip;
 pub mod slow;
+
+/// 统一周期 ticker:所有采集 worker 一律 Skip 错过的 tick(与 scheduler 一致),
+/// 否则一轮慢采集(如 ping 黑洞 ~51s)会触发 Burst 补跑、负载自激。
+pub(crate) fn ticker(period: std::time::Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker
+}
+
+/// 与 [`ticker`] 相同,但首拍在 `start` 时刻(配置变更后延迟生效用)。
+pub(crate) fn ticker_at(
+    start: tokio::time::Instant,
+    period: std::time::Duration,
+) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval_at(start, period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker
+}

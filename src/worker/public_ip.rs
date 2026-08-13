@@ -8,8 +8,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
+use crate::worker::ticker;
 use tokio::sync::watch;
-use tokio::time::interval;
 
 use std::sync::Arc;
 
@@ -67,7 +67,7 @@ pub fn spawn(
             .timeout(Duration::from_secs(5))
             .pool_max_idle_per_host(0)
             .build();
-        let mut ticker = interval(Duration::from_secs(intervals_rx.borrow().ip.max(1)));
+        let mut ticker = ticker(Duration::from_secs(intervals_rx.borrow().ip.max(1)));
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -80,7 +80,7 @@ pub fn spawn(
                 }
                 r = intervals_rx.changed() => {
                     if r.is_err() { return; }
-                    ticker = interval(Duration::from_secs(intervals_rx.borrow().ip.max(1)));
+                    ticker = crate::worker::ticker(Duration::from_secs(intervals_rx.borrow().ip.max(1)));
                 }
             }
         }
@@ -133,14 +133,18 @@ mod tests {
     fn parses_trace_and_plain_text_bodies() {
         let trace = "fl=123f45\nh=cloudflare.com\nip=203.0.113.7\nts=1786.1\n";
         assert_eq!(parse_ip_body(trace).as_deref(), Some("203.0.113.7"));
-        assert_eq!(parse_ip_body(" 2001:db8::1 \n").as_deref(), Some("2001:db8::1"));
+        assert_eq!(
+            parse_ip_body(" 2001:db8::1 \n").as_deref(),
+            Some("2001:db8::1")
+        );
         assert_eq!(parse_ip_body("192.0.2.9").as_deref(), Some("192.0.2.9"));
         assert_eq!(parse_ip_body("not an ip"), None);
         assert_eq!(parse_ip_body(""), None);
     }
 
     #[test]
-    fn successful_family_refreshes_while_failed_family_keeps_its_timestamp() {        let mut snapshot = IpSnapshot::default();
+    fn successful_family_refreshes_while_failed_family_keeps_its_timestamp() {
+        let mut snapshot = IpSnapshot::default();
         assert!(snapshot.merge(Some(measurement("192.0.2.1", 10)), None));
         assert!(!snapshot.merge(None, None));
         assert_eq!(snapshot.ipv4.as_ref().unwrap().measured_at_ms, 10);
