@@ -128,7 +128,7 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
 | `round_trip_ms` | number \| null | 最近一次成功校准请求的往返耗时；误差量级约为其一半 |
 | `sample_age_ms` | number \| null | 最近校准样本到本次组包的单调时钟年龄 |
 
-Agent 不修改系统时间。Agent 启动后会立即运行一次独立的 NTP 校准任务，此后每 10 分钟刷新，不依赖任何 Reporter 的上报周期；全部 Reporter 共享校准结果。每轮并行查询 `time.cloudflare.com`、`time.google.com`、`time.nist.gov`、`ntp.aliyun.com`，每个域名会并发尝试 DNS 返回的全部 IPv4/IPv6 地址，再按成功服务器样本的偏差中位数选源。NTP 样本最长使用 24 小时；UDP/123 被阻断或全部 NTP 查询失败时，才回退到原生服务端 `server_time`，并通过 `source` 明示。校准成功后，准确时间锚定在单调时钟上继续推进，因此本机墙钟随后发生跳变时，下一次上报的 `offset_ms` 会立即反映出来。CF 的 `timestamp` 使用组包时准确时间；`boot_time` 在 static 缓存生成时校准，`samples[].ts` 使用各 dynamic 记录采集时保存的 `accurate_ts`，重试不会用当前偏差移动旧记录。Komari 的 `uptime` 使用准确当前时间与缓存生成时已校准的启动时间。公共 NTP 是未认证 UDP，多源中位数能排除单个异常源，但不能抵御控制本机网络的攻击者。
+Agent 不修改系统时间。Agent 启动后会立即运行一次独立的 NTP 校准任务，此后每 10 分钟刷新，不依赖任何 Reporter 的上报周期；全部 Reporter 共享校准结果。每轮并行查询 `time.cloudflare.com`、`time.google.com`、`time.nist.gov`、`ntp.aliyun.com`，每个域名会并发尝试 DNS 返回的全部 IPv4/IPv6 地址，再按成功服务器样本的偏差中位数选源。NTP 样本的 **24 小时寿命用于新鲜源选择**：超过 24 小时未刷新的样本不再参与 NTP/server 源优先级比较，但已建立的校准锚点继续沿单调时钟推进（不回退本机墙钟，避免时间域跳变）；UDP/123 被阻断或全部 NTP 查询失败时，才回退到原生服务端 `server_time`，并通过 `source` 明示。校准成功后，准确时间锚定在单调时钟上继续推进，因此本机墙钟随后发生跳变时，下一次上报的 `offset_ms` 会立即反映出来。CF 的 `timestamp` 使用组包时准确时间；`boot_time` 在 static 缓存生成时校准，`samples[].ts` 使用各 dynamic 记录采集时保存的 `accurate_ts`，重试不会用当前偏差移动旧记录。Komari 的 `uptime` 使用准确当前时间与缓存生成时已校准的启动时间。公共 NTP 是未认证 UDP，多源中位数能排除单个异常源，但不能抵御控制本机网络的攻击者。
 
 ## static 字段
 
@@ -147,8 +147,8 @@ Agent 不修改系统时间。Agent 启动后会立即运行一次独立的 NTP 
 | `disks` | array | — | statfs / sysinfo | 当前 Reporter 选中的逐卷 `{id,name,mount_point,file_system,total,used}`；`disk_total` 为其 total 合计 |
 | `gpu_name` | string \| null | — | nvidia-smi 等 | 无 GPU 为 null |
 | `virtualization` | string \| null | — | systemd-detect-virt 等 | 物理机为 null |
-| `boot_time` | number | 毫秒时间戳 | /proc/stat btime | static 缓存生成时按当时校准结果换算，之后重试不重新移动 |
-| `ipv4` | string \| null | — | cloudflare trace (tcp4) | 查询失败保留旧值 |
+| `boot_time` | number \| null | 毫秒时间戳 | /proc/stat btime | static 缓存生成时按当时校准结果换算，之后重试不重新移动；采集失败为 null |
+| `ipv4` | string \| null | — | cloudflare trace (tcp4) | 查询失败保留缓存；测量时间戳超过新鲜度窗口（ip + min(ip, report)）后该字段不输出（置 null），不会永久上报旧 IP |
 | `ipv6` | string \| null | — | cloudflare trace (tcp6) | 无 v6 出口为 null |
 | `agent_version` | string | — | 编译注入 | 原生为版本号；CF 出站格式为 `<版本>_probe-rs` |
 | `config` | object | — | 当前生效配置 | 供服务端展示/核对，字段见下 |
@@ -210,9 +210,9 @@ Ping 聚合规则：机器内部按“类型 + 规范化目标”去重，TCP �
 - 异步记录**仅当对应源的快照 ts 更新时才产生**（同一份异步数据不会重复出现）；worker 失败 = 快照 ts 停滞；
 - 异步数据粒度被 collect 间隔截断：一个 collect 周期内的多次异步更新只保留最新一次；
 - 两个数组 ts 语义各自单一：dynamic 一律 tick 时刻，async 一律各自测量时刻；展示归并（按 kind/字段取最新）是服务端/前端职责；
-- 各数组内按 ts 升序排列；
+- 各数组按采集序（seq）排列、近似 ts 升序；墙钟回拨或异步源交错时可能局部倒挂，服务端按 ts 归并即可；
 - 单项采集失败该字段为 null，不影响其他字段；
-- 上报失败的记录由 agent 保留待重发（有界：每类缓冲 10 条，超限丢最旧——只覆盖短暂抖动，长断网历史不补发），服务端可能收到延迟补发的记录，按 ts 去重/排序即可。
+- 上报失败的记录由 agent 保留待重发（dynamic/async/errors 三类共享一个 512 条的有界日志，按 Reporter 游标非破坏读取、成功才 ACK；超限丢最旧并注入 `source=buffer` 错误事件——只覆盖短暂抖动，长断网历史不补发），服务端可能收到延迟补发的记录，按 ts 去重/排序即可。
 
 ## errors 记录字段（每条 = 一次采集/上报失败）
 
@@ -222,7 +222,7 @@ Ping 聚合规则：机器内部按“类型 + 规范化目标”去重，TCP �
 | `source` | string | 来源：`gpu` / `ip` / `reporter` / `ping:<组名>` |
 | `msg` | string | 错误信息 |
 
-约定：**同源同文去重**（同一来源上一条信息相同则跳过，防止周期性失败刷屏）；缓冲上限 200 条，超限丢最旧；上报失败后与数据一起保留重发。
+约定：**同源同文去重**（同一来源上一条信息相同则跳过，防止周期性失败刷屏）；errors 与 dynamic/async 共用同一 512 条有界日志；上报失败后与数据一起保留重发。
 
 ## 响应（服务端 → agent）
 
@@ -260,9 +260,9 @@ Ping 聚合规则：机器内部按“类型 + 规范化目标”去重，TCP �
 | `intervals` | 当前 Reporter 的六项采集需求（秒，均 >= 1）；应用后重新计算机器级最小周期 |
 | `report_interval` | 当前 Reporter 的上报间隔（秒），>= 1；与全局 collect 无任何关系约束 |
 | `reset_day` | 账期重置日 1-31；0 = 不重置 |
-| `interfaces` | 可选；网卡白名单（glob 数组） |
-| `disks` | 可选；卷/物理盘白名单（glob 数组） |
-| `pings` | 可选；整组替换当前 Reporter 的 Ping 需求；`type` 必须为 http/tcp/icmp，target 不允许 path/query/fragment |
+| `interfaces` | 可选；网卡白名单（glob 数组，最多 32 项，超限整体拒绝） |
+| `disks` | 可选；卷/物理盘白名单（glob 数组，最多 32 项，超限整体拒绝） |
+| `pings` | 可选；整组替换当前 Reporter 的 Ping 需求（最多 64 项，超限整体拒绝）；`type` 必须为 http/tcp/icmp，target 不允许 path/query/fragment |
 | `report_gpu` | 可选；当前 Reporter 是否输出 GPU（布尔），同时参与机器级 GPU worker 的 OR 聚合 |
 | `report_errors` | 可选；是否上报 errors 错误事件（布尔，缺省 true） |
 | `report_self` | 可选；是否上报探针自身资源占用 kind:"self"（布尔，缺省 false） |

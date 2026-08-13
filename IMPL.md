@@ -60,7 +60,7 @@ probe-rs/
 
 ### 3.1 调度（scheduler.rs）
 
-- 用 `tokio::time::interval` 而不是 `sleep` 循环：错过 tick 时 `MissedTickBehavior::Skip`，防止堆积补偿执行。
+- 用 `tokio::time::interval` 而不是 `sleep` 循环：错过 tick 时 `MissedTickBehavior::Skip`，防止堆积补偿执行（scheduler、各采集 worker 与 netstatic 采样任务统一使用 `worker::ticker`/`worker::ticker_at` 工厂）。
 - intervals 仅校验 >= 1 秒；report 与 collect 无任何关系约束，report 时把缓冲全部发出即可。
 - collect tick：`collector::collect_once()` 全程同步文件读取（微秒级），直接 async 里跑，不用 spawn_blocking。
 - 同步采集组装 dynamic 记录：fast 字段（cpu/mem/net/load）+ 各异步源快照按 ts 新鲜度摘取的块（slow/pings/gpu）。
@@ -75,14 +75,15 @@ probe-rs/
 
 ### 3.3 缓冲（buffer.rs）
 
-- `Mutex<Vec<DynamicRecord>>` 等三个，标准库 `Mutex` 即可（临界区极短，无需 tokio::Mutex）。
-- report 时 `std::mem::take` 换出；发送失败 `restore` 放回缓冲头部（保序），每类上限 1000 条，超限丢最旧——断网不丢数据，内存又有界。
+- 共享有界事件日志（`MAX_JOURNAL_RECORDS = 512`，dynamic/async/errors 三类共用一个 journal），每 Reporter 独立 seq 游标：`read()` 非破坏读取游标之后的全部事件，上报成功才 `ack(through)`；日志只裁剪到所有 Reporter 都已确认的位置（min-cursor）。
+- 慢端点不会阻塞采集：日志满时丢最旧事件；丢弃**未确认**事件时按 64 条节流注入一条 `source=buffer` 错误事件并打 warn 日志，长中断不静默。
+- errors 同源同文去重在入队前完成；上报失败无需"restore"，未 ack 的事件自然留在日志里待下轮重发。
 
 ### 3.4 netstatic
 
 - 存储：每网卡 `VecDeque<Entry>` 明细 + `archived_totals` 永久归档基数，Entry = `{ts_ms, rx, tx}`。
 - 采样 task 每 2s：读 /proc/net/dev → 与上一帧 per-iface 计数器算 delta → `current < prev` 记 0（纪律 2）→ append 内存 + 标记 dirty。
-- 修剪：append 时把队首 `ts < now - 31d` 的条目先累加到该网卡归档基数，再从明细弹出。
+- 保留：**32 天**明细 + 永久归档基数（严格大于最长 31 天账期，账期首日明细不会被归档；reset_day 28-31 的月流量不因修剪少计）
 - 落盘：每 10min 全量重写 `net_static.json`（tmp + rename 原子写，spawn_blocking）；启动时加载。
 - 查询：`sum(period_start..=now)` 按白名单网卡过滤求和；`period_start=0` 额外加归档基数，实现真正永久累计。
 - 内存优化（可选二期）：小时粒度合并，见设计书 §5.4。
@@ -124,7 +125,7 @@ probe-rs/
 - `[auto_update] enabled=false` 默认关闭；`stable` 只读取正式 Release，`prerelease` 同时接受预发布版及之后更高的正式版。
 - 仅当远端版本按 SemVer precedence 严格大于编译版本时更新；draft、缺少当前平台资产或缺少 `SHA256SUMS` 的 Release 均跳过。
 - GitHub 仓库、下载路径和平台资产名编译期固定；二进制下载后必须通过 Release 附带的 SHA-256 校验。
-- Linux 原子替换后由 systemd `Restart=always` 拉起；Windows 使用新版 helper 等旧 Agent 退出后重新运行计划任务，托盘 companion 单独替换。
+- Linux 原子替换后由 systemd `Restart=always` 拉起；Windows 使用新版 helper 等旧 Agent 退出后重新运行计划任务（等待超时会安全失败、不会双 Agent 并存），托盘 companion 单独替换、会话内替换需下次登录生效。
 - GitHub/API/下载/校验失败只记日志，不中断采集和上报；检查周期最低 300 秒，默认 6 小时。
 
 ## 4. 实施顺序
@@ -161,7 +162,7 @@ make build   # cargo build --release（strip + lto）
 make demo    # 本地演示服务端（8080）
 ```
 
-CI：`.github/workflows/ci.yml` 对所有 push/PR 在 Linux、Windows 跑 Rust 格式化与测试，并在 Linux 跑 Deno 门禁；`release.yml` 在 push master 时按 Cargo.toml version 发版，产出 Linux x86_64/aarch64 与 Windows x86_64 三个文件（资产完整时跳过）。版本包含 SemVer 预发布后缀（如 `-beta.1`）时发布为 GitHub prerelease，不会替换安装脚本使用的稳定版 `latest`。
+CI：`.github/workflows/ci.yml` 对所有 push/PR 在 Linux、Windows 跑 Rust 格式化与测试，并在 Linux 跑 Deno 门禁；`release.yml` 在 push master 时按 Cargo.toml version 发版，产出 Linux x86_64/aarch64 与 Windows x86_64 三个文件（资产完整时跳过）。版本包含 SemVer 预发布后缀（如 `-beta.1`）时发布为 GitHub prerelease。CF 一键安装脚本（cf-install.sh/cf-install.ps1）默认 pin 当前版本以保持可复现安装，`latest`/`-install-version` 为显式可选项；komari-install.sh 默认走 `latest`。
 
 ## 部署
 

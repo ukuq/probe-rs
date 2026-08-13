@@ -152,7 +152,7 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 - **三段结构**：`static` obj + `dynamic[]`（fast，ts = tick 时刻）+ `async[]`（kind 区分来源，ts = 各自测量时刻）——两个数组的 ts 语义各自单一，异步频率互不迁就。
 - **异步按新鲜度产生**：异步记录仅当对应源快照 ts 更新时才进入 `async[]`（见 §2.3 规则）；worker 失败 = ts 停滞，有记录但值相同 = 没变。
 - **月流量/累计值**：放在 `dynamic` 记录中带当前值（上报时向 netstatic 现查）；netstatic 明细及每条 dynamic 的查询窗口均使用采集时的 Agent 时间，避免本地墙钟跳变跨越 `reset_day` 时错账期。
-- **上报失败有界保留**：失败的记录放回缓冲待下次重发，上限 10 条（只覆盖短暂抖动，长断网历史不补发）。
+- **上报失败有界保留**：失败的记录留在共享事件日志中待下次重发；日志上限 512 条（dynamic/async/errors 三类共享一个 journal），超限丢最旧并注入一条 `source=buffer` 错误事件（只覆盖短暂抖动，长断网历史不补发）。
 - **数据陈旧判断交给服务端**：动态数据有 `ts`，静态数据本来不变，不报 `measured_at` 之类的额外字段。
 - **配置回执带完整 Ping 定义**：`static.config.global.pings` 是按 type + 规范化 target 聚合后的无 name/type 实际 worker 配置 `{target,interval}`，类型编码进 URI target（如 `tcp://host:80`、`https://host:443`、`icmp://host`），周期取各路最小值；`static.config.reporters[].pings` 保留每路原始 name/type/target/interval。target 用于配置核对，不脱敏；secret、worker_url 及其他线路身份仍不回传。
 
@@ -169,7 +169,7 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 |---|---|
 | 方向词汇 | 一律 `rx`（下行/接收）/ `tx`（上行/发送），全文档与代码禁用 in/out、up/down |
 | 探测术语 | 一律 `ping`（worker、intervals.ping、ping[] 数组），禁用 probe 指代该子系统 |
-| 配置 key | snake_case；间隔类收敛到 `intervals.{collect, report, ping, slow, gpu, ip, diskio}` |
+| 配置 key | snake_case；间隔类收敛到 `intervals.{collect, report, ping, slow, gpu, ip, diskio}`（注意两层形态：Reporter 需求为六项 `intervals.{collect,ping,slow,gpu,ip,diskio}` + 独立 `report_interval`；static.config 回执中的 `intervals` 为七项、含 `report`，两者是不同结构） |
 | 使用率字段 | 后缀 `_usage`（`cpu_usage`、gpu 记录的 `usage`），与 `_name`/`_total`/`_used` 后缀风格一致 |
 | 时间字段 | 一律 `ts`（毫秒）；静态开机时间用 `boot_time` |
 | 账期字段 | 后缀 `_monthly` 表示账期累计（reset_day=0 时为永久累计） |
@@ -261,7 +261,7 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 |---|---|---|
 | 采样 | 每 2 秒 | 读 /proc/net/dev 计数器算 delta，以当时 Agent 时间记 ts，只写内存 |
 | 落盘 | 每 10 分钟 | 内存增量合并写入 JSON，崩溃最多丢 10 分钟 |
-| 保留 | 31 天明细 + 永久归档基数 | 月账期可重算，`reset_day=0` 不会因明细裁剪丢失累计 |
+| 保留 | 32 天明细 + 永久归档基数 | 保留期必须严格大于最长账期（31 天），否则 reset_day 28-31 的账期首日明细会在账期内被归档、月流量永久少计；月账期可重算，`reset_day=0` 不会因明细裁剪丢失累计 |
 | 查询 | `sum(period_start ≤ ts ≤ now)` | 月流量现查；`period_start=0` 时再加所选网卡的归档基数 |
 
 ### 5.3 增量正确性纪律（配置变更/重启不出错）
@@ -296,7 +296,7 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 | 决策 | 结论 | 理由 |
 |---|---|---|
 | 空 dynamic 是否上报 | **报** | 承担心跳职能 |
-| 上报失败缓冲 | **有界保留（10 条，满丢最旧）** | 只覆盖短暂抖动；长断网历史不值得补发 |
+| 上报失败缓冲 | **有界保留（共享日志 512 条，超限丢最旧并告警）** | 只覆盖短暂抖动；长断网历史不值得补发 |
 | 采集/上报频率关系 | **无约束**（仅要求 >= 1s） | report 时清空缓冲即可，采集节奏无需是上报的约数 |
 | 同步采集频率 | **slow 指标异步化** | slow worker 独立节奏直写 dynamic，带真实测量 ts；杜绝"缓存值贴新 ts" |
 | 异步数据模型 | **只发快照 + 新鲜度去重** | 异步只保留最近一次（带测量 ts）；采集端按 ts 变化摘取，天然去重 |
@@ -306,7 +306,7 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 | 流量统计底层 | **时序明细（非 KV 状态机）** | 按网卡存 delta，配置变更后新增增量始终正确；reset_day/interfaces 变更可重算 |
 | 实时网速来源 | **主采集计数器差值** | 比 netstatic 2s 粒度更贴合采集周期 |
 | 远端可下发项 | **仅所属 Reporter 的需求与输出策略** | 全局实际值没有写入口，每次从全部 Reporter 聚合，消除多路覆盖冲突 |
-| 流量校正 | **服务端职责，agent 不做** | netstatic 报诚实累计值；重装跳变由服务端检测并加 offset，校正属展示/账务层 |
+| 流量校正 | **客户端记账 + 服务端下发目标值** | netstatic 报诚实累计值；CF 协议的服务端校正以"覆盖当月累计"下发，agent 用 offset 记账（相同命令幂等，账期翻页自动失效），账务层职责仍在服务端 |
 | 自升级 | **本地显式开关；仅固定 GitHub Release + SHA-256** | 不接受服务端 URL/命令，版本必须按 SemVer 严格增加 |
 | 远程命令 | **不做** | CF/Komari 服务端不能触发命令执行或指定更新来源 |
 | 单位/类型 | **字节 + JSON number** | komari 风格，不学 cfsm 全字符串 |
