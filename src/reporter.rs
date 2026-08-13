@@ -1,4 +1,5 @@
-//! 上报器：POST /report，X-Secret 认证，失败丢弃（由调用方 drain 后不重试），
+//! 上报器：POST /report，X-Secret 认证；失败保留游标（journal 事件留在
+//! 共享日志中待下轮重发），成功才 ACK。
 //! 响应体非空时解析为远端配置
 
 use std::sync::{Arc, Mutex};
@@ -27,6 +28,12 @@ const MAX_CALIBRATION_AGE: Duration = Duration::from_secs(86_400);
 const NTP_UNIX_EPOCH_SECONDS: i128 = 2_208_988_800;
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
 const NANOS_PER_MILLI: i128 = 1_000_000;
+/// server_time 合理性限幅:2000-01-01 .. 2100-01-01 之外的绝对时间视为非法,
+/// 防止单个故障/恶意服务端污染全进程共享的校准时钟。
+const MIN_PLAUSIBLE_SERVER_TIME_MS: i64 = 946_684_800_000;
+const MAX_PLAUSIBLE_SERVER_TIME_MS: i64 = 4_102_444_800_000;
+/// server_time 采样的 RTT 上限(请求已受 TIMEOUT 约束,这里是显式双保险)。
+const MAX_CALIBRATION_RTT: Duration = Duration::from_secs(30);
 
 /// 响应信封：config 缺席 = 无配置变更；next.static = true 时下次上报强制带 static
 #[derive(serde::Deserialize)]
@@ -131,18 +138,23 @@ struct NtpSample {
 impl AgentClock {
     /// Snapshot both the local wall clock and the best calibrated clock.
     pub fn report_time(&self) -> ReportTime {
+        self.report_time_at(Instant::now())
+    }
+
+    /// `report_time` with an injectable monotonic `now`. `now` anchors sample
+    /// freshness and age, so tests can simulate stale samples without relying
+    /// on the system having run longer than `MAX_CALIBRATION_AGE`.
+    fn report_time_at(&self, now: Instant) -> ReportTime {
         let local_ts = crate::model::now_millis();
         let clock = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let fresh = |sample: &ClockCalibration| {
+            now.saturating_duration_since(sample.anchor) <= MAX_CALIBRATION_AGE
+        };
         let calibration = clock
             .ntp
             .as_ref()
-            .filter(|sample| sample.anchor.elapsed() <= MAX_CALIBRATION_AGE)
-            .or_else(|| {
-                clock
-                    .server
-                    .as_ref()
-                    .filter(|sample| sample.anchor.elapsed() <= MAX_CALIBRATION_AGE)
-            })
+            .filter(|sample| fresh(sample))
+            .or_else(|| clock.server.as_ref().filter(|sample| fresh(sample)))
             // Once calibrated, stay in the monotonic calibrated domain even
             // if refreshes are temporarily unavailable. Falling back to a
             // user-adjusted wall clock would make timestamps jump domains.
@@ -157,7 +169,9 @@ impl AgentClock {
                 (None, None) => None,
             });
         match calibration {
-            Some(calibration) => calibration.snapshot(local_ts, calibration.anchor.elapsed()),
+            Some(calibration) => {
+                calibration.snapshot(local_ts, now.saturating_duration_since(calibration.anchor))
+            }
             None => ReportTime {
                 local_ts,
                 accurate_ts: None,
@@ -176,6 +190,24 @@ impl AgentClock {
         anchor: Instant,
         reporter_id: &str,
     ) {
+        // 合理性校验:AgentClock 是全进程共享的,一个故障/恶意的原生服务端
+        // 返回任意值会污染所有 Reporter(含 CF/komari)的时间域。
+        if !(MIN_PLAUSIBLE_SERVER_TIME_MS..=MAX_PLAUSIBLE_SERVER_TIME_MS).contains(&server_time) {
+            tracing::warn!(
+                reporter_id,
+                server_time,
+                "server_time 超出合理范围,校准样本被拒绝"
+            );
+            return;
+        }
+        if round_trip > MAX_CALIBRATION_RTT {
+            tracing::warn!(
+                reporter_id,
+                round_trip_ms = duration_millis(round_trip),
+                "server_time 采样 RTT 过大,校准样本被拒绝"
+            );
+            return;
+        }
         let calibration = ClockCalibration::from_server_time(server_time, round_trip, anchor);
         let snapshot = calibration.snapshot(crate::model::now_millis(), anchor.elapsed());
         tracing::debug!(
@@ -462,6 +494,9 @@ impl Reporter {
         let client = reqwest::Client::builder()
             .timeout(TIMEOUT)
             .pool_max_idle_per_host(1)
+            // 307/308 会保留方法并把 X-Secret 等自定义头转发到重定向目标;
+            // 上报端点应显式配置,不允许服务端把认证信息引向其他域。
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("构建 HTTP client 失败")?;
         Ok(Self {
@@ -646,15 +681,48 @@ mod tests {
     }
 
     #[test]
+    fn implausible_server_time_samples_are_rejected() {
+        let clock = super::AgentClock::default();
+        let anchor = Instant::now();
+        // 范围外绝对时间
+        clock.update_server_clock(0, Duration::from_millis(80), anchor, "primary");
+        clock.update_server_clock(i64::MAX, Duration::from_millis(80), anchor, "primary");
+        assert!(clock.state.lock().unwrap().server.is_none());
+        // 范围合法但 RTT 过大
+        clock.update_server_clock(
+            1_754_300_060_123,
+            Duration::from_secs(120),
+            anchor,
+            "primary",
+        );
+        assert!(clock.state.lock().unwrap().server.is_none());
+        // 合法样本接受
+        clock.update_server_clock(
+            1_754_300_060_123,
+            Duration::from_millis(80),
+            anchor,
+            "primary",
+        );
+        assert!(clock.state.lock().unwrap().server.is_some());
+    }
+
+    #[test]
     fn stale_calibration_does_not_fall_back_to_local_time() {
         let clock = super::AgentClock::default();
-        clock.state.lock().unwrap().ntp = Some(ClockCalibration {
+        let anchor = Instant::now();
+        clock.state.lock().unwrap().ntp = Some(super::ClockCalibration {
             source: "ntp:test".into(),
-            anchor: Instant::now() - super::MAX_CALIBRATION_AGE - Duration::from_secs(1),
+            anchor,
             accurate_at_anchor: 1_000_000,
             round_trip_ms: 1,
         });
-        let snapshot = clock.report_time();
+        // Simulate a stale sample with a virtual monotonic now, so the test
+        // does not depend on the system having run past MAX_CALIBRATION_AGE.
+        let virtual_now = anchor
+            .checked_add(super::MAX_CALIBRATION_AGE)
+            .and_then(|now| now.checked_add(Duration::from_secs(1)))
+            .expect("virtual monotonic now must fit in Instant");
+        let snapshot = clock.report_time_at(virtual_now);
         assert!(snapshot.accurate_ts.is_some());
         assert_eq!(snapshot.source.as_deref(), Some("ntp:test"));
         assert!(snapshot.sample_age_ms.unwrap() > super::MAX_CALIBRATION_AGE.as_millis() as u64);
