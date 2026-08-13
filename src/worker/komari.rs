@@ -32,6 +32,9 @@ pub struct TimedKomariReport {
     pub payload: Value,
     pub measured_at_ms: i64,
     pub valid_until_ms: i64,
+    /// scheduler 侧批次游标：帧真正发出后才 ack，未发出的批次留在 journal
+    /// 里随下次成功发送一起确认，避免 WS 中断期间静默丢数据。
+    pub through: u64,
 }
 
 impl TimedKomariReport {
@@ -78,8 +81,8 @@ pub fn spawn(
             {
                 Ok(()) => tracing::warn!("komari WS 连接结束，5s 后重连"),
                 Err(e) => {
-                    buffers.push_error(
-                        format!("reporter:{reporter_id}"),
+                    buffers.push_reporter_error(
+                        reporter_id.as_str(),
                         format!("Komari WS 连接失败: {e}"),
                     );
                     // 不打 URL：query 里有 token，防泄漏进 journald
@@ -128,6 +131,7 @@ async fn run_session(
                 crate::reporter_komari::report_frame(rep.payload).into(),
             ))
             .await?;
+            buffers.ack(reporter_id, rep.through);
         } else {
             tracing::debug!(
                 measured_at = rep.measured_at_ms,
@@ -174,6 +178,7 @@ async fn run_session(
                 if let Some(rep) = out.report {
                     if rep.is_fresh(crate::model::now_millis()) {
                         ws.send(Message::Text(crate::reporter_komari::report_frame(rep.payload).into())).await?;
+                        buffers.ack(reporter_id, rep.through);
                     } else {
                         tracing::debug!(
                             measured_at = rep.measured_at_ms,
@@ -216,11 +221,19 @@ fn handle_downstream(
 
     // v1 遗留：{"message":"terminal","request_id":...}
     let legacy_msg = v.get("message").and_then(Value::as_str).unwrap_or("");
-    let is_terminal = method == "agent.terminal.request"
-        || legacy_msg == "terminal"
-        || v.get("request_id").is_some();
-    let is_exec = method == "agent.exec" || legacy_msg == "exec";
-    let is_ping = method == "agent.ping" || v.get("ping_task_id").is_some();
+    // method 优先：已知 v2 method 直接分发；只有无 method 的 v1 遗留帧才按
+    // 字段存在性识别——新帧类型碰巧带 request_id/ping_task_id 不会被误路由。
+    let (is_exec, is_terminal, is_ping) = match method {
+        "agent.exec" => (true, false, false),
+        "agent.terminal.request" => (false, true, false),
+        "agent.ping" => (false, false, true),
+        "" => (
+            legacy_msg == "exec",
+            legacy_msg == "terminal" || v.get("request_id").is_some(),
+            v.get("ping_task_id").is_some(),
+        ),
+        _ => (false, false, false),
+    };
 
     if is_exec {
         let task_id = s("task_id");
@@ -278,15 +291,22 @@ fn handle_downstream(
             .and_then(|(kind, target)| cfg.learn_komari_ping(reporter_id, kind, &target, now))
         {
             Ok(registration) => {
-                let max_age = registration
-                    .interval
-                    .saturating_mul(2)
-                    .max(10)
-                    .saturating_mul(1000)
-                    .min(i64::MAX as u64) as i64;
+                // 与 scheduler 其余消费者共用同一套新鲜度口径（source +
+                // min(source, report) + 2s 宽限），不再各算各的。
+                let report_interval = cfg
+                    .get()
+                    .reporter(reporter_id)
+                    .map(|spec| spec.intervals.report)
+                    .unwrap_or(1);
                 if let Some(record) = ping_rx.borrow().get(&registration.task_id) {
-                    let age = now.saturating_sub(record.ts);
-                    if (0..=max_age).contains(&age) {
+                    if crate::scheduler::snapshot_valid_until(
+                        record.ts,
+                        registration.interval,
+                        report_interval,
+                        now,
+                    )
+                    .is_some()
+                    {
                         value = record.rtt;
                         finished_at = record.ts;
                         cache_hit = true;
@@ -301,8 +321,8 @@ fn handle_downstream(
                 );
             }
             Err(error) => {
-                buffers.push_error(
-                    format!("reporter:{reporter_id}"),
+                buffers.push_reporter_error(
+                    reporter_id,
                     format!("Komari Ping 目标未接受: {error}"),
                 );
                 tracing::warn!(reporter_id, task_id, %error, "Komari Ping 目标未接受");
@@ -406,6 +426,7 @@ mod tests {
             payload: serde_json::json!({"cpu": {"usage": 1}}),
             measured_at_ms: 10_000,
             valid_until_ms: 14_000,
+            through: 0,
         };
         assert!(report.is_fresh(10_000));
         assert!(report.is_fresh(14_000));

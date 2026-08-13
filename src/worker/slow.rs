@@ -34,9 +34,28 @@ pub fn spawn(
             tokio::select! {
                 _ = ticker.tick() => {
                     let ts = crate::model::now_millis();
-                    let disks = collector::disks();
+                    // disks()/connections()/processes() 在 Windows/macOS 上是
+                    // netstat 子进程、全进程表扫描等级的阻塞操作，移出 runtime
+                    // worker 线程，避免卡住同线程的上报/WS 保活任务。
+                    let collected = tokio::task::spawn_blocking(move || {
+                        let disks = collector::disks();
+                        let connections = collector::connections();
+                        let processes = collector::processes();
+                        let stats = self_monitor.sample();
+                        (disks, connections, processes, stats, self_monitor)
+                    })
+                    .await;
+                    let (disks, connections, processes, stats, monitor) = match collected {
+                        Ok(values) => values,
+                        Err(error) => {
+                            tracing::warn!(error = %error, "slow 采集任务异常终止");
+                            self_monitor = SelfMonitor::new();
+                            continue;
+                        }
+                    };
+                    self_monitor = monitor;
                     let disk_used = disks.iter().map(|disk| disk.used).sum();
-                    let (tcp_conn, udp_conn) = match collector::connections() {
+                    let (tcp_conn, udp_conn) = match connections {
                         Ok((tcp, udp)) => (Some(tcp), Some(udp)),
                         Err(e) => {
                             tracing::warn!(error = %e, "连接数采集失败");
@@ -44,7 +63,6 @@ pub fn spawn(
                             (None, None)
                         }
                     };
-                    let processes = collector::processes();
                     slow_tx.send_replace(Some(SlowBlock {
                         ts,
                         disk_used: Some(disk_used),
@@ -54,7 +72,6 @@ pub fn spawn(
                         processes,
                     }));
                     // 自身占用与 slow 同频实际采集；各 Reporter 仅决定是否输出。
-                    let stats = self_monitor.sample();
                     self_tx.send_replace(Some(SelfRecord {
                         ts,
                         cpu_usage: stats.cpu_usage,

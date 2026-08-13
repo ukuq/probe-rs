@@ -1,4 +1,4 @@
-//! 公网 IP worker：查 cloudflare trace，绑定本地地址强制 v4/v6 分流
+//! 公网 IP worker：多 provider 顺序回退，绑定本地地址强制 v4/v6 分流
 //!
 //! 公网 IP 是身份信息（"你是谁"），不是被测量的指标——因此喂 static、
 //! 不进 async[]。它的变化会触发 static 重报（scheduler 监听快照变化）。
@@ -16,7 +16,13 @@ use std::sync::Arc;
 use crate::buffer::Buffers;
 use crate::model::Intervals;
 
-const TRACE_URL: &str = "https://cloudflare.com/cdn-cgi/trace";
+/// 按顺序回退；cloudflare trace 在某些网络不可达时仍有兜底。
+/// api64/icanhazip 返回纯文本 IP，parser 兼容两种形态。
+const PROVIDERS: &[&str] = &[
+    "https://cloudflare.com/cdn-cgi/trace",
+    "https://api64.ipify.org",
+    "https://icanhazip.com",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpMeasurement {
@@ -68,7 +74,7 @@ pub fn spawn(
                     let ipv4 = match &v4 { Ok(c) => query(c).await, Err(_) => None };
                     let ipv6 = match &v6 { Ok(c) => query(c).await, Err(_) => None };
                     if ipv4.is_none() && ipv6.is_none() {
-                        buffers.push_error("ip", "cloudflare trace 查询失败（v4/v6 均不可达）");
+                        buffers.push_error("ip", "公网 IP 查询失败（所有 provider 均不可达）");
                     }
                     tx.send_if_modified(|current| current.merge(ipv4, ipv6));
                 }
@@ -83,16 +89,33 @@ pub fn spawn(
 }
 
 async fn query(client: &reqwest::Client) -> Option<IpMeasurement> {
-    let body = client.get(TRACE_URL).send().await.ok()?.text().await.ok()?;
-    for line in body.lines() {
-        if let Some(ip) = line.strip_prefix("ip=") {
-            return Some(IpMeasurement {
-                address: ip.trim().to_string(),
-                measured_at_ms: crate::model::now_millis(),
-            });
+    for url in PROVIDERS {
+        if let Some(measurement) = query_one(client, url).await {
+            return Some(measurement);
         }
     }
     None
+}
+
+async fn query_one(client: &reqwest::Client, url: &str) -> Option<IpMeasurement> {
+    let body = client.get(url).send().await.ok()?.text().await.ok()?;
+    let address = parse_ip_body(&body)?;
+    Some(IpMeasurement {
+        address,
+        measured_at_ms: crate::model::now_millis(),
+    })
+}
+
+/// 兼容 cloudflare trace 的 `ip=` 行与纯文本 IP 两种响应。
+fn parse_ip_body(body: &str) -> Option<String> {
+    for line in body.lines() {
+        if let Some(ip) = line.strip_prefix("ip=") {
+            let ip = ip.trim();
+            return ip.parse::<IpAddr>().ok().map(|_| ip.to_string());
+        }
+    }
+    let ip = body.trim();
+    ip.parse::<IpAddr>().ok().map(|_| ip.to_string())
 }
 
 #[cfg(test)]
@@ -107,8 +130,17 @@ mod tests {
     }
 
     #[test]
-    fn successful_family_refreshes_while_failed_family_keeps_its_timestamp() {
-        let mut snapshot = IpSnapshot::default();
+    fn parses_trace_and_plain_text_bodies() {
+        let trace = "fl=123f45\nh=cloudflare.com\nip=203.0.113.7\nts=1786.1\n";
+        assert_eq!(parse_ip_body(trace).as_deref(), Some("203.0.113.7"));
+        assert_eq!(parse_ip_body(" 2001:db8::1 \n").as_deref(), Some("2001:db8::1"));
+        assert_eq!(parse_ip_body("192.0.2.9").as_deref(), Some("192.0.2.9"));
+        assert_eq!(parse_ip_body("not an ip"), None);
+        assert_eq!(parse_ip_body(""), None);
+    }
+
+    #[test]
+    fn successful_family_refreshes_while_failed_family_keeps_its_timestamp() {        let mut snapshot = IpSnapshot::default();
         assert!(snapshot.merge(Some(measurement("192.0.2.1", 10)), None));
         assert!(!snapshot.merge(None, None));
         assert_eq!(snapshot.ipv4.as_ref().unwrap().measured_at_ms, 10);

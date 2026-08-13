@@ -64,6 +64,11 @@ struct StoreFile {
     ledger_time: Option<LedgerTime>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     archived_totals: BTreeMap<String, ArchivedTotal>,
+    /// 各网卡最近一次采样的绝对计数器。持久化后，agent 停机期间的流量
+    /// 会在重启后的第一次采样计入 delta（机器重启导致计数器归零时
+    /// saturating_sub 得 0，不会虚增）。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    last_counters: BTreeMap<String, NetBytes>,
     #[serde(default)]
     corrections: BTreeMap<String, Correction>,
     /// Compatibility with the pre-multi-reporter on-disk format.
@@ -119,7 +124,6 @@ fn archive_before(store: &mut StoreFile, interface: &str, cutoff: i64) -> bool {
 
 struct Inner {
     store: StoreFile,
-    last_counters: HashMap<String, NetBytes>,
     last_save: Instant,
     dirty: bool,
 }
@@ -171,7 +175,6 @@ impl NetStatic {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 store,
-                last_counters: HashMap::new(),
                 last_save: Instant::now(),
                 dirty: migrated,
             })),
@@ -181,7 +184,25 @@ impl NetStatic {
 
     /// 读一次 /proc/net/dev，按网卡算 delta 并追加（由 sampler 每 2s 调用）
     pub fn sample(&self, filter: &IfaceFilter, now: i64, calibrated: bool) {
-        let current = read_per_iface(filter);
+        self.sample_counters(read_per_iface(filter), now, calibrated);
+    }
+
+    #[cfg(test)]
+    fn sample_with<'a>(
+        &self,
+        _filter: &IfaceFilter,
+        ifaces: impl IntoIterator<Item = (&'a str, u64, u64)>,
+        now: i64,
+        calibrated: bool,
+    ) {
+        let current = ifaces
+            .into_iter()
+            .map(|(name, rx, tx)| (name.to_string(), NetBytes { rx, tx }))
+            .collect();
+        self.sample_counters(current, now, calibrated);
+    }
+
+    fn sample_counters(&self, current: HashMap<String, NetBytes>, now: i64, calibrated: bool) {
         let mut inner = self.inner.lock().expect("netstatic lock poisoned");
         if calibrated
             && inner
@@ -196,11 +217,16 @@ impl NetStatic {
             inner.dirty = true;
         }
         for (name, counters) in current {
-            let (rx_delta, tx_delta) = match inner.last_counters.insert(name.clone(), counters) {
-                Some(prev) => (
-                    net::counter_delta(counters.rx, prev.rx),
-                    net::counter_delta(counters.tx, prev.tx),
-                ),
+            let (rx_delta, tx_delta) = match inner.store.last_counters.insert(name.clone(), counters)
+            {
+                Some(prev) if prev != counters => {
+                    inner.dirty = true;
+                    (
+                        net::counter_delta(counters.rx, prev.rx),
+                        net::counter_delta(counters.tx, prev.tx),
+                    )
+                }
+                Some(_) => (0, 0),
                 None => (0, 0),
             };
             if rx_delta == 0 && tx_delta == 0 {
@@ -216,8 +242,12 @@ impl NetStatic {
             );
             inner.dirty = true;
         }
+        // 校准时钟与本地时钟混用会污染归档边界：只在采样时钟与账本时钟
+        // 同域时清理——已校准，或账本从未见过校准时间（全部条目都是本地时钟）。
+        let can_prune =
+            calibrated || inner.store.ledger_time.is_none_or(|time| !time.calibrated);
         drop(inner);
-        if calibrated {
+        if can_prune {
             self.prune(now);
         }
     }
@@ -673,6 +703,82 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("probe-rs-ns-{tag}-{}", std::process::id()));
         let path = dir.join("net.json");
         (NetStatic::load(&path), path)
+    }
+
+    #[test]
+    fn persisted_counters_capture_downtime_traffic_after_restart() {
+        let (_, path) = tmp_ns("downtime");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let store = StoreFile {
+            last_counters: BTreeMap::from([(
+                "eth0".into(),
+                NetBytes { rx: 1000, tx: 2000 },
+            )]),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+
+        let ns = NetStatic::load(&path);
+        // 重启后第一次采样：计数器从 1000/2000 涨到 1600/2300（停机期间的
+        // 流量），delta 应计入账本而不是记 (0,0)。
+        ns.sample_with(&IfaceFilter::new(&[]), [("eth0", 1600, 2300)], 10_000, false);
+        assert_eq!(ns.query(&IfaceFilter::new(&[]), 0, 10_000), (600, 300));
+
+        // 机器重启导致计数器归零：saturating_sub 得 0，不虚增。
+        ns.sample_with(&IfaceFilter::new(&[]), [("eth0", 50, 60)], 20_000, false);
+        assert_eq!(ns.query(&IfaceFilter::new(&[]), 0, 20_000), (600, 300));
+
+        ns.flush();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("last_counters"));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn uncalibrated_sampler_prunes_when_ledger_never_calibrated() {
+        let (ns, path) = tmp_ns("uncalibrated-prune");
+        let now = crate::model::now_millis();
+        let old = now - RETAIN.num_milliseconds() - 1_000;
+        {
+            let mut inner = ns.inner.lock().unwrap();
+            inner.store.interfaces.insert(
+                "eth0".into(),
+                [Entry {
+                    ts: old,
+                    rx: 7,
+                    tx: 8,
+                }]
+                .into(),
+            );
+        }
+        // 从未校准的账本：未校准采样也应推进 retention（同一时钟域）。
+        ns.sample_with(&IfaceFilter::new(&[]), [("eth0", 1, 1)], now, false);
+        let inner = ns.inner.lock().unwrap();
+        assert!(inner.store.interfaces["eth0"].is_empty());
+        assert_eq!(inner.store.archived_totals["eth0"].rx, 7);
+        drop(inner);
+
+        // 账本带校准标记后，未校准采样不再推进 retention（时钟域不明）。
+        let (ns2, _path2) = (NetStatic::load(&path), &path);
+        ns2.sample_with(&IfaceFilter::new(&[]), [("eth0", 2, 2)], now + 1_000, true);
+        let old2 = now - RETAIN.num_milliseconds() - 500;
+        {
+            let mut inner = ns2.inner.lock().unwrap();
+            inner.store.interfaces.insert(
+                "eth1".into(),
+                [Entry {
+                    ts: old2,
+                    rx: 9,
+                    tx: 9,
+                }]
+                .into(),
+            );
+        }
+        ns2.sample_with(&IfaceFilter::new(&[]), [("eth0", 3, 3)], now + 2_000, false);
+        let inner = ns2.inner.lock().unwrap();
+        assert_eq!(inner.store.interfaces["eth1"].len(), 1);
+        drop(inner);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]

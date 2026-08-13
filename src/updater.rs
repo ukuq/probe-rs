@@ -198,23 +198,7 @@ async fn check_and_apply(settings: &AutoUpdateConfig) -> Result<CheckOutcome> {
     .await
     .context("update staging task panicked")??;
 
-    let replace_source = staging.path().to_owned();
-    #[cfg(windows)]
-    let previous_executable =
-        tokio::task::spawn_blocking(move || replace_windows_executable(&replace_source))
-            .await
-            .context("update replacement task panicked")?
-            .context("failed to replace the running executable")?;
-    #[cfg(not(windows))]
-    tokio::task::spawn_blocking(move || self_replace::self_replace(replace_source))
-        .await
-        .context("update replacement task panicked")?
-        .context("failed to replace the running executable")?;
-
-    #[cfg(windows)]
-    if let Err(error) = refresh_windows_tray_companion(staging.path()) {
-        tracing::warn!(%error, "failed to refresh Windows tray companion");
-    }
+    let outcome = install_staged_update(&staging).await?;
 
     tracing::info!(
         previous = %current,
@@ -222,14 +206,40 @@ async fn check_and_apply(settings: &AutoUpdateConfig) -> Result<CheckOutcome> {
         "automatic update installed"
     );
 
-    #[cfg(windows)]
-    {
-        if let Err(error) = spawn_windows_restart_helper(&previous_executable) {
-            tracing::error!(%error, "failed to start Windows update restart helper");
-            return Ok(CheckOutcome::InstalledPendingRestart);
-        }
+    Ok(outcome)
+}
+
+/// 把已校验的暂存二进制替换为运行中的可执行文件，并安排重启。
+/// 每平台一个实现，stage/replace/restart 的顺序不变量集中在这里。
+#[cfg(windows)]
+async fn install_staged_update(staging: &tempfile::NamedTempFile) -> Result<CheckOutcome> {
+    let replace_source = staging.path().to_owned();
+    let previous_executable =
+        tokio::task::spawn_blocking(move || replace_windows_executable(&replace_source))
+            .await
+            .context("update replacement task panicked")?
+            .context("failed to replace the running executable")?;
+
+    if let Err(error) = refresh_windows_tray_companion(staging.path()) {
+        tracing::warn!(%error, "failed to refresh Windows tray companion");
     }
 
+    if let Err(error) = spawn_windows_restart_helper(&previous_executable) {
+        tracing::error!(%error, "failed to start Windows update restart helper");
+        return Ok(CheckOutcome::InstalledPendingRestart);
+    }
+    Ok(CheckOutcome::Restart)
+}
+
+/// 把已校验的暂存二进制替换为运行中的可执行文件，并安排重启。
+/// 每平台一个实现，stage/replace/restart 的顺序不变量集中在这里。
+#[cfg(not(windows))]
+async fn install_staged_update(staging: &tempfile::NamedTempFile) -> Result<CheckOutcome> {
+    let replace_source = staging.path().to_owned();
+    tokio::task::spawn_blocking(move || self_replace::self_replace(replace_source))
+        .await
+        .context("update replacement task panicked")?
+        .context("failed to replace the running executable")?;
     Ok(CheckOutcome::Restart)
 }
 
@@ -444,17 +454,23 @@ fn swap_windows_executable(
 ) -> Result<()> {
     if let Err(error) = std::fs::rename(executable, previous) {
         let _ = std::fs::remove_file(incoming);
-        return Err(error).context("failed to move the running executable aside");
+        return Err(error).with_context(|| {
+            format!("failed to move {} aside", executable.display())
+        });
     }
     if let Err(install_error) = std::fs::rename(incoming, executable) {
         let restore_result = std::fs::rename(previous, executable);
         let _ = std::fs::remove_file(incoming);
         return match restore_result {
-            Ok(()) => Err(install_error).context(
-                "failed to install the incoming executable; restored the previous executable",
-            ),
+            Ok(()) => Err(install_error).with_context(|| {
+                format!(
+                    "failed to install the incoming executable as {}; restored the previous one",
+                    executable.display()
+                )
+            }),
             Err(restore_error) => bail!(
-                "failed to install the incoming executable ({install_error}); also failed to restore the previous executable ({restore_error})"
+                "failed to install the incoming executable as {} ({install_error}); also failed to restore the previous one ({restore_error})",
+                executable.display()
             ),
         };
     }
@@ -508,15 +524,8 @@ fn refresh_windows_tray_companion(new_executable: &std::path::Path) -> Result<()
     let previous = directory.join(format!(".probe-rs-tray-{unique}.previous.exe"));
     std::fs::copy(new_executable, &incoming)
         .with_context(|| format!("failed to stage {}", incoming.display()))?;
-    if let Err(error) = std::fs::rename(&tray, &previous) {
-        let _ = std::fs::remove_file(&incoming);
-        return Err(error).context("failed to move the running tray companion aside");
-    }
-    if let Err(error) = std::fs::rename(&incoming, &tray) {
-        let _ = std::fs::rename(&previous, &tray);
-        let _ = std::fs::remove_file(&incoming);
-        return Err(error).context("failed to install the new tray companion");
-    }
+    // 与主程序共用同一套 staged-replace（rename-aside / rename-in / 失败还原）
+    swap_windows_executable(&tray, &incoming, &previous)?;
 
     let previous_wide: Vec<u16> = previous
         .as_os_str()

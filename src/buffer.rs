@@ -4,13 +4,45 @@ use std::sync::Mutex;
 use crate::model::{AsyncRecord, DynamicRecord, ErrorRecord};
 
 /// 所有 Reporter 共享的短期事件日志；慢端点不会阻塞采集，超限只丢最旧事件。
+/// 丢弃未确认事件时会注入 source=buffer 的错误记录并打 warn 日志（节流）。
 pub const MAX_JOURNAL_RECORDS: usize = 512;
+
+/// 错误来源（类型化，journal 内部使用）。线上协议的 `ping:`/`reporter:`
+/// 前缀字符串由 Reporter 出口处（scope_errors）从该枚举生成，内部路由
+/// 不再解析自由文本前缀，磁盘/网卡名撞上前缀也不会被误路由。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ErrorOrigin {
+    /// 采集器直报：gpu / ip / connections / diskio / buffer ...
+    Collector(String),
+    /// Ping 任务（task_id，出口处按 Reporter 别名展开）
+    Ping(String),
+    /// 某个 Reporter 自身的错误（只路由给该 Reporter）
+    Reporter(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct LoggedError {
+    pub ts: i64,
+    pub origin: ErrorOrigin,
+    pub msg: String,
+}
+
+impl LoggedError {
+    /// 生成线上协议形态：source 字符串 + msg
+    pub fn to_wire(&self, source: impl Into<String>) -> ErrorRecord {
+        ErrorRecord {
+            ts: self.ts,
+            source: source.into(),
+            msg: self.msg.clone(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 enum Event {
     Dynamic(DynamicRecord),
     Async(AsyncRecord),
-    Error(ErrorRecord),
+    Error(LoggedError),
 }
 
 #[derive(Default)]
@@ -19,6 +51,10 @@ struct State {
     events: VecDeque<(u64, Event)>,
     /// reporter_id -> 已确认的最后序号
     cursors: HashMap<String, u64>,
+    /// 溢出丢弃未确认事件的累计数，用于节流告警
+    dropped_unacked: u64,
+    /// 上一次溢出告警时的 dropped_unacked，避免每个事件都刷日志
+    last_drop_warn: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -26,7 +62,7 @@ pub struct BufferBatch {
     pub through: u64,
     pub dynamic: Vec<DynamicRecord>,
     pub async_records: Vec<AsyncRecord>,
-    pub errors: Vec<ErrorRecord>,
+    pub errors: Vec<LoggedError>,
 }
 
 pub struct Buffers {
@@ -52,19 +88,33 @@ impl Buffers {
         state.cursors.entry(reporter_id.into()).or_insert(tail);
     }
 
+    /// 采集器错误：source 原样作为线上 source（gpu / ip / connections ...）。
     pub fn push_error(&self, source: impl Into<String>, msg: impl Into<String>) {
-        let source = source.into();
-        let msg = msg.into();
+        self.push_typed_error(ErrorOrigin::Collector(source.into()), msg.into());
+    }
+
+    /// Ping 任务错误：task_id 在出口处按 Reporter 别名展开。
+    pub fn push_ping_error(&self, task_id: impl Into<String>, msg: impl Into<String>) {
+        self.push_typed_error(ErrorOrigin::Ping(task_id.into()), msg.into());
+    }
+
+    /// Reporter 自身错误：只路由给该 Reporter，线上 source 为 "reporter"。
+    pub fn push_reporter_error(&self, reporter_id: impl Into<String>, msg: impl Into<String>) {
+        self.push_typed_error(ErrorOrigin::Reporter(reporter_id.into()), msg.into());
+    }
+
+    fn push_typed_error(&self, origin: ErrorOrigin, msg: String) {
         {
             let mut dedup = self.error_dedup.lock().expect("buffer lock poisoned");
-            if dedup.get(&source).is_some_and(|last| *last == msg) {
+            let key = format!("{origin:?}");
+            if dedup.get(&key).is_some_and(|last| *last == msg) {
                 return;
             }
-            dedup.insert(source.clone(), msg.clone());
+            dedup.insert(key, msg.clone());
         }
-        self.push(Event::Error(ErrorRecord {
+        self.push(Event::Error(LoggedError {
             ts: crate::model::now_millis(),
-            source,
+            origin,
             msg,
         }));
     }
@@ -79,12 +129,7 @@ impl Buffers {
 
     fn push(&self, event: Event) {
         let mut state = self.state.lock().expect("buffer lock poisoned");
-        let seq = state.next_seq;
-        state.next_seq = state.next_seq.saturating_add(1);
-        state.events.push_back((seq, event));
-        while state.events.len() > MAX_JOURNAL_RECORDS {
-            state.events.pop_front();
-        }
+        push_locked(&mut state, event);
     }
 
     /// 非破坏性读取：同一批数据可被任意数量 Reporter 独立消费。
@@ -130,6 +175,49 @@ impl Buffers {
 impl Default for Buffers {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 追加事件并在溢出时丢弃最旧事件；丢弃**未确认**事件时留下信号——
+/// 本地 tracing::warn + 注入一条 source=buffer 的 ErrorRecord 随上报带出，
+/// 避免端点长时间中断导致的数据丢失完全无声。
+fn push_locked(state: &mut State, event: Event) {
+    let seq = state.next_seq;
+    state.next_seq = state.next_seq.saturating_add(1);
+    state.events.push_back((seq, event));
+    let mut dropped = 0u64;
+    while state.events.len() > MAX_JOURNAL_RECORDS {
+        let (dropped_seq, _) = state.events.pop_front().expect("journal non-empty");
+        // 与 ack() 一致：无游标时视为全部已确认
+        let min_cursor = state
+            .cursors
+            .values()
+            .copied()
+            .min()
+            .unwrap_or_else(|| seq.saturating_sub(1));
+        if dropped_seq > min_cursor {
+            dropped += 1;
+        }
+    }
+    if dropped == 0 {
+        return;
+    }
+    state.dropped_unacked = state.dropped_unacked.saturating_add(dropped);
+    // 首次及此后每 64 条告警一次；递归注入不会再触发告警（差值 < 64）
+    if state.last_drop_warn == 0
+        || state.dropped_unacked - state.last_drop_warn >= 64
+    {
+        state.last_drop_warn = state.dropped_unacked;
+        let total = state.dropped_unacked;
+        tracing::warn!(dropped_total = total, "journal 溢出：未确认事件被丢弃（端点中断过久）");
+        push_locked(
+            state,
+            Event::Error(LoggedError {
+                ts: crate::model::now_millis(),
+                origin: ErrorOrigin::Collector("buffer".to_string()),
+                msg: format!("上报缓冲溢出，已累计丢弃 {total} 条未确认事件"),
+            }),
+        );
     }
 }
 
@@ -181,5 +269,34 @@ mod tests {
         buffers.push_error("gpu", "x");
         buffers.push_error("gpu", "y");
         assert_eq!(buffers.read("a").errors.len(), 2);
+    }
+
+    #[test]
+    fn overflow_of_unacked_events_emits_a_notice() {
+        let buffers = Buffers::new();
+        buffers.register("a");
+        for i in 0..(MAX_JOURNAL_RECORDS + 10) {
+            buffers.push_dynamic(rec(i as i64));
+        }
+        let batch = buffers.read("a");
+        assert_eq!(batch.dynamic.len(), MAX_JOURNAL_RECORDS - 1);
+        let notice = batch
+            .errors
+            .iter()
+            .find(|e| e.origin == ErrorOrigin::Collector("buffer".to_string()))
+            .expect("overflow should inject a buffer error record");
+        assert!(notice.msg.contains("丢弃"));
+    }
+
+    #[test]
+    fn overflow_of_acked_events_stays_quiet() {
+        let buffers = Buffers::new();
+        buffers.register("a");
+        for i in 0..(MAX_JOURNAL_RECORDS + 10) {
+            buffers.push_dynamic(rec(i as i64));
+            let batch = buffers.read("a");
+            buffers.ack("a", batch.through);
+        }
+        assert!(buffers.read("a").errors.is_empty());
     }
 }

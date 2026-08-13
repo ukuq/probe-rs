@@ -79,8 +79,8 @@ async fn target_loop(
                 let ts = crate::model::now_millis();
                 let name = target.name.clone();
                 if rtt < 0 {
-                    buffers.push_error(
-                        format!("ping:{}", name),
+                    buffers.push_ping_error(
+                        &name,
                         err.unwrap_or_else(|| "全部测量失败".to_string()),
                     );
                 }

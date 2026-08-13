@@ -141,7 +141,10 @@ if [ -z "$BIN" ]; then
         *) die "不支持的架构: $arch" ;;
     esac
     if [ -n "$VERSION" ]; then
-        BIN="$RELEASE_BASE/download/$VERSION/probe-rs-linux-$arch"
+        # 与 cf-install.sh 对齐：缺 v 前缀自动补，非法字符拒绝
+        case "$VERSION" in v*) tag=$VERSION ;; *) tag=v$VERSION ;; esac
+        case "$tag" in *[!A-Za-z0-9._-]*) die "invalid install-version" ;; esac
+        BIN="$RELEASE_BASE/download/$tag/probe-rs-linux-$arch"
     else
         BIN="$RELEASE_BASE/latest/download/probe-rs-linux-$arch"
     fi

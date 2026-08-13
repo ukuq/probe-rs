@@ -62,7 +62,7 @@ fn is_default_excluded(name: &str) -> bool {
         || WINDOWS_EXCLUDED_PARTS.iter().any(|p| name.contains(p))
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NetBytes {
     pub rx: u64,
     pub tx: u64,

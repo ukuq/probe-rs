@@ -26,6 +26,9 @@ use crate::worker::ping::PingSnapshot;
 use crate::worker::public_ip::IpSnapshot;
 
 const STATIC_REFRESH: Duration = Duration::from_secs(600);
+/// 校准时钟偏移变化超过该阈值时重建 static（ts/boot_time 里烘焙了旧偏移）。
+/// 取 1s：boot_time 展示精度为秒，小于该值的 NTP 微调不可见，避免频繁重建。
+const STATIC_OFFSET_REFRESH_MS: i64 = 1_000;
 
 /// Pure collection scheduler. Reporting is handled by `ReporterRunner`.
 pub struct Scheduler {
@@ -233,6 +236,8 @@ pub struct ReporterRunner {
     last_static: Option<Instant>,
     static_cache: Option<StaticInfo>,
     static_calibrated: Option<bool>,
+    /// 上次构建 static 时烘焙进 ts/boot_time 的时钟偏移
+    static_offset_ms: Option<i64>,
 }
 
 impl ReporterRunner {
@@ -276,6 +281,7 @@ impl ReporterRunner {
             last_static: None,
             static_cache: None,
             static_calibrated: None,
+            static_offset_ms: None,
         }
     }
 
@@ -341,7 +347,9 @@ impl ReporterRunner {
             "komari" => self.report_komari(&spec, &dynamic, &batch).await,
             _ => self.report_probe(&spec, dynamic, &batch).await,
         };
-        if success {
+        // Komari 的 ack 在 WS worker 真正发出帧之后进行（见 worker/komari.rs），
+        // 这里 ack 会把尚未发送的批次标记为已确认。
+        if success && spec.protocol != "komari" {
             self.buffers.ack(&self.id, batch.through);
         }
     }
@@ -417,8 +425,8 @@ impl ReporterRunner {
         batch: &BufferBatch,
     ) -> bool {
         let Some(tx) = self.komari_tx.clone() else {
-            self.buffers.push_error(
-                format!("reporter:{}", self.id),
+            self.buffers.push_reporter_error(
+                &self.id,
                 "komari output channel is unavailable",
             );
             return false;
@@ -519,6 +527,7 @@ impl ReporterRunner {
                 payload: report,
                 measured_at_ms: dyn_latest.ts,
                 valid_until_ms: report_valid_until,
+                through: batch.through,
             }),
             basic_info,
         );
@@ -764,38 +773,40 @@ impl ReporterRunner {
 
     fn scope_errors(
         &self,
-        records: &[crate::model::ErrorRecord],
+        records: &[crate::buffer::LoggedError],
         spec: &ReporterSpec,
     ) -> Vec<crate::model::ErrorRecord> {
+        use crate::buffer::ErrorOrigin;
         if !spec.report_errors {
             return Vec::new();
         }
         records
             .iter()
-            .flat_map(|record| {
-                if let Some(task_id) = record.source.strip_prefix("ping:") {
-                    return scope_ping_error_aliases(record, task_id, spec);
-                }
-                if let Some(reporter_id) = record.source.strip_prefix("reporter:") {
-                    return if reporter_id == spec.id {
-                        let mut scoped = record.clone();
-                        scoped.source = "reporter".to_string();
-                        vec![scoped]
+            .flat_map(|record| match &record.origin {
+                ErrorOrigin::Ping(task_id) => scope_ping_error_aliases(record, task_id, spec),
+                ErrorOrigin::Reporter(reporter_id) => {
+                    if reporter_id == &spec.id {
+                        vec![record.to_wire("reporter")]
                     } else {
                         Vec::new()
-                    };
+                    }
                 }
-                vec![record.clone()]
+                ErrorOrigin::Collector(source) => vec![record.to_wire(source.clone())],
             })
             .collect()
     }
 
     fn static_due(&self, spec: &ReporterSpec) -> bool {
+        let report_time = self.reporter.report_time();
+        let offset_shifted = self.static_offset_ms.is_some_and(|used| {
+            (used - report_time.offset_ms.unwrap_or(0)).abs() >= STATIC_OFFSET_REFRESH_MS
+        });
         if self
             .last_static
             .is_none_or(|last| last.elapsed() >= STATIC_REFRESH)
             || self.static_cache.is_none()
-            || self.static_calibrated != Some(self.reporter.report_time().accurate_ts.is_some())
+            || self.static_calibrated != Some(report_time.accurate_ts.is_some())
+            || offset_shifted
         {
             return true;
         }
@@ -846,13 +857,13 @@ impl ReporterRunner {
         });
         info.disk_total = info.disks.iter().map(|disk| disk.total).sum();
         self.static_calibrated = Some(report_time.accurate_ts.is_some());
+        self.static_offset_ms = Some(clock_offset_ms);
         self.static_cache = Some(info.clone());
         info
     }
 
     fn report_error(&self, error: anyhow::Error) {
-        self.buffers
-            .push_error(format!("reporter:{}", self.id), error.to_string());
+        self.buffers.push_reporter_error(&self.id, error.to_string());
         tracing::warn!(reporter_id = %self.id, %error, "report failed; cursor retained");
     }
 }
@@ -961,18 +972,14 @@ fn scope_fresh_cf_pings(
 }
 
 fn scope_ping_error_aliases(
-    record: &ErrorRecord,
+    record: &crate::buffer::LoggedError,
     task_id: &str,
     spec: &ReporterSpec,
 ) -> Vec<ErrorRecord> {
     spec.pings
         .iter()
         .filter(|target| target.task_id == task_id)
-        .map(|target| {
-            let mut scoped = record.clone();
-            scoped.source = format!("ping:{}", target.target.name);
-            scoped
-        })
+        .map(|target| record.to_wire(format!("ping:{}", target.target.name)))
         .collect()
 }
 
@@ -1022,7 +1029,7 @@ fn publish_komari(
 ///
 /// 采集快于上报时不能因上报周期很长而放宽有效期；采集慢于上报时则允许
 /// 在下一次采集前复用快照。额外两秒用于 ticker 抖动和任务切换。
-fn snapshot_valid_until(
+pub(crate) fn snapshot_valid_until(
     measured_at_ms: i64,
     source_interval: u64,
     report_interval: u64,
@@ -1111,9 +1118,9 @@ mod tests {
             .collect();
         assert_eq!(names, ["first", "second"]);
 
-        let error = ErrorRecord {
+        let error = crate::buffer::LoggedError {
             ts: 1,
-            source: "ping:tcp:example.com:80".into(),
+            origin: crate::buffer::ErrorOrigin::Ping("tcp:example.com:80".into()),
             msg: "timeout".into(),
         };
         let sources: Vec<_> = scope_ping_error_aliases(&error, "tcp:example.com:80", &spec)
@@ -1165,6 +1172,7 @@ mod tests {
                 payload: serde_json::json!({ "cpu": { "usage": 1 } }),
                 measured_at_ms: 10_000,
                 valid_until_ms: 14_000,
+                through: 0,
             }),
             None,
         );

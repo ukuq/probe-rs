@@ -37,7 +37,8 @@ pub struct ReportTime {
 pub struct ErrorRecord {
     /// 发生时刻，毫秒时间戳
     pub ts: i64,
-    /// 来源：gpu / ip / reporter / ping:<组名> ...
+    /// 线上协议来源串：gpu / ip / reporter / ping:<组名> ...
+    /// （由 Reporter 出口从类型化 ErrorOrigin 生成，见 buffer.rs）
     pub source: String,
     pub msg: String,
 }
