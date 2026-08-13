@@ -454,9 +454,8 @@ fn swap_windows_executable(
 ) -> Result<()> {
     if let Err(error) = std::fs::rename(executable, previous) {
         let _ = std::fs::remove_file(incoming);
-        return Err(error).with_context(|| {
-            format!("failed to move {} aside", executable.display())
-        });
+        return Err(error)
+            .with_context(|| format!("failed to move {} aside", executable.display()));
     }
     if let Err(install_error) = std::fs::rename(incoming, executable) {
         let restore_result = std::fs::rename(previous, executable);

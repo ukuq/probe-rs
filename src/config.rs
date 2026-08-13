@@ -569,6 +569,13 @@ pub struct SharedConfig {
     config_tx: watch::Sender<LocalConfig>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalReload {
+    Applied,
+    Unchanged,
+    RestartRequired,
+}
+
 impl SharedConfig {
     pub fn new(
         cfg: LocalConfig,
@@ -625,17 +632,23 @@ impl SharedConfig {
         });
     }
 
-    /// 原子热加载:写锁内复核文件 mtime 未变才整体替换。
-    /// 调用方在写锁外读文件、解析、校验的窗口可能撞上远端应用/Komari 学习
-    /// 的落盘+内存更新;若不经复核直接整体替换,旧快照会把新配置回退。
-    /// 返回 false 表示文件在解析期间又变了,本次结果作废,下个轮询周期重试。
-    pub fn update_local_from_disk(&self, path: &Path) -> Result<bool> {
-        let before = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-        let cfg = load(path)?;
+    /// 原子热加载：持有写锁时读取、校验并提交同一份文件快照。
+    ///
+    /// 远端应用和 Komari 学习也在该锁内落盘，因此不会在本次读取与提交之间
+    /// 插入一个更新；`is_compatible` 检查的正是随后要应用的 `cfg`，连接身份
+    /// 变化不能通过调用方预读另一份快照绕过 restart-only 限制。
+    pub fn update_local_from_disk(
+        &self,
+        path: &Path,
+        is_compatible: impl FnOnce(&LocalConfig) -> bool,
+    ) -> Result<LocalReload> {
         let mut guard = self.inner.write().expect("config lock poisoned");
-        let after = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-        if before != after {
-            return Ok(false);
+        let cfg = load(path)?;
+        if !is_compatible(&cfg) {
+            return Ok(LocalReload::RestartRequired);
+        }
+        if *guard == cfg {
+            return Ok(LocalReload::Unchanged);
         }
         let effective = cfg.effective_intervals();
         *guard = cfg.clone();
@@ -656,7 +669,7 @@ impl SharedConfig {
                 false
             }
         });
-        Ok(true)
+        Ok(LocalReload::Applied)
     }
 
     /// 记录 Komari 面板下发的 Ping 目标。这里只修改该 Reporter 的本地采集需求；
@@ -1003,6 +1016,47 @@ mod tests {
         let mut cfg = base_config();
         cfg.reporters[0].intervals.collect = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn local_reload_validates_and_applies_the_same_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let initial = base_config();
+        persist(&path, &initial).unwrap();
+        let (shared, intervals_rx, config_rx) = SharedConfig::new(initial.clone(), path.clone());
+
+        let mut incompatible = initial.clone();
+        incompatible.reporters[0].worker_url = "https://other.example/report".into();
+        incompatible.reporters[0].intervals.collect = 5;
+        persist(&path, &incompatible).unwrap();
+
+        let result = shared
+            .update_local_from_disk(&path, |candidate| {
+                candidate.reporters[0].worker_url == initial.reporters[0].worker_url
+            })
+            .unwrap();
+        assert_eq!(result, LocalReload::RestartRequired);
+        assert_eq!(shared.get(), initial);
+        assert!(!intervals_rx.has_changed().unwrap());
+        assert!(!config_rx.has_changed().unwrap());
+
+        let mut compatible = initial.clone();
+        compatible.reporters[0].intervals.collect = 5;
+        persist(&path, &compatible).unwrap();
+
+        let result = shared
+            .update_local_from_disk(&path, |candidate| {
+                candidate.reporters[0].worker_url == initial.reporters[0].worker_url
+            })
+            .unwrap();
+        assert_eq!(result, LocalReload::Applied);
+        assert_eq!(shared.get(), compatible);
+        assert!(intervals_rx.has_changed().unwrap());
+        assert!(config_rx.has_changed().unwrap());
+
+        let result = shared.update_local_from_disk(&path, |_| true).unwrap();
+        assert_eq!(result, LocalReload::Unchanged);
     }
 
     #[test]

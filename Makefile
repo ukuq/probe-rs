@@ -31,4 +31,4 @@ uninstall:
 
 # 本地演示：Deno 服务端（8080）+ 指定配置的 agent
 demo:
-	deno run --allow-net server-demo/server.ts
+	deno run --allow-net --allow-env=HOST server-demo/server.ts

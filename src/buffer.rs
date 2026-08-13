@@ -204,12 +204,13 @@ fn push_locked(state: &mut State, event: Event) {
     }
     state.dropped_unacked = state.dropped_unacked.saturating_add(dropped);
     // 首次及此后每 64 条告警一次；递归注入不会再触发告警（差值 < 64）
-    if state.last_drop_warn == 0
-        || state.dropped_unacked - state.last_drop_warn >= 64
-    {
+    if state.last_drop_warn == 0 || state.dropped_unacked - state.last_drop_warn >= 64 {
         state.last_drop_warn = state.dropped_unacked;
         let total = state.dropped_unacked;
-        tracing::warn!(dropped_total = total, "journal 溢出：未确认事件被丢弃（端点中断过久）");
+        tracing::warn!(
+            dropped_total = total,
+            "journal 溢出：未确认事件被丢弃（端点中断过久）"
+        );
         push_locked(
             state,
             Event::Error(LoggedError {

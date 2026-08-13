@@ -321,10 +321,8 @@ fn handle_downstream(
                 );
             }
             Err(error) => {
-                buffers.push_reporter_error(
-                    reporter_id,
-                    format!("Komari Ping 目标未接受: {error}"),
-                );
+                buffers
+                    .push_reporter_error(reporter_id, format!("Komari Ping 目标未接受: {error}"));
                 tracing::warn!(reporter_id, task_id, %error, "Komari Ping 目标未接受");
             }
         }

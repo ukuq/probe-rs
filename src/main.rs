@@ -19,7 +19,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::sync::watch;
 
-use crate::config::{LocalConfig, SharedConfig};
+use crate::config::{LocalConfig, LocalReload, SharedConfig};
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -184,30 +184,16 @@ async fn main() -> Result<()> {
                         let current_mtime = mtime(&watch_path);
                         if current_mtime == last_mtime { continue; }
                         last_mtime = current_mtime;
-                        let cfg = match config::load(&watch_path) {
-                            Ok(cfg) => cfg,
-                            Err(error) => {
-                                tracing::warn!(%error, "config hot reload rejected");
-                                continue;
-                            }
-                        };
-                        if connection_signature(&cfg) != initial_connections {
-                            tracing::warn!(
+                        match shared.update_local_from_disk(&watch_path, |cfg| {
+                            connection_signature(cfg) == initial_connections
+                        }) {
+                            Ok(LocalReload::Applied) => tracing::info!("config hot-reloaded"),
+                            Ok(LocalReload::Unchanged) => {}
+                            Ok(LocalReload::RestartRequired) => tracing::warn!(
                                 "Reporter endpoints/count changed; restart required, hot reload skipped"
-                            );
-                            continue;
-                        }
-                        if cfg != shared.get() {
-                            // 原子应用:写锁内复核 mtime,避免旧快照覆盖远端应用/
-                            // Komari 学习刚刚落盘的新配置(C1)。
-                            match shared.update_local_from_disk(&watch_path) {
-                                Ok(true) => tracing::info!("config hot-reloaded"),
-                                Ok(false) => tracing::debug!(
-                                    "config changed during reload; retrying next tick"
-                                ),
-                                Err(error) => {
-                                    tracing::warn!(%error, "config hot reload rejected")
-                                }
+                            ),
+                            Err(error) => {
+                                tracing::warn!(%error, "config hot reload rejected")
                             }
                         }
                     }

@@ -5,8 +5,9 @@ Deno + TypeScript 单文件、零依赖。实现 [REPORT.md](../REPORT.md) 协�
 ## 运行
 
 ```bash
-deno run --allow-net server.ts        # 默认 8080 端口
-deno run --allow-net server.ts 9000   # 指定端口
+deno run --allow-net --allow-env=HOST server.ts        # 默认 127.0.0.1:8080
+deno run --allow-net --allow-env=HOST server.ts 9000   # 指定端口
+HOST=0.0.0.0 deno run --allow-net --allow-env=HOST server.ts # 显式对外监听
 ```
 
 打开 http://localhost:8080 看监控面板。
@@ -38,7 +39,7 @@ deno run --allow-net server.ts 9000   # 指定端口
 
 ## 演示流程
 
-1. 启动服务端：`deno run --allow-net server.ts`
+1. 启动服务端：`deno run --allow-net --allow-env=HOST server.ts`
 2. 在 agent 的 `config.toml` 中增加一条 `[[reporters]]`：`protocol = "probe"`、
    `worker_url = "http://127.0.0.1:8080/report"`、`secret = "change-me"`
 3. 启动 agent：`probe-rs -c config.toml`，面板上出现数据

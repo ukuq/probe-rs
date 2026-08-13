@@ -92,19 +92,7 @@ const EXCLUDED_FS: &[&str] = &[
 /// (disk_total, disk_used)，字节
 pub fn disks() -> Vec<crate::model::DiskVolume> {
     let disks = Disks::new_with_refreshed_list();
-    // macOS APFS:数据卷(/System/Volumes/Data 等,卷标通常为 "<根卷标> - Data")
-    // 与根快照同容器共享空间。根快照只读、used 只有十几 GB,数据卷才代表
-    // 真实占用。有 Data 卷时跳过同名前缀的根快照,避免双计并修复 used 低估。
-    let data_names: Vec<String> = disks
-        .iter()
-        .filter(|d| {
-            d.file_system().to_string_lossy().to_lowercase() == "apfs"
-                && d.mount_point().to_string_lossy().to_lowercase() == "/system/volumes/data"
-        })
-        .map(|d| d.name().to_string_lossy().to_string())
-        .collect();
-    let mut devices: std::collections::HashMap<String, crate::model::DiskVolume> =
-        Default::default();
+    let mut volumes = Vec::new();
     for d in &disks {
         let mount = d.mount_point().to_string_lossy().to_lowercase();
         let fs = d.file_system().to_string_lossy().to_lowercase();
@@ -117,34 +105,34 @@ pub fn disks() -> Vec<crate::model::DiskVolume> {
             continue;
         }
         let name = d.name().to_string_lossy().to_string();
-        let is_data_volume = data_names.contains(&name);
-        // 根快照/同容器兄弟卷:其 Data 卷已在 data_names 中时跳过。
-        if fs == "apfs" && superseded_by_data_volume(&name, is_data_volume, &data_names) {
-            continue;
-        }
         let mount_point = d.mount_point().to_string_lossy().to_string();
         let id = if cfg!(target_os = "windows") {
             mount_point.clone()
         } else {
             name.clone()
         };
-        match devices.get(&id) {
-            Some(existing)
-                if existing.total > total
-                    || (existing.total == total
-                        && !(mount == "/system/volumes/data" && existing.mount_point == "/")) => {}
+        volumes.push(crate::model::DiskVolume {
+            id,
+            name,
+            mount_point,
+            file_system: fs,
+            total,
+            used,
+        });
+    }
+
+    // macOS APFS 的根快照和 Data 卷共享空间。保留根卷 id/name/"/" 作为
+    // Reporter 筛选别名，只用 Data 卷的容量替换其 total/used，然后移除
+    // Data 记录，既不会双计，也不会让已有 disks=["/"] 配置升级后失效。
+    merge_apfs_data_volumes(&mut volumes);
+
+    let mut devices: std::collections::HashMap<String, crate::model::DiskVolume> =
+        Default::default();
+    for volume in volumes {
+        match devices.get(&volume.id) {
+            Some(existing) if existing.total >= volume.total => {}
             _ => {
-                devices.insert(
-                    id.clone(),
-                    crate::model::DiskVolume {
-                        id,
-                        name,
-                        mount_point,
-                        file_system: fs,
-                        total,
-                        used,
-                    },
-                );
+                devices.insert(volume.id.clone(), volume);
             }
         }
     }
@@ -153,14 +141,45 @@ pub fn disks() -> Vec<crate::model::DiskVolume> {
     volumes
 }
 
-/// APFS 卷组去重判定(纯函数,供跨平台测试):
-/// 当 Data 卷(卷标通常为 "<根卷标> - Data")存在时,同容器的根快照/兄弟卷
-/// (卷标是 Data 卷标的前缀或同名)由 Data 卷代表,应被跳过。
-fn superseded_by_data_volume(name: &str, is_data_volume: bool, data_labels: &[String]) -> bool {
-    !is_data_volume
-        && data_labels
-            .iter()
-            .any(|data| data == name || data.starts_with(&format!("{name} - ")))
+fn apfs_data_matches_root(data_name: &str, root_name: &str) -> bool {
+    data_name == root_name || data_name.strip_suffix(" - Data") == Some(root_name)
+}
+
+fn merge_apfs_data_volumes(volumes: &mut Vec<crate::model::DiskVolume>) {
+    let data_indices: Vec<_> = volumes
+        .iter()
+        .enumerate()
+        .filter(|(_, volume)| {
+            volume.file_system.eq_ignore_ascii_case("apfs")
+                && volume
+                    .mount_point
+                    .eq_ignore_ascii_case("/System/Volumes/Data")
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let mut remove = std::collections::BTreeSet::new();
+    for data_index in data_indices {
+        let data_name = volumes[data_index].name.clone();
+        let root_index = volumes.iter().enumerate().find_map(|(index, volume)| {
+            (index != data_index
+                && volume.file_system.eq_ignore_ascii_case("apfs")
+                && volume.mount_point == "/"
+                && apfs_data_matches_root(&data_name, &volume.name))
+            .then_some(index)
+        });
+        if let Some(root_index) = root_index {
+            volumes[root_index].total = volumes[data_index].total;
+            volumes[root_index].used = volumes[data_index].used;
+            remove.insert(data_index);
+        }
+    }
+    if !remove.is_empty() {
+        *volumes = volumes
+            .drain(..)
+            .enumerate()
+            .filter_map(|(index, volume)| (!remove.contains(&index)).then_some(volume))
+            .collect();
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -366,35 +385,57 @@ udp6       0      0  *.5353                *.*
     }
 
     #[test]
-    fn apfs_root_snapshot_is_superseded_by_its_data_volume() {
-        let data = |s: &str| s.to_string();
-        let labels = vec![data("Macintosh HD - Data")];
-        // 根快照卷标是 Data 卷标前缀 → 跳过
-        assert!(super::superseded_by_data_volume(
-            "Macintosh HD",
-            false,
-            &labels
-        ));
-        // 无关卷不受影响
-        assert!(!super::superseded_by_data_volume("Backup", false, &labels));
-        // Data 卷本身永不被跳过
-        assert!(!super::superseded_by_data_volume(
+    fn apfs_data_capacity_replaces_root_without_losing_root_aliases() {
+        let volume =
+            |id: &str, name: &str, mount: &str, total: u64, used: u64| crate::model::DiskVolume {
+                id: id.into(),
+                name: name.into(),
+                mount_point: mount.into(),
+                file_system: "apfs".into(),
+                total,
+                used,
+            };
+        let mut volumes = vec![
+            volume("Macintosh HD", "Macintosh HD", "/", 100, 10),
+            volume(
+                "Macintosh HD - Data",
+                "Macintosh HD - Data",
+                "/System/Volumes/Data",
+                100,
+                70,
+            ),
+            volume("Backup", "Backup", "/Volumes/Backup", 200, 20),
+        ];
+
+        super::merge_apfs_data_volumes(&mut volumes);
+
+        assert_eq!(volumes.len(), 2);
+        let root = volumes
+            .iter()
+            .find(|volume| volume.mount_point == "/")
+            .unwrap();
+        assert_eq!(root.id, "Macintosh HD");
+        assert_eq!(root.name, "Macintosh HD");
+        assert_eq!((root.total, root.used), (100, 70));
+        assert!(volumes
+            .iter()
+            .all(|volume| volume.mount_point != "/System/Volumes/Data"));
+        assert!(volumes.iter().any(|volume| volume.name == "Backup"));
+    }
+
+    #[test]
+    fn apfs_data_label_matching_is_specific_to_the_root_group() {
+        assert!(super::apfs_data_matches_root(
             "Macintosh HD - Data",
-            true,
-            &labels
+            "Macintosh HD"
         ));
-        // 卷标完全相同(根快照与 Data 同名)时,非 Data 的根快照同样被代表
-        let identical = vec![data("Macintosh HD")];
-        assert!(super::superseded_by_data_volume(
+        assert!(super::apfs_data_matches_root(
             "Macintosh HD",
-            false,
-            &identical
+            "Macintosh HD"
         ));
-        // 无 Data 卷时保持现状,不跳过任何卷
-        assert!(!super::superseded_by_data_volume(
-            "Macintosh HD",
-            false,
-            &[]
+        assert!(!super::apfs_data_matches_root(
+            "Backup - Data",
+            "Macintosh HD"
         ));
     }
 }

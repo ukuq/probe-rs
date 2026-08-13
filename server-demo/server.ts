@@ -1,4 +1,4 @@
-#!/usr/bin/env -S deno run --allow-net
+#!/usr/bin/env -S deno run --allow-net --allow-env=HOST
 /**
  * probe-rs 演示服务端（Deno + TypeScript，零依赖单文件）
  *
@@ -10,7 +10,8 @@
  *   GET  /ws                面板 WebSocket 实时推送
  *   POST /api/config/:instance_id  设置该 Reporter 的待下发配置
  *
- * 运行: deno run --allow-net server.ts [PORT]   默认 8080，密钥见 SECRET
+ * 运行: deno run --allow-net --allow-env=HOST server.ts [PORT]
+ * 默认 127.0.0.1:8080，密钥见 SECRET
  */
 
 // ---------- 协议类型（对应 REPORT.md） ----------
@@ -137,6 +138,7 @@ interface PingRecord {
 
 interface GpuRecord {
   ts: number;
+  id: string;
   name: string;
   usage: number | null;
   mem_total: number | null; // 字节；macOS 为 null（统一内存）
@@ -298,6 +300,18 @@ function mergeTsWindow<T extends { ts: number }>(
   return [...merged.values()].sort((a, b) => a.ts - b.ts);
 }
 
+/** 同一批 GPU 共享 ts，Ping 也可能在同一毫秒完成；去重键必须包含记录身份。 */
+function asyncRecordKey(record: AsyncRecord): string {
+  switch (record.kind) {
+    case "gpu":
+      return JSON.stringify([record.kind, record.ts, record.id || record.name]);
+    case "ping":
+      return JSON.stringify([record.kind, record.ts, record.name]);
+    default:
+      return JSON.stringify([record.kind, record.ts]);
+  }
+}
+
 function broadcast(): void {
   if (!clients.size) return;
   const msg = JSON.stringify(serversView());
@@ -404,7 +418,7 @@ function handleReport(req: Request, report: Report): Response {
     }
   }
   if (Array.isArray(report.async)) {
-    s.asyncs = mergeTsWindow(s.asyncs, report.async, (r) => `${r.kind}:${r.ts}`);
+    s.asyncs = mergeTsWindow(s.asyncs, report.async, asyncRecordKey);
     if (s.asyncs.length > KEEP_DYNAMIC) {
       s.asyncs = s.asyncs.slice(-KEEP_DYNAMIC);
     }
