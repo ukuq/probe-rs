@@ -64,20 +64,49 @@ do_install() {
             echo "已安装并启动。状态: systemctl status probe-rs"
         else
             echo ""
-            echo "警告: 服务启动失败（多半是现有配置非法）。"
-            echo "排查: journalctl -u probe-rs -n 20 --no-pager"
-            echo "修好后: systemctl restart probe-rs"
+            echo "错误: 服务启动失败（多半是现有配置非法）。" >&2
+            echo "排查: journalctl -u probe-rs -n 20 --no-pager" >&2
+            echo "修好后: systemctl restart probe-rs" >&2
+            exit 1
         fi
     else
-        # 含 secret，权限 600；示例文件缺失时写最小兜底配置
+        # 含 secret，权限 600；示例文件缺失时写最小合法兜底配置。
+        # 注意:必须使用 [[reporters]] 数组格式——旧版顶层 server_id/secret/
+        # worker_url 根级格式已被 agent 拒绝(rejects_legacy_root_connection_shape)。
         if [ -f "$EXAMPLE_CONF" ]; then
             install -m 0600 "$EXAMPLE_CONF" "$CONF_DIR/config.toml"
         else
             cat > "$CONF_DIR/config.toml" <<'EOF'
+# probe-rs minimal fallback config（首次安装后必须编辑）
+net_static_path = "/var/lib/probe-rs/net_static.json"
+
+[auto_update]
+enabled = false
+channel = "stable"
+check_interval = 21600
+
+[[reporters]]
+id = "primary"
+protocol = "probe"
 server_id = "srv-01"
 secret = "change-me"
 worker_url = "https://monitor.example.com/report"
-net_static_path = "/var/lib/probe-rs/net_static.json"
+config_version = ""
+report_interval = 60
+reset_day = 1
+interfaces = []
+disks = []
+report_gpu = true
+report_errors = true
+report_self = false
+
+[reporters.intervals]
+collect = 1
+ping = 30
+slow = 60
+gpu = 60
+ip = 600
+diskio = 10
 EOF
             chmod 600 "$CONF_DIR/config.toml"
         fi

@@ -133,6 +133,10 @@ fi
 
 # ---- 二进制 ----
 TMP_BIN=$(mktemp /tmp/probe-rs.XXXXXX)
+TMP_SUMS=
+VERIFY_SUMS=0
+cleanup_tmp() { rm -f "$TMP_BIN" ${TMP_SUMS:+$TMP_SUMS}; }
+trap cleanup_tmp EXIT
 if [ -z "$BIN" ]; then
     arch=$(uname -m)
     case "$arch" in
@@ -145,18 +149,41 @@ if [ -z "$BIN" ]; then
         case "$VERSION" in v*) tag=$VERSION ;; *) tag=v$VERSION ;; esac
         case "$tag" in *[!A-Za-z0-9._-]*) die "invalid install-version" ;; esac
         BIN="$RELEASE_BASE/download/$tag/probe-rs-linux-$arch"
+        SUM_URL="$RELEASE_BASE/download/$tag/SHA256SUMS"
     else
         BIN="$RELEASE_BASE/latest/download/probe-rs-linux-$arch"
+        SUM_URL="$RELEASE_BASE/latest/download/SHA256SUMS"
     fi
+    # 脚本自动推导的 Release 源必须校验;用户显式 -bin=<路径或URL> 视为信任输入
+    VERIFY_SUMS=1
 fi
 if [ -f "$BIN" ]; then
     cp -f "$BIN" "$TMP_BIN"
 else
     log "下载二进制: $BIN"
     curl -fSL --connect-timeout 10 -o "$TMP_BIN" "$BIN" || die "二进制下载失败（可用 -bin= 指定本地路径）"
+    if [ "$VERIFY_SUMS" = 1 ]; then
+        TMP_SUMS=$(mktemp /tmp/probe-rs-sums.XXXXXX)
+        if ! curl -fSL --connect-timeout 10 -o "$TMP_SUMS" "$SUM_URL"; then
+            die "SHA256SUMS 下载失败，拒绝安装未校验的二进制；可用 -bin= 指定本地路径"
+        fi
+        asset=$(basename "$BIN")
+        expected=$(awk -v asset="$asset" '$2 == asset { print $1; exit }' "$TMP_SUMS")
+        if [ -z "$expected" ]; then
+            die "SHA256SUMS 缺少 $asset 的校验值，拒绝安装"
+        fi
+        actual=$(sha256sum "$TMP_BIN" | awk '{print $1}')
+        if [ "$actual" != "$expected" ]; then
+            die "二进制 SHA-256 校验失败（期望 $expected，实际 $actual）；旧版本保持不变"
+        fi
+        log "SHA-256 校验通过: $actual"
+    fi
 fi
-install -m 0755 "$TMP_BIN" "$BIN_DST"
-rm -f "$TMP_BIN"
+# staged replace：先写同目录临时文件再原子替换，中途失败不破坏现有二进制
+install -m 0755 "$TMP_BIN" "$BIN_DST.new" || die "安装二进制失败；旧版本保持不变"
+mv -f "$BIN_DST.new" "$BIN_DST"
+rm -f "$TMP_BIN" "$TMP_SUMS"
+trap - EXIT
 
 # ---- 配置 ----
 install -d -m 0755 "$DATA_DIR"
