@@ -257,6 +257,9 @@ interface DiskVolume {
 }
 
 const PORT = Number(Deno.args[0]) || 8080;
+// 默认只监听回环:管理接口无鉴权,绑到 0.0.0.0 会把伪造上报与 Ping 下发
+// (SSRF) 暴露给局域网。确需对外演示时显式设置 HOST=0.0.0.0。
+const HOST = Deno.env.get("HOST") ?? "127.0.0.1";
 const SECRET = "change-me"; // 演示用全局密钥；生产应按 server_id 分配
 const KEEP_DYNAMIC = 300;
 const KEEP_REPORTS = 100;
@@ -272,6 +275,28 @@ let reportSeq = 0;
 
 /** 面板 WebSocket 客户端：每次收到上报后广播最新视图 */
 const clients = new Set<WebSocket>();
+
+/**
+ * 把新到的带 ts 记录合并进现有窗口:按 keyOf 去重(同 key 保留最新到达,
+ * 覆盖延迟补发的旧值),整体按 ts 升序排序。REPORT.md:215 约定服务端
+ * 对延迟补发记录按 ts 去重/排序。
+ */
+function mergeTsWindow<T extends { ts: number }>(
+  existing: T[],
+  incoming: T[],
+  keyOf: (item: T) => string,
+): T[] {
+  if (incoming.length === 0) return existing;
+  const merged = new Map<string, T>();
+  for (const item of existing) {
+    const key = keyOf(item);
+    if (!merged.has(key)) merged.set(key, item);
+  }
+  for (const item of incoming) {
+    merged.set(keyOf(item), item);
+  }
+  return [...merged.values()].sort((a, b) => a.ts - b.ts);
+}
 
 function broadcast(): void {
   if (!clients.size) return;
@@ -373,19 +398,21 @@ function handleReport(req: Request, report: Report): Response {
   if (report.time) s.time = report.time;
   if (report.static) s.staticInfo = report.static;
   if (Array.isArray(report.dynamic)) {
-    s.dynamic.push(...report.dynamic);
+    s.dynamic = mergeTsWindow(s.dynamic, report.dynamic, (r) => String(r.ts));
     if (s.dynamic.length > KEEP_DYNAMIC) {
       s.dynamic = s.dynamic.slice(-KEEP_DYNAMIC);
     }
   }
   if (Array.isArray(report.async)) {
-    s.asyncs.push(...report.async);
+    s.asyncs = mergeTsWindow(s.asyncs, report.async, (r) => `${r.kind}:${r.ts}`);
     if (s.asyncs.length > KEEP_DYNAMIC) {
       s.asyncs = s.asyncs.slice(-KEEP_DYNAMIC);
     }
   }
   if (Array.isArray(report.errors)) {
+    // errors 是同源同文去重后的事件流,仅按 ts 排序,不做去重。
     s.errors.push(...report.errors);
+    s.errors.sort((a, b) => a.ts - b.ts);
     if (s.errors.length > KEEP_DYNAMIC) {
       s.errors = s.errors.slice(-KEEP_DYNAMIC);
     }
@@ -685,7 +712,7 @@ function json(obj: unknown, status = 200): Response {
 
 // ---------- 路由 ----------
 
-Deno.serve({ port: PORT }, async (req) => {
+Deno.serve({ hostname: HOST, port: PORT }, async (req) => {
   const url = new URL(req.url);
   if (req.method === "POST" && url.pathname === "/report") {
     try {
