@@ -31,6 +31,11 @@ pub async fn run_if_requested() -> Result<bool> {
             set_traffic_correction(parse_correction_args(args)?).await?;
             Ok(true)
         }
+        // 未知子命令必须报错:静默回退为启动 agent 会把拼错的管理命令变成
+        // 一次意外的前台探针启动。
+        other if !other.starts_with('-') => {
+            bail!("unknown command: {other} (supported: configure-cf, set-traffic-correction)")
+        }
         _ => Ok(false),
     }
 }
@@ -109,7 +114,8 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
             }
             "--auto-update" => auto_update = Some(parse_bool(&arg, &value(&mut args)?)?),
             "--update-channel" => {
-                update_channel = Some(match value(&mut args)?.as_str() {
+                // 大小写归一,与 PowerShell ValidateSet 的大小写不敏感一致。
+                update_channel = Some(match value(&mut args)?.to_ascii_lowercase().as_str() {
                     "stable" => UpdateChannel::Stable,
                     "prerelease" => UpdateChannel::Prerelease,
                     _ => bail!("--update-channel must be stable or prerelease"),
@@ -269,24 +275,40 @@ fn load_install_config(path: &Path, net_static_path: String) -> Result<LocalConf
         .with_context(|| format!("failed to read existing config: {}", path.display()))?;
     let document: toml::Value = toml::from_str(&raw).context("existing config is invalid TOML")?;
     if document.get("reporters").is_none() {
-        return Ok(LocalConfig {
-            net_static_path,
-            auto_update: AutoUpdateConfig::default(),
+        // 只补空 reporters,保留文件里可保留的字段(net_static_path/auto_update),
+        // 不能整体丢弃用户已有配置。
+        let preserved = LocalConfig {
+            net_static_path: document
+                .get("net_static_path")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .unwrap_or(net_static_path),
+            auto_update: document
+                .get("auto_update")
+                .cloned()
+                .and_then(|value| value.try_into().ok())
+                .unwrap_or_default(),
             reporters: Vec::new(),
-        });
+        };
+        tracing::warn!(
+            path = %path.display(),
+            "existing config has no [[reporters]]; reporters will be added by configure-cf, other fields preserved"
+        );
+        return Ok(preserved);
     }
     toml::from_str(&raw).context("existing canonical config is invalid")
 }
 
+/// 只删除"完整示例指纹"的 Reporter:示例 server_id 与示例 worker_url 的
+/// 精确配对命中才算,避免用户真实使用某示例 URL(如本地 demo)时被误删。
 fn is_seeded_sample(reporter: &ReporterConfig) -> bool {
-    reporter.server_id == "cf-server-uuid"
-        || matches!(
-            reporter.worker_url.as_str(),
-            "https://monitor.example.com/update"
-                | "https://komari.example.com"
-                | "http://127.0.0.1:8080/report"
-                | "https://monitor.example.com/report"
-        )
+    matches!(
+        (reporter.server_id.as_str(), reporter.worker_url.as_str()),
+        ("cf-server-uuid", "https://monitor.example.com/update")
+            | ("my-host", "https://komari.example.com")
+            | ("my-host", "http://127.0.0.1:8080/report")
+            | ("srv-01", "https://monitor.example.com/report")
+    )
 }
 
 #[derive(Debug)]
