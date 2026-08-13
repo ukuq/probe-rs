@@ -13,7 +13,10 @@ pub fn collect(
     agent_version: &str,
     cfg: &crate::model::StaticConfig,
 ) -> StaticInfo {
-    let (mem_total, _, swap_total, _) = mem::collect();
+    let (mem_total, swap_total) = match mem::collect() {
+        Some((total, _, swap, _)) => (total, swap),
+        None => (0, 0),
+    };
     let disks = disk::collect_volumes();
     let disk_total = disks.iter().map(|disk| disk.total).sum();
     StaticInfo {
@@ -30,7 +33,7 @@ pub fn collect(
         disks,
         gpu_name,
         virtualization: detect_virtualization(),
-        boot_time: boot_time_ms().unwrap_or_else(|| crate::model::now_millis()),
+        boot_time: boot_time_ms(),
         ipv4,
         ipv6,
         agent_version: agent_version.to_string(),
@@ -196,7 +199,7 @@ mod tests {
         assert!(!info.os.is_empty());
         assert!(!info.kernel.is_empty());
         assert!(info.cpu_cores >= 1);
-        assert!(info.boot_time > 0);
+        assert!(info.boot_time.is_some_and(|boot| boot > 0));
         assert!(info.mem_total > 0);
     }
 }

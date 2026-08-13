@@ -70,16 +70,18 @@ impl CpuMonitor {
     }
 }
 
-/// (mem_total, mem_used, swap_total, swap_used)，字节
-pub fn memory() -> (u64, u64, u64, u64) {
+/// (mem_total, mem_used, swap_total, swap_used)，字节。
+/// sysinfo 路径不会失败,但为与 Linux 门面对齐(读失败 → None → 线上 null),
+/// 保持 Option 签名。
+pub fn memory() -> Option<(u64, u64, u64, u64)> {
     let mut s = System::new();
     s.refresh_memory();
-    (
+    Some((
         s.total_memory(),
         s.used_memory(),
         s.total_swap(),
         s.used_swap(),
-    )
+    ))
 }
 
 /// 排除的虚拟/网络文件系统（小写包含匹配）
@@ -90,6 +92,17 @@ const EXCLUDED_FS: &[&str] = &[
 /// (disk_total, disk_used)，字节
 pub fn disks() -> Vec<crate::model::DiskVolume> {
     let disks = Disks::new_with_refreshed_list();
+    // macOS APFS:数据卷(/System/Volumes/Data 等,卷标通常为 "<根卷标> - Data")
+    // 与根快照同容器共享空间。根快照只读、used 只有十几 GB,数据卷才代表
+    // 真实占用。有 Data 卷时跳过同名前缀的根快照,避免双计并修复 used 低估。
+    let data_names: Vec<String> = disks
+        .iter()
+        .filter(|d| {
+            d.file_system().to_string_lossy().to_lowercase() == "apfs"
+                && d.mount_point().to_string_lossy().to_lowercase() == "/system/volumes/data"
+        })
+        .map(|d| d.name().to_string_lossy().to_string())
+        .collect();
     let mut devices: std::collections::HashMap<String, crate::model::DiskVolume> =
         Default::default();
     for d in &disks {
@@ -104,6 +117,11 @@ pub fn disks() -> Vec<crate::model::DiskVolume> {
             continue;
         }
         let name = d.name().to_string_lossy().to_string();
+        let is_data_volume = data_names.contains(&name);
+        // 根快照/同容器兄弟卷:其 Data 卷已在 data_names 中时跳过。
+        if fs == "apfs" && superseded_by_data_volume(&name, is_data_volume, &data_names) {
+            continue;
+        }
         let mount_point = d.mount_point().to_string_lossy().to_string();
         let id = if cfg!(target_os = "windows") {
             mount_point.clone()
@@ -111,7 +129,10 @@ pub fn disks() -> Vec<crate::model::DiskVolume> {
             name.clone()
         };
         match devices.get(&id) {
-            Some(existing) if existing.total >= total => {}
+            Some(existing)
+                if existing.total > total
+                    || (existing.total == total
+                        && !(mount == "/system/volumes/data" && existing.mount_point == "/")) => {}
             _ => {
                 devices.insert(
                     id.clone(),
@@ -132,12 +153,23 @@ pub fn disks() -> Vec<crate::model::DiskVolume> {
     volumes
 }
 
+/// APFS 卷组去重判定(纯函数,供跨平台测试):
+/// 当 Data 卷(卷标通常为 "<根卷标> - Data")存在时,同容器的根快照/兄弟卷
+/// (卷标是 Data 卷标的前缀或同名)由 Data 卷代表,应被跳过。
+fn superseded_by_data_volume(name: &str, is_data_volume: bool, data_labels: &[String]) -> bool {
+    !is_data_volume
+        && data_labels
+            .iter()
+            .any(|data| data == name || data.starts_with(&format!("{name} - ")))
+}
+
 #[cfg(target_os = "macos")]
 fn include_mount(mount: &str, fs: &str) -> bool {
-    if mount != "/" && !mount.starts_with("/volumes/") {
-        return false;
-    }
-    !EXCLUDED_FS.iter().any(|x| fs.contains(x))
+    // 系统根快照、APFS 数据卷(真实用户数据占用)、外接卷。
+    // 注意:纳入 Data 卷后由 disks() 的卷组去重防止与根快照双计。
+    let accepted =
+        mount == "/" || mount.starts_with("/volumes/") || mount == "/system/volumes/data";
+    accepted && !EXCLUDED_FS.iter().any(|x| fs.contains(x))
 }
 
 #[cfg(target_os = "windows")]
@@ -211,7 +243,7 @@ pub fn static_info(
 ) -> StaticInfo {
     let mut s = System::new();
     s.refresh_cpu_all();
-    let (mem_total, _, swap_total, _) = memory();
+    let (mem_total, _, swap_total, _) = memory().unwrap_or((0, 0, 0, 0));
     let disks = disks();
     let disk_total = disks.iter().map(|disk| disk.total).sum();
     StaticInfo {
@@ -243,7 +275,7 @@ pub fn static_info(
         gpu_name,
         // DMI 检测是 Linux 专属；macOS 物理机为主，Windows 一期不做虚拟化检测
         virtualization: None,
-        boot_time: (System::boot_time() * 1000) as i64,
+        boot_time: Some((System::boot_time() * 1000) as i64),
         ipv4,
         ipv6,
         agent_version: agent_version.to_string(),
@@ -331,5 +363,38 @@ tcp4       0      0  127.0.0.1.80          *.*                    LISTEN
 udp6       0      0  *.5353                *.*
 "#;
         assert_eq!(super::parse_netstat(text), (3, 2));
+    }
+
+    #[test]
+    fn apfs_root_snapshot_is_superseded_by_its_data_volume() {
+        let data = |s: &str| s.to_string();
+        let labels = vec![data("Macintosh HD - Data")];
+        // 根快照卷标是 Data 卷标前缀 → 跳过
+        assert!(super::superseded_by_data_volume(
+            "Macintosh HD",
+            false,
+            &labels
+        ));
+        // 无关卷不受影响
+        assert!(!super::superseded_by_data_volume("Backup", false, &labels));
+        // Data 卷本身永不被跳过
+        assert!(!super::superseded_by_data_volume(
+            "Macintosh HD - Data",
+            true,
+            &labels
+        ));
+        // 卷标完全相同(根快照与 Data 同名)时,非 Data 的根快照同样被代表
+        let identical = vec![data("Macintosh HD")];
+        assert!(super::superseded_by_data_volume(
+            "Macintosh HD",
+            false,
+            &identical
+        ));
+        // 无 Data 卷时保持现状,不跳过任何卷
+        assert!(!super::superseded_by_data_volume(
+            "Macintosh HD",
+            false,
+            &[]
+        ));
     }
 }

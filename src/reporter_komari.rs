@@ -38,7 +38,10 @@ pub fn build_report(
         "swap": { "total": st.swap_total, "used": d.swap_used.unwrap_or(0) },
         "disk": { "total": st.disk_total },
         "network": network,
-        "uptime": ((now_ms - st.boot_time).max(0) / 1000) as u64,
+        "uptime": st
+            .boot_time
+            .map(|boot| ((now_ms - boot).max(0) / 1000) as u64)
+            .unwrap_or(0),
         "message": errors.iter().map(|e| format!("[{}] {}", e.source, e.msg))
             .collect::<Vec<_>>().join("; "),
     });
@@ -160,7 +163,7 @@ mod tests {
             disks: vec![],
             gpu_name: None,
             virtualization: Some("kvm".into()),
-            boot_time: 1200,
+            boot_time: Some(1200),
             ipv4: Some("1.2.3.4".into()),
             ipv6: None,
             agent_version: "0.1.1".into(),

@@ -111,7 +111,15 @@ impl Scheduler {
         let report_time = self.clock.report_time();
         let now_ms = report_time.local_ts;
         let cpu_usage = self.cpu.sample().map(|u| (u * 100.0).round() / 100.0);
-        let (_, mem_used, _, swap_used) = collector::memory();
+        let (mem_used, swap_used) = match collector::memory() {
+            Some((_, used, _, swap)) => (Some(used), Some(swap)),
+            None => {
+                // 采集故障必须表达为 null,而不是伪装成 0。
+                self.buffers
+                    .push_error("memory", "内存采集失败(/proc/meminfo 不可读)");
+                (None, None)
+            }
+        };
 
         // Capture every interface. Filtering is performed independently at
         // each Reporter outlet.
@@ -159,8 +167,8 @@ impl Scheduler {
             ts: now_ms,
             accurate_ts: report_time.accurate_ts,
             cpu_usage,
-            mem_used: Some(mem_used),
-            swap_used: Some(swap_used),
+            mem_used,
+            swap_used,
             load: collector::load(),
             net_rx: Some(net_rx),
             net_tx: Some(net_tx),
@@ -425,10 +433,8 @@ impl ReporterRunner {
         batch: &BufferBatch,
     ) -> bool {
         let Some(tx) = self.komari_tx.clone() else {
-            self.buffers.push_reporter_error(
-                &self.id,
-                "komari output channel is unavailable",
-            );
+            self.buffers
+                .push_reporter_error(&self.id, "komari output channel is unavailable");
             return false;
         };
         let refreshed = self.static_due(spec);
@@ -844,7 +850,9 @@ impl ReporterRunner {
         let report_time = self.reporter.report_time();
         let clock_offset_ms = report_time.offset_ms.unwrap_or(0);
         info.ts = info.ts.saturating_add(clock_offset_ms);
-        info.boot_time = info.boot_time.saturating_add(clock_offset_ms);
+        info.boot_time = info
+            .boot_time
+            .map(|boot| boot.saturating_add(clock_offset_ms));
         info.disks.retain(|disk| {
             disk_selected(
                 &spec.disks,
@@ -863,7 +871,8 @@ impl ReporterRunner {
     }
 
     fn report_error(&self, error: anyhow::Error) {
-        self.buffers.push_reporter_error(&self.id, error.to_string());
+        self.buffers
+            .push_reporter_error(&self.id, error.to_string());
         tracing::warn!(reporter_id = %self.id, %error, "report failed; cursor retained");
     }
 }

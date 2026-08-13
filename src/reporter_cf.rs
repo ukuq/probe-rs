@@ -58,7 +58,8 @@ pub struct CfMetrics {
     pub disk: Option<CfDisk>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load_avg: Option<String>,
-    pub boot_time: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_time: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub net_rx: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -540,7 +541,7 @@ mod tests {
             disks: vec![],
             gpu_name: None,
             virtualization: None,
-            boot_time: 1786000000000,
+            boot_time: Some(1786000000000),
             ipv4: Some("38.147.161.207".into()),
             ipv6: None,
             agent_version: "0.1.0".into(),

@@ -38,8 +38,8 @@ impl CpuMonitor {
     }
 }
 
-/// (mem_total, mem_used, swap_total, swap_used)，字节
-pub fn memory() -> (u64, u64, u64, u64) {
+/// (mem_total, mem_used, swap_total, swap_used)，字节；读失败为 None
+pub fn memory() -> Option<(u64, u64, u64, u64)> {
     mem::collect()
 }
 
@@ -56,7 +56,7 @@ pub fn processes() -> Option<u64> {
 }
 
 pub fn connections() -> Result<(u64, u64), String> {
-    Ok(conn::collect())
+    conn::collect()
 }
 
 pub fn scan_net_dev(f: impl FnMut(&str, u64, u64)) {

@@ -43,8 +43,8 @@ impl CpuMonitor {
     }
 }
 
-/// (mem_total, mem_used, swap_total, swap_used)，字节
-pub fn memory() -> (u64, u64, u64, u64) {
+/// (mem_total, mem_used, swap_total, swap_used)，字节；读失败为 None
+pub fn memory() -> Option<(u64, u64, u64, u64)> {
     imp::memory()
 }
 

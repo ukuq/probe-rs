@@ -60,8 +60,8 @@ pub struct StaticInfo {
     pub disks: Vec<DiskVolume>,
     pub gpu_name: Option<String>,
     pub virtualization: Option<String>,
-    /// 毫秒时间戳
-    pub boot_time: i64,
+    /// 毫秒时间戳;采集失败为 null(绝不用"当前时刻"伪装成刚开机)
+    pub boot_time: Option<i64>,
     pub ipv4: Option<String>,
     pub ipv6: Option<String>,
     pub agent_version: String,
