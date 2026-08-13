@@ -14,6 +14,10 @@ use crate::model::{
 pub const KOMARI_LEARNED_PING_LIMIT: usize = 5;
 const KOMARI_PING_TOUCH_PERSIST_MS: i64 = 60_000;
 pub const MIN_UPDATE_CHECK_INTERVAL: u64 = 300;
+/// 远端可下发的 Ping/glob 数量上限:被攻陷或出错的服务端不应能把
+/// worker 任务数、回执体积与内存推到无界。上限值同步进协议文档。
+pub const MAX_REMOTE_PINGS: usize = 64;
+pub const MAX_REMOTE_PATTERNS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -621,6 +625,40 @@ impl SharedConfig {
         });
     }
 
+    /// 原子热加载:写锁内复核文件 mtime 未变才整体替换。
+    /// 调用方在写锁外读文件、解析、校验的窗口可能撞上远端应用/Komari 学习
+    /// 的落盘+内存更新;若不经复核直接整体替换,旧快照会把新配置回退。
+    /// 返回 false 表示文件在解析期间又变了,本次结果作废,下个轮询周期重试。
+    pub fn update_local_from_disk(&self, path: &Path) -> Result<bool> {
+        let before = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let cfg = load(path)?;
+        let mut guard = self.inner.write().expect("config lock poisoned");
+        let after = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        if before != after {
+            return Ok(false);
+        }
+        let effective = cfg.effective_intervals();
+        *guard = cfg.clone();
+        drop(guard);
+        self.intervals_tx.send_if_modified(|cur| {
+            if *cur != effective {
+                *cur = effective;
+                true
+            } else {
+                false
+            }
+        });
+        self.config_tx.send_if_modified(|cur| {
+            if *cur != cfg {
+                *cur = cfg.clone();
+                true
+            } else {
+                false
+            }
+        });
+        Ok(true)
+    }
+
     /// 记录 Komari 面板下发的 Ping 目标。这里只修改该 Reporter 的本地采集需求；
     /// 真正探测由全局 Ping worker 在配置通知后异步完成。
     pub fn learn_komari_ping(
@@ -767,6 +805,14 @@ impl SharedConfig {
             .iter_mut()
             .find(|r| r.id == reporter_id)
             .ok_or_else(|| anyhow::anyhow!("Reporter 不存在: {reporter_id}"))?;
+        // 协议守卫:ext.cf 只对 CF 协议 Reporter 有意义,其他线路收到应整体
+        // 拒绝,避免把无意义的协议扩展写进 TOML。
+        if ext.as_ref().is_some_and(|ext| ext.cf.is_some()) && reporter.protocol != "cf" {
+            bail!(
+                "ext.cf 仅对 CF 协议 Reporter 生效,当前协议: {}",
+                reporter.protocol
+            );
+        }
         if let Some(value) = intervals {
             reporter.intervals = value;
         }
@@ -840,12 +886,21 @@ fn validate_remote(remote: &RemoteConfig) -> Result<()> {
         }
     }
     if let Some(interfaces) = &remote.interfaces {
+        if interfaces.len() > MAX_REMOTE_PATTERNS {
+            bail!("远端 interfaces 数量超限(最多 {MAX_REMOTE_PATTERNS} 项)");
+        }
         validate_patterns("远端 interfaces", interfaces)?;
     }
     if let Some(disks) = &remote.disks {
+        if disks.len() > MAX_REMOTE_PATTERNS {
+            bail!("远端 disks 数量超限(最多 {MAX_REMOTE_PATTERNS} 项)");
+        }
         validate_patterns("远端 disks", disks)?;
     }
     if let Some(pings) = &remote.pings {
+        if pings.len() > MAX_REMOTE_PINGS {
+            bail!("远端 pings 数量超限(最多 {MAX_REMOTE_PINGS} 项)");
+        }
         validate_pings(pings).context("远端 pings 非法")?;
     }
     Ok(())

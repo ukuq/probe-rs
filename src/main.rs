@@ -103,12 +103,12 @@ async fn main() -> Result<()> {
 
     // The persistent traffic ledger captures all interfaces. Reporter-specific
     // filters and corrections are applied only when a payload is built.
-    {
+    let net_sampler_handle = {
         let net = net.clone();
         let clock = Arc::clone(&agent_clock);
         let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(net.sample_interval());
+            let mut ticker = crate::worker::ticker(net.sample_interval());
             let all = collector::net::IfaceFilter::all();
             loop {
                 tokio::select! {
@@ -123,17 +123,20 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-        });
-    }
+        })
+    };
 
     let (ping_tx, ping_rx) = watch::channel(worker::ping::PingSnapshot::new());
     let (gpu_name_tx, gpu_name_rx) = watch::channel::<Option<String>>(None);
     let (gpu_tx, gpu_rx) = watch::channel::<Vec<model::GpuRecord>>(Vec::new());
-    let (_ip_handle, ip_rx) = worker::public_ip::spawn(Arc::clone(&buffers), intervals_rx.clone());
-    let (_slow_handle, slow_rx, self_rx) =
+    let (ip_handle, ip_rx) = worker::public_ip::spawn(Arc::clone(&buffers), intervals_rx.clone());
+    watch_task("public-ip", ip_handle);
+    let (slow_handle, slow_rx, self_rx) =
         worker::slow::spawn(intervals_rx.clone(), Arc::clone(&buffers));
-    let (_diskio_handle, diskio_rx) =
+    watch_task("slow", slow_handle);
+    let (diskio_handle, diskio_rx) =
         worker::diskio::spawn(intervals_rx.clone(), Arc::clone(&buffers));
+    watch_task("diskio", diskio_handle);
 
     let init_cfg = shared.get();
     let init_pings = init_cfg.effective_pings();
@@ -181,18 +184,31 @@ async fn main() -> Result<()> {
                         let current_mtime = mtime(&watch_path);
                         if current_mtime == last_mtime { continue; }
                         last_mtime = current_mtime;
-                        match config::load(&watch_path) {
-                            Ok(cfg) => {
-                                if connection_signature(&cfg) != initial_connections {
-                                    tracing::warn!(
-                                        "Reporter endpoints/count changed; restart required, hot reload skipped"
-                                    );
-                                } else if cfg != shared.get() {
-                                    shared.update_local(cfg);
-                                    tracing::info!("config hot-reloaded");
+                        let cfg = match config::load(&watch_path) {
+                            Ok(cfg) => cfg,
+                            Err(error) => {
+                                tracing::warn!(%error, "config hot reload rejected");
+                                continue;
+                            }
+                        };
+                        if connection_signature(&cfg) != initial_connections {
+                            tracing::warn!(
+                                "Reporter endpoints/count changed; restart required, hot reload skipped"
+                            );
+                            continue;
+                        }
+                        if cfg != shared.get() {
+                            // 原子应用:写锁内复核 mtime,避免旧快照覆盖远端应用/
+                            // Komari 学习刚刚落盘的新配置(C1)。
+                            match shared.update_local_from_disk(&watch_path) {
+                                Ok(true) => tracing::info!("config hot-reloaded"),
+                                Ok(false) => tracing::debug!(
+                                    "config changed during reload; retrying next tick"
+                                ),
+                                Err(error) => {
+                                    tracing::warn!(%error, "config hot reload rejected")
                                 }
                             }
-                            Err(error) => tracing::warn!(%error, "config hot reload rejected"),
                         }
                     }
                     changed = config_rx.changed() => {
@@ -249,8 +265,9 @@ async fn main() -> Result<()> {
     let collector_handle = tokio::spawn(collector.run());
     tokio::task::yield_now().await;
 
-    // A separate runtime and, for Komari, a separate WebSocket worker is
-    // created for every configured Reporter, including same-protocol peers.
+    // Every configured Reporter gets its own runner task and, for Komari,
+    // an additional WebSocket worker task, including same-protocol peers.
+    let mut reporter_handles: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
     for spec in initial_specs {
         let reporter = Arc::new(
             reporter::Reporter::new(
@@ -265,7 +282,7 @@ async fn main() -> Result<()> {
         );
         let komari_tx = if spec.protocol == "komari" {
             let (tx, rx) = watch::channel(worker::komari::KomariOut::default());
-            worker::komari::spawn(
+            let komari_handle = worker::komari::spawn(
                 spec.id.clone(),
                 spec.worker_url.clone(),
                 spec.secret.clone(),
@@ -274,12 +291,13 @@ async fn main() -> Result<()> {
                 Arc::clone(&shared),
                 ping_rx.clone(),
             );
+            watch_task("komari", komari_handle);
             Some(tx)
         } else {
             None
         };
         let runner = scheduler::ReporterRunner::new(
-            spec.id,
+            spec.id.clone(),
             Arc::clone(&shared),
             Arc::clone(&buffers),
             reporter,
@@ -296,7 +314,7 @@ async fn main() -> Result<()> {
             AGENT_VERSION.to_string(),
             komari_tx,
         );
-        tokio::spawn(runner.run());
+        reporter_handles.push((spec.id.clone(), tokio::spawn(runner.run())));
     }
 
     tokio::spawn(async move {
@@ -307,9 +325,31 @@ async fn main() -> Result<()> {
     collector_handle
         .await
         .context("collection scheduler failed")?;
+    // 优雅退出:先等各路 Reporter 停止(完成最后一次上报),再等采样任务
+    // 收尾,最后 flush 流量账本,缩小丢失窗口。
+    for (reporter_id, handle) in reporter_handles {
+        if let Err(error) = handle.await {
+            tracing::error!(reporter_id = %reporter_id, error = %error, "Reporter 任务异常退出(panic)");
+        }
+    }
+    if let Err(error) = net_sampler_handle.await {
+        tracing::error!(error = %error, "netstatic 采样任务异常退出(panic)");
+    }
     net.flush();
     tracing::info!("probe-rs stopped");
     Ok(())
+}
+
+/// 后台任务监督:panic(或未预期的提前返回)必须产生可观察错误,而不是静默
+/// 永久停报。被显式 abort 的任务(配置重建/进程退出)不计为异常。
+fn watch_task(name: &'static str, handle: tokio::task::JoinHandle<()>) {
+    tokio::spawn(async move {
+        match handle.await {
+            Ok(()) => tracing::debug!(task = name, "后台任务正常退出"),
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => tracing::error!(task = name, error = %error, "后台任务异常退出(panic)"),
+        }
+    });
 }
 
 use std::time::Duration;
