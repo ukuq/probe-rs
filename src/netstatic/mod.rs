@@ -15,7 +15,9 @@ use crate::collector::net::{self, IfaceFilter, NetBytes};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 const SAVE_INTERVAL: Duration = Duration::from_secs(600);
-const RETAIN: chrono::Duration = chrono::Duration::days(31);
+// 保留期必须严格大于最长账期(31 天),否则 reset_day 28-31 的账期首日
+// 明细会在账期内被归档,而非永久累计的月查询不读归档基数,月流量永久少计。
+const RETAIN: chrono::Duration = chrono::Duration::days(32);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct Entry {
@@ -126,12 +128,23 @@ struct Inner {
     store: StoreFile,
     last_save: Instant,
     dirty: bool,
+    /// 每次标记 dirty 时递增;flush 成功且期间无新变更才允许清 dirty,
+    /// 避免把"落盘期间产生的新数据"误标为已持久化。
+    dirty_generation: u64,
+}
+
+fn mark_dirty(inner: &mut Inner) {
+    inner.dirty = true;
+    inner.dirty_generation = inner.dirty_generation.saturating_add(1);
 }
 
 #[derive(Clone)]
 pub struct NetStatic {
     inner: Arc<Mutex<Inner>>,
     path: Arc<PathBuf>,
+    /// 串行化 flush:采样 flush_if_due 与退出 flush 可能并发触发,
+    /// 固定 tmp 名下的并发写会让旧快照覆盖新快照。
+    flush_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -177,8 +190,10 @@ impl NetStatic {
                 store,
                 last_save: Instant::now(),
                 dirty: migrated,
+                dirty_generation: 0,
             })),
             path: Arc::new(path.to_path_buf()),
+            flush_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -214,21 +229,26 @@ impl NetStatic {
                 ts: now,
                 calibrated: true,
             });
-            inner.dirty = true;
+            mark_dirty(&mut inner);
         }
         for (name, counters) in current {
-            let (rx_delta, tx_delta) = match inner.store.last_counters.insert(name.clone(), counters)
-            {
-                Some(prev) if prev != counters => {
-                    inner.dirty = true;
-                    (
-                        net::counter_delta(counters.rx, prev.rx),
-                        net::counter_delta(counters.tx, prev.tx),
-                    )
-                }
-                Some(_) => (0, 0),
-                None => (0, 0),
-            };
+            let (rx_delta, tx_delta) =
+                match inner.store.last_counters.insert(name.clone(), counters) {
+                    Some(prev) if prev != counters => {
+                        mark_dirty(&mut inner);
+                        (
+                            net::counter_delta(counters.rx, prev.rx),
+                            net::counter_delta(counters.tx, prev.tx),
+                        )
+                    }
+                    Some(_) => (0, 0),
+                    // 新网卡/新账本的计数器基线同样需要持久化,否则停机流量
+                    // 捕获的基线会在崩溃时丢失。
+                    None => {
+                        mark_dirty(&mut inner);
+                        (0, 0)
+                    }
+                };
             if rx_delta == 0 && tx_delta == 0 {
                 continue;
             }
@@ -240,12 +260,11 @@ impl NetStatic {
                     tx: tx_delta,
                 },
             );
-            inner.dirty = true;
+            mark_dirty(&mut inner);
         }
         // 校准时钟与本地时钟混用会污染归档边界：只在采样时钟与账本时钟
         // 同域时清理——已校准，或账本从未见过校准时间（全部条目都是本地时钟）。
-        let can_prune =
-            calibrated || inner.store.ledger_time.is_none_or(|time| !time.calibrated);
+        let can_prune = calibrated || inner.store.ledger_time.is_none_or(|time| !time.calibrated);
         drop(inner);
         if can_prune {
             self.prune(now);
@@ -260,7 +279,9 @@ impl NetStatic {
         for interface in interfaces {
             archived |= archive_before(&mut inner.store, &interface, cutoff);
         }
-        inner.dirty |= archived;
+        if archived {
+            mark_dirty(&mut inner);
+        }
     }
 
     /// Latest persisted timestamp known to be in the calibrated ledger domain.
@@ -432,6 +453,42 @@ impl NetStatic {
         tx_gb: f64,
         confirm_pending: bool,
     ) {
+        // 幂等:相同 reporter + period_start + GB 原值视为同一命令。若按已经
+        // 增长的 raw 累计重算 offset,校正后的显示值会被拉回服务端目标值,
+        // 期间新增流量被暂时吞掉;重发只应恢复确认状态。
+        let same_command = {
+            let inner = self.inner.lock().expect("netstatic lock poisoned");
+            inner.store.corrections.get(reporter_id).is_some_and(|c| {
+                c.period_start == period_start && c.rx_gb == rx_gb && c.tx_gb == tx_gb
+            })
+        };
+        if same_command {
+            let changed = {
+                let mut inner = self.inner.lock().expect("netstatic lock poisoned");
+                let correction = inner
+                    .store
+                    .corrections
+                    .get_mut(reporter_id)
+                    .expect("checked correction exists");
+                let changed = !correction.confirm_pending && confirm_pending;
+                if confirm_pending {
+                    correction.confirm_pending = true;
+                    mark_dirty(&mut inner);
+                }
+                changed
+            };
+            if changed {
+                self.flush();
+            }
+            tracing::info!(
+                reporter_id,
+                rx_gb,
+                tx_gb,
+                "相同校正命令,已恢复确认状态,offset 保持不变"
+            );
+            return;
+        }
+
         const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
         let rx_bytes = (rx_gb * GIB).round() as i64;
         let tx_bytes = (tx_gb * GIB).round() as i64;
@@ -448,7 +505,7 @@ impl NetStatic {
                     confirm_pending,
                 },
             );
-            inner.dirty = true;
+            mark_dirty(&mut inner);
         }
         self.flush();
         tracing::info!(reporter_id, rx_gb, tx_gb, confirm_pending, "流量校正已应用");
@@ -473,7 +530,7 @@ impl NetStatic {
             match inner.store.corrections.get_mut(reporter_id) {
                 Some(c) if c.confirm_pending => {
                     c.confirm_pending = false;
-                    inner.dirty = true;
+                    mark_dirty(&mut inner);
                     true
                 }
                 _ => false,
@@ -496,23 +553,42 @@ impl NetStatic {
     }
 
     pub fn flush(&self) {
-        let data = {
-            let mut inner = self.inner.lock().expect("netstatic lock poisoned");
-            inner.last_save = Instant::now();
-            inner.dirty = false;
+        let _guard = self
+            .flush_lock
+            .lock()
+            .expect("netstatic flush lock poisoned");
+        let (data, generation) = {
+            let inner = self.inner.lock().expect("netstatic lock poisoned");
             match serde_json::to_vec(&inner.store) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!(error = %e, "netstatic 序列化失败");
+                Ok(data) => (data, inner.dirty_generation),
+                Err(error) => {
+                    // 序列化失败不清 dirty、不推进 last_save,下次 flush 重试。
+                    tracing::warn!(error = %error, "netstatic 序列化失败");
                     return;
                 }
             }
         };
         let path = self.path.clone();
-        let _ = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")));
-        let tmp = path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, data).and_then(|_| std::fs::rename(&tmp, &*path)) {
-            tracing::warn!(error = %e, path = %path.display(), "netstatic 落盘失败");
+        let write_result = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))
+            .and_then(|_| {
+                let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+                std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &*path))
+            });
+        if let Err(error) = write_result {
+            // 保留 dirty 与旧 last_save,flush_if_due / 退出 flush 会重试。
+            tracing::warn!(
+                error = %error,
+                path = %path.display(),
+                "netstatic 落盘失败(保留 dirty 待重试)"
+            );
+            return;
+        }
+        let mut inner = self.inner.lock().expect("netstatic lock poisoned");
+        inner.last_save = Instant::now();
+        // 落盘期间新产生的变更已推进 generation;只有快照仍是最新时才可清 dirty,
+        // 否则新数据会等到下一个 SAVE_INTERVAL 才被持久化。
+        if inner.dirty_generation == generation {
+            inner.dirty = false;
         }
     }
 
@@ -630,7 +706,7 @@ mod tests {
         let (_, path) = tmp_ns("lifetime");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let now = crate::model::now_millis();
-        let old = now - chrono::Duration::days(32).num_milliseconds();
+        let old = now - chrono::Duration::days(33).num_milliseconds();
         let recent = now - 1_000;
         let store = StoreFile {
             interfaces: BTreeMap::from([
@@ -710,10 +786,7 @@ mod tests {
         let (_, path) = tmp_ns("downtime");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let store = StoreFile {
-            last_counters: BTreeMap::from([(
-                "eth0".into(),
-                NetBytes { rx: 1000, tx: 2000 },
-            )]),
+            last_counters: BTreeMap::from([("eth0".into(), NetBytes { rx: 1000, tx: 2000 })]),
             ..Default::default()
         };
         std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
@@ -721,7 +794,12 @@ mod tests {
         let ns = NetStatic::load(&path);
         // 重启后第一次采样：计数器从 1000/2000 涨到 1600/2300（停机期间的
         // 流量），delta 应计入账本而不是记 (0,0)。
-        ns.sample_with(&IfaceFilter::new(&[]), [("eth0", 1600, 2300)], 10_000, false);
+        ns.sample_with(
+            &IfaceFilter::new(&[]),
+            [("eth0", 1600, 2300)],
+            10_000,
+            false,
+        );
         assert_eq!(ns.query(&IfaceFilter::new(&[]), 0, 10_000), (600, 300));
 
         // 机器重启导致计数器归零：saturating_sub 得 0，不虚增。
@@ -778,6 +856,96 @@ mod tests {
         let inner = ns2.inner.lock().unwrap();
         assert_eq!(inner.store.interfaces["eth1"].len(), 1);
         drop(inner);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn retention_window_keeps_the_first_day_of_a_31_day_period() {
+        let (ns, path) = tmp_ns("retain-32d");
+        let now = crate::model::now_millis();
+        let first_day = now - chrono::Duration::days(31).num_milliseconds();
+        {
+            let mut inner = ns.inner.lock().unwrap();
+            inner.store.interfaces.insert(
+                "eth0".into(),
+                [Entry {
+                    ts: first_day,
+                    rx: 100,
+                    tx: 200,
+                }]
+                .into(),
+            );
+        }
+        // 32 天保留期下,31 天前的账期首日仍在明细窗口内,不被归档。
+        ns.sample_with(&IfaceFilter::new(&[]), [("eth0", 1, 1)], now, false);
+        {
+            let inner = ns.inner.lock().unwrap();
+            assert_eq!(inner.store.interfaces["eth0"].len(), 1);
+            assert!(
+                inner.store.archived_totals.get("eth0").is_none(),
+                "31 天账期的首日明细不得在 32 天保留期内被归档"
+            );
+        }
+        // 非永久累计查询(账期起点 = 31 天前)必须能看到这一条。
+        let (rx, tx) = ns.query(&IfaceFilter::new(&[]), first_day, now);
+        assert_eq!((rx, tx), (100, 200));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn flush_failure_keeps_dirty_and_recovers() {
+        let dir =
+            std::env::temp_dir().join(format!("probe-rs-ns-flushfail-{}", std::process::id()));
+        let blocker = dir.join("blocker");
+        // 用普通文件占住目录位置,使 create_dir_all 失败。
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join("net.json");
+        let ns = NetStatic::load(&path);
+        ns.sample_with(&IfaceFilter::new(&[]), [("eth0", 100, 200)], 10_000, false);
+        assert!(ns.inner.lock().unwrap().dirty);
+        ns.flush();
+        assert!(
+            ns.inner.lock().unwrap().dirty,
+            "落盘失败后 dirty 必须保留,等待重试"
+        );
+        assert!(!path.exists());
+        // 解除阻塞后重试成功,dirty 清空。
+        std::fs::remove_file(&blocker).unwrap();
+        ns.flush();
+        assert!(!ns.inner.lock().unwrap().dirty);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("last_counters"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn repeated_identical_correction_does_not_recompute_offset() {
+        let (ns, path) = tmp_ns("correction-idem");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        ns.apply_correction("cf", 1_000, (1_000_000, 2_000_000), 1.0, 2.0);
+        let first = {
+            let inner = ns.inner.lock().unwrap();
+            let c = inner.store.corrections["cf"];
+            (c.rx_offset, c.tx_offset, c.confirm_pending)
+        };
+        assert!(first.2);
+        // 期间新增流量:raw 累计增长,服务端重发同一命令。
+        ns.apply_correction("cf", 1_000, (5_000_000, 6_000_000), 1.0, 2.0);
+        let second = {
+            let inner = ns.inner.lock().unwrap();
+            let c = inner.store.corrections["cf"];
+            (c.rx_offset, c.tx_offset, c.confirm_pending)
+        };
+        assert_eq!(first, second, "相同命令不得按增长的 raw 累计重算 offset");
+        // 本地同值校正(confirm_pending=false)不改变确认状态,也不重算。
+        ns.apply_local_correction("cf", 1_000, (9_000_000, 9_000_000), 1.0, 2.0);
+        let third = {
+            let inner = ns.inner.lock().unwrap();
+            let c = inner.store.corrections["cf"];
+            (c.rx_offset, c.tx_offset, c.confirm_pending)
+        };
+        assert_eq!(first, third);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
