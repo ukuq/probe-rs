@@ -18,6 +18,12 @@ const SAVE_INTERVAL: Duration = Duration::from_secs(600);
 // 保留期必须严格大于最长账期(31 天),否则 reset_day 28-31 的账期首日
 // 明细会在账期内被归档,而非永久累计的月查询不读归档基数,月流量永久少计。
 const RETAIN: chrono::Duration = chrono::Duration::days(32);
+/// 24h 内保留 2s 粒度明细；更老的条目在 prune 时合并为小时桶（桶 ts 取该
+/// 小时首条）。桶是原子的：恰好跨账期起点的小时桶整体计入/排除，边界误差
+/// 上限 1 小时流量且只影响 24h 以前的数据（CF 校正本身以 GB 取整）。
+/// 没有它，繁忙网卡 32 天会累积 ~1.4M 条明细，内存与每次落盘都全量承受。
+const FINE_RETAIN: chrono::Duration = chrono::Duration::hours(24);
+const BUCKET_MS: i64 = 3_600_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct Entry {
@@ -59,7 +65,7 @@ pub struct Correction {
     pub confirm_pending: bool,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct StoreFile {
     interfaces: BTreeMap<String, VecDeque<Entry>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,6 +128,57 @@ fn archive_before(store: &mut StoreFile, interface: &str, cutoff: i64) -> bool {
         total.tx = total.tx.saturating_add(archived.tx);
     }
     removed
+}
+
+/// 把 `cutoff` 之前的明细合并为小时桶（桶 ts = 该小时首条 ts）。条目按 ts
+/// 有序，旧前缀逐小时累加；只在确实存在同小时多条时才重建。
+fn coarsen_entries(entries: &mut VecDeque<Entry>, cutoff: i64) -> bool {
+    let mut needs_merge = false;
+    let mut previous_hour: Option<i64> = None;
+    for entry in entries.iter() {
+        if entry.ts >= cutoff {
+            break;
+        }
+        let hour = entry.ts.div_euclid(BUCKET_MS);
+        if previous_hour == Some(hour) {
+            needs_merge = true;
+            break;
+        }
+        previous_hour = Some(hour);
+    }
+    if !needs_merge {
+        return false;
+    }
+    let mut buckets: VecDeque<Entry> = VecDeque::new();
+    while entries.front().is_some_and(|entry| entry.ts < cutoff) {
+        let entry = entries.pop_front().expect("checked front");
+        match buckets.back_mut() {
+            Some(bucket) if bucket.ts.div_euclid(BUCKET_MS) == entry.ts.div_euclid(BUCKET_MS) => {
+                bucket.rx = bucket.rx.saturating_add(entry.rx);
+                bucket.tx = bucket.tx.saturating_add(entry.tx);
+            }
+            _ => buckets.push_back(entry),
+        }
+    }
+    while let Some(bucket) = buckets.pop_back() {
+        entries.push_front(bucket);
+    }
+    true
+}
+
+/// 已按 ts 有序的队列中，首个 ts >= threshold 的下标（二分查找）。
+fn lower_bound_ts(entries: &VecDeque<Entry>, threshold: i64) -> usize {
+    let mut low = 0;
+    let mut high = entries.len();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if entries[mid].ts < threshold {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    low
 }
 
 struct Inner {
@@ -273,13 +330,18 @@ impl NetStatic {
 
     fn prune(&self, now: i64) {
         let cutoff = now - RETAIN.num_milliseconds();
+        let fine_cutoff = now - FINE_RETAIN.num_milliseconds();
         let mut inner = self.inner.lock().expect("netstatic lock poisoned");
         let interfaces: Vec<_> = inner.store.interfaces.keys().cloned().collect();
         let mut archived = false;
+        let mut coarsened = false;
         for interface in interfaces {
             archived |= archive_before(&mut inner.store, &interface, cutoff);
+            if let Some(entries) = inner.store.interfaces.get_mut(&interface) {
+                coarsened |= coarsen_entries(entries, fine_cutoff);
+            }
         }
-        if archived {
+        if archived || coarsened {
             mark_dirty(&mut inner);
         }
     }
@@ -312,11 +374,13 @@ impl NetStatic {
             if !filter.includes(name) {
                 continue;
             }
-            for e in entries {
-                if e.ts >= start_ms && e.ts <= now_ms {
-                    rx = rx.saturating_add(e.rx);
-                    tx = tx.saturating_add(e.tx);
+            // 条目按 ts 有序：二分定位窗口起点，避免整表线性扫描。
+            for entry in entries.range(lower_bound_ts(entries, start_ms)..) {
+                if entry.ts > now_ms {
+                    break;
                 }
+                rx = rx.saturating_add(entry.rx);
+                tx = tx.saturating_add(entry.tx);
             }
         }
         (rx, tx)
@@ -357,8 +421,7 @@ impl NetStatic {
                     .interfaces
                     .get(name)
                     .into_iter()
-                    .flatten()
-                    .filter(|entry| entry.ts >= start)
+                    .flat_map(|list| list.range(lower_bound_ts(list, start)..))
                     .peekable();
                 let archived = (start <= 0)
                     .then(|| inner.store.archived_totals.get(name))
@@ -541,7 +604,38 @@ impl NetStatic {
         }
     }
 
-    /// 到点（10min）或退出时落盘；tmp + rename 原子写
+    /// apply_correction 的 runtime 外版本：落盘含 fsync 的全量写，调用方在
+    /// 异步上下文时应使用它，避免阻塞 runtime worker 线程。
+    pub async fn apply_correction_off_runtime(
+        &self,
+        reporter_id: &str,
+        period_start: i64,
+        raw_monthly: (u64, u64),
+        rx_gb: f64,
+        tx_gb: f64,
+    ) {
+        let net = self.clone();
+        let reporter_id = reporter_id.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            net.apply_correction(&reporter_id, period_start, raw_monthly, rx_gb, tx_gb)
+        })
+        .await;
+        if let Err(error) = result {
+            tracing::error!(%error, "netstatic apply_correction 后台任务 panic");
+        }
+    }
+
+    /// clear_confirm 的 runtime 外版本，同 [`Self::apply_correction_off_runtime`]。
+    pub async fn clear_confirm_off_runtime(&self, reporter_id: &str) {
+        let net = self.clone();
+        let reporter_id = reporter_id.to_string();
+        let result = tokio::task::spawn_blocking(move || net.clear_confirm(&reporter_id)).await;
+        if let Err(error) = result {
+            tracing::error!(%error, "netstatic clear_confirm 后台任务 panic");
+        }
+    }
+
+    /// 到点（10min）或退出时落盘；tmp + rename + fsync 原子写
     pub fn flush_if_due(&self) {
         let should = {
             let inner = self.inner.lock().expect("netstatic lock poisoned");
@@ -557,22 +651,25 @@ impl NetStatic {
             .flush_lock
             .lock()
             .expect("netstatic flush lock poisoned");
-        let (data, generation) = {
+        // 锁内只做快照(clone 是连续内存拷贝,远快于序列化),序列化与写盘
+        // 都在锁外——期间 reporter 的 query/query_batch 最多等一次拷贝。
+        let (store, generation) = {
             let inner = self.inner.lock().expect("netstatic lock poisoned");
-            match serde_json::to_vec(&inner.store) {
-                Ok(data) => (data, inner.dirty_generation),
-                Err(error) => {
-                    // 序列化失败不清 dirty、不推进 last_save,下次 flush 重试。
-                    tracing::warn!(error = %error, "netstatic 序列化失败");
-                    return;
-                }
+            (inner.store.clone(), inner.dirty_generation)
+        };
+        let data = match serde_json::to_vec(&store) {
+            Ok(data) => data,
+            Err(error) => {
+                // 序列化失败不清 dirty、不推进 last_save,下次 flush 重试。
+                tracing::warn!(error = %error, "netstatic 序列化失败");
+                return;
             }
         };
         let path = self.path.clone();
         let write_result = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))
             .and_then(|_| {
                 let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-                std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &*path))
+                write_durable(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &*path))
             });
         if let Err(error) = write_result {
             // 保留 dirty 与旧 last_save,flush_if_due / 退出 flush 会重试。
@@ -583,6 +680,7 @@ impl NetStatic {
             );
             return;
         }
+        sync_parent_dir(&path);
         let mut inner = self.inner.lock().expect("netstatic lock poisoned");
         inner.last_save = Instant::now();
         // 落盘期间新产生的变更已推进 generation;只有快照仍是最新时才可清 dirty,
@@ -596,6 +694,27 @@ impl NetStatic {
         SAMPLE_INTERVAL
     }
 }
+
+/// 写入并 fsync：rename 只保证进程崩溃下的原子替换；没有 fsync，断电后
+/// 可能留下 0 字节/半截文件，而 load 对损坏文件会静默清零整个账本。
+fn write_durable(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(data)?;
+    file.sync_all()
+}
+
+/// rename 的目录项也要落盘,否则断电时 rename 本身可能丢失。
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) {
+    let Some(parent) = path.parent() else { return };
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) {}
 
 /// 读全部网卡计数器（经平台门面），白名单在采样时生效
 fn read_per_iface(filter: &IfaceFilter) -> HashMap<String, NetBytes> {
@@ -772,6 +891,44 @@ mod tests {
         assert_eq!(reloaded.query(&all, 0, now), (111, 222));
         assert_eq!(reloaded.query(&all, month_start, now), (1, 2));
 
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn prune_coarsens_old_entries_into_hourly_buckets_without_losing_totals() {
+        let (ns, path) = tmp_ns("coarsen");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // 小时对齐的起点，取 26h 前：两小时明细整体落在 24h 粗化窗口之外。
+        let base = 472_223_i64 * 3_600_000;
+        // i=0 只建立计数器基线；i=1..=3600 每条 delta 1000，明细共两小时。
+        for i in 0..=3600u64 {
+            let ts = base + (i as i64) * 2_000;
+            ns.sample_with(&IfaceFilter::all(), [("eth0", i * 1000, 0)], ts, false);
+        }
+        let now = base + 26 * 3_600_000;
+        ns.sample_with(
+            &IfaceFilter::all(),
+            [("eth0", 3_600_000 + 999_999, 7)],
+            now,
+            false,
+        );
+
+        {
+            let inner = ns.inner.lock().unwrap();
+            let entries = &inner.store.interfaces["eth0"];
+            // 2 个小时桶 + 1 条恰好落在粗化边界上的明细 + 1 条新明细，
+            // 而不是 3600+ 条。
+            assert_eq!(entries.len(), 4, "entries not coarsened");
+        }
+        // 总量守恒：3600 条 ×1000 + 最后一条 delta。
+        let all = IfaceFilter::new(&[]);
+        assert_eq!(ns.query(&all, base, now), (3_600 * 1000 + 999_999, 7));
+        // 从首个桶的 ts 起查，整个桶计入。
+        assert_eq!(ns.query(&all, base + 2_000, now).0, 3_600 * 1000 + 999_999);
+
+        ns.flush();
+        let reloaded = NetStatic::load(&path);
+        assert_eq!(reloaded.query(&all, base, now), (3_600 * 1000 + 999_999, 7));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

@@ -8,7 +8,9 @@ use tokio::sync::watch;
 
 use crate::config::{AutoUpdateConfig, LocalConfig, UpdateChannel};
 
-const RELEASES_API: &str = "https://api.github.com/repos/ukuq/probe-rs/releases";
+/// 发布源身份：所有 GitHub URL（含资产下载域的前缀安全检查）都从该常量派生，
+/// 仓库迁移时只改这一处。
+const GITHUB_REPO: &str = "ukuq/probe-rs";
 const CHECKSUM_ASSET: &str = "SHA256SUMS";
 const MAX_BINARY_BYTES: usize = 100 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: usize = 1024 * 1024;
@@ -243,13 +245,18 @@ async fn install_staged_update(staging: &tempfile::NamedTempFile) -> Result<Chec
     Ok(CheckOutcome::Restart)
 }
 
+fn releases_api() -> String {
+    format!("https://api.github.com/repos/{GITHUB_REPO}/releases")
+}
+
 async fn fetch_releases(
     client: &reqwest::Client,
     channel: UpdateChannel,
 ) -> Result<Vec<GithubRelease>> {
+    let api = releases_api();
     let request = match channel {
-        UpdateChannel::Stable => client.get(format!("{RELEASES_API}/latest")),
-        UpdateChannel::Prerelease => client.get(format!("{RELEASES_API}?per_page=30")),
+        UpdateChannel::Stable => client.get(format!("{api}/latest")),
+        UpdateChannel::Prerelease => client.get(format!("{api}?per_page=30")),
     }
     .header("Accept", "application/vnd.github+json")
     .header("X-GitHub-Api-Version", "2022-11-28");
@@ -346,7 +353,7 @@ async fn download_limited(
 
 fn validate_release_download_url(url: &str, tag: &str) -> Result<()> {
     let url = reqwest::Url::parse(url).context("invalid release asset URL")?;
-    let expected_prefix = format!("/ukuq/probe-rs/releases/download/{tag}/");
+    let expected_prefix = format!("/{GITHUB_REPO}/releases/download/{tag}/");
     if url.scheme() != "https"
         || url.host_str() != Some("github.com")
         || !url.path().starts_with(&expected_prefix)
@@ -680,11 +687,52 @@ fn windows_previous_executable_path(file_name: &std::ffi::OsStr) -> Result<std::
 #[cfg(windows)]
 fn windows_agent_process_running(previous_process_id: u32) -> std::io::Result<bool> {
     let current_id = std::process::id();
+    // 同名进程不足以证明"本安装已重启"——一台主机可能装有多套 probe-rs。
+    // 只把可执行文件位于本安装目录内的进程视为本实例;取不到自身路径时
+    // 宁可返回 false(继续走 schtasks 拉起,对已运行的任务无害)。
+    let install_directory = std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(std::path::Path::to_path_buf));
     windows_process_matches(|process_id, process_name| {
-        process_id != current_id
-            && process_id != previous_process_id
-            && process_name.eq_ignore_ascii_case("probe-rs.exe")
+        if process_id == current_id
+            || process_id == previous_process_id
+            || !process_name.eq_ignore_ascii_case("probe-rs.exe")
+        {
+            return false;
+        }
+        install_directory
+            .as_deref()
+            .is_some_and(|directory| process_image_in_directory(process_id, directory))
     })
+}
+
+/// 进程可执行文件完整路径是否位于 `directory` 内。查询失败按"不是"处理。
+#[cfg(windows)]
+fn process_image_in_directory(process_id: u32, directory: &std::path::Path) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
+        if handle.is_null() {
+            return false;
+        }
+        let mut buffer = [0_u16; 1024];
+        let mut size = buffer.len() as u32;
+        let queried =
+            QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut size);
+        CloseHandle(handle);
+        if queried == 0 {
+            return false;
+        }
+        let image = String::from_utf16_lossy(&buffer[..size as usize]);
+        std::path::Path::new(&image)
+            .parent()
+            .is_some_and(|parent| parent == directory)
+    }
 }
 
 #[cfg(windows)]

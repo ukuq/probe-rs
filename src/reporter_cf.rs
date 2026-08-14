@@ -496,6 +496,10 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
     }
     if let (Some(rx), Some(tx)) = (rx_gb, tx_gb) {
         correction = Some((rx, tx));
+    } else if rx_gb.is_some() != tx_gb.is_some() {
+        // CF 校正必须成对下发。单侧出现说明服务端异常：显式告警而不是静默
+        // 忽略——静默会让服务端永远重推、用户永远看不到原因。
+        tracing::warn!("CF 校正只包含单侧 rx/tx，已整体忽略");
     }
     if has_config {
         push.version = match md5_header.filter(|s| !s.is_empty()) {

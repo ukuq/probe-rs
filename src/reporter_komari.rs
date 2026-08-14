@@ -9,6 +9,33 @@ use serde_json::{json, Value};
 
 use crate::model::{DynamicRecord, ErrorRecord, GpuRecord, SlowBlock, StaticInfo};
 
+/// message 字段最多携带的错误条数与总字节数：无界拼接会把整个未确认
+/// journal 的错误塞进单个 WS 帧。
+const MAX_MESSAGE_ERRORS: usize = 20;
+const MAX_MESSAGE_BYTES: usize = 2048;
+
+fn build_message(errors: &[ErrorRecord]) -> String {
+    // 取最近的若干条并保持时间顺序。
+    let mut parts: Vec<String> = errors
+        .iter()
+        .rev()
+        .take(MAX_MESSAGE_ERRORS)
+        .map(|e| format!("[{}] {}", e.source, e.msg))
+        .collect();
+    parts.reverse();
+    let mut message = parts.join("; ");
+    if message.len() > MAX_MESSAGE_BYTES {
+        // 字节截断回退到字符边界，避免 panic。
+        let mut end = MAX_MESSAGE_BYTES;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        message.push_str("; …");
+    }
+    message
+}
+
 /// komari agent.report 的内层指标对象（只含最新值；缺失字段不输出）
 pub fn build_report(
     st: &StaticInfo,
@@ -42,8 +69,7 @@ pub fn build_report(
             .boot_time
             .map(|boot| ((now_ms - boot).max(0) / 1000) as u64)
             .unwrap_or(0),
-        "message": errors.iter().map(|e| format!("[{}] {}", e.source, e.msg))
-            .collect::<Vec<_>>().join("; "),
+        "message": build_message(errors),
     });
     if let Some(l) = d.load {
         out["load"] = json!({ "load1": l[0], "load5": l[1], "load15": l[2] });

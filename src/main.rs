@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config_path = parse_config_arg();
+    let config_path = parse_config_arg().context("invalid command line arguments")?;
     let local = config::load(&config_path).context("failed to load config")?;
     let initial_specs = local.reporter_specs();
     let agent_clock = Arc::new(reporter::AgentClock::default());
@@ -92,7 +92,9 @@ async fn main() -> Result<()> {
     let net = netstatic::NetStatic::load_with_legacy_reporter(&net_static_path, legacy_cf_reporter);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (update_check_tx, update_check_rx) = watch::channel(0_u64);
-    let _ntp_refresh_handle = agent_clock.spawn_ntp_refresh(shutdown_rx.clone());
+    // NTP 刷新与其他后台任务同样纳入监督：panic 不能静默停摆校准时钟。
+    let ntp_refresh_handle = agent_clock.spawn_ntp_refresh(shutdown_rx.clone());
+    watch_task("ntp-refresh", ntp_refresh_handle);
 
     updater::spawn(
         shared.subscribe_config(),
@@ -115,8 +117,20 @@ async fn main() -> Result<()> {
                     _ = ticker.tick() => {
                         let report_time = clock.report_time();
                         let sample_time = report_time.accurate_ts.unwrap_or(report_time.local_ts);
-                        net.sample(&all, sample_time, report_time.accurate_ts.is_some());
-                        net.flush_if_due();
+                        let calibrated = report_time.accurate_ts.is_some();
+                        // 采样(sysinfo 全网卡枚举)与落盘(全量写+fsync)都是
+                        // 阻塞操作,移出 runtime worker,避免卡住同线程的
+                        // WS 保活/上报任务。
+                        let net = net.clone();
+                        let filter = all.clone();
+                        let sampled = tokio::task::spawn_blocking(move || {
+                            net.sample(&filter, sample_time, calibrated);
+                            net.flush_if_due();
+                        })
+                        .await;
+                        if let Err(error) = sampled {
+                            tracing::error!(%error, "netstatic 采样任务 panic,下个周期重试");
+                        }
                     }
                     changed = shutdown_rx.changed() => {
                         if changed.is_err() || *shutdown_rx.borrow() { break; }
@@ -183,17 +197,26 @@ async fn main() -> Result<()> {
                     _ = ticker.tick() => {
                         let current_mtime = mtime(&watch_path);
                         if current_mtime == last_mtime { continue; }
-                        last_mtime = current_mtime;
+                        // mtime 只在处理成功后推进：读到写了一半的文件（解析失败）
+                        // 时下轮重试，而不是把这次半成品 mtime 记为已见、永久跳过。
                         match shared.update_local_from_disk(&watch_path, |cfg| {
                             connection_signature(cfg) == initial_connections
                         }) {
-                            Ok(LocalReload::Applied) => tracing::info!("config hot-reloaded"),
-                            Ok(LocalReload::Unchanged) => {}
-                            Ok(LocalReload::RestartRequired) => tracing::warn!(
-                                "Reporter endpoints/count changed; restart required, hot reload skipped"
-                            ),
+                            Ok(LocalReload::Applied) => {
+                                last_mtime = current_mtime;
+                                tracing::info!("config hot-reloaded");
+                            }
+                            Ok(LocalReload::Unchanged) => {
+                                last_mtime = current_mtime;
+                            }
+                            Ok(LocalReload::RestartRequired) => {
+                                last_mtime = current_mtime;
+                                tracing::warn!(
+                                    "Reporter endpoints/count changed; restart required, hot reload skipped"
+                                );
+                            }
                             Err(error) => {
-                                tracing::warn!(%error, "config hot reload rejected")
+                                tracing::warn!(%error, "config hot reload failed; will retry")
                             }
                         }
                     }
@@ -356,22 +379,28 @@ fn connection_signature(cfg: &LocalConfig) -> Vec<(String, String, String, Strin
         .collect()
 }
 
-fn parse_config_arg() -> PathBuf {
+fn parse_config_arg() -> Result<PathBuf> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-c" | "--config" => {
-                if let Some(path) = args.next() {
-                    return PathBuf::from(path);
-                }
+                // 缺值必须报错：静默回退默认路径会连到错误的服务端。
+                let Some(path) = args.next() else {
+                    anyhow::bail!("{arg} 需要一个配置文件路径");
+                };
+                return Ok(PathBuf::from(path));
             }
             _ if arg.starts_with("--config=") => {
-                return PathBuf::from(arg.trim_start_matches("--config="));
+                let path = arg.trim_start_matches("--config=");
+                if path.is_empty() {
+                    anyhow::bail!("--config= 需要一个配置文件路径");
+                }
+                return Ok(PathBuf::from(path));
             }
             _ => {}
         }
     }
-    config::default_config_path()
+    Ok(config::default_config_path())
 }
 
 async fn wait_for_signal() {

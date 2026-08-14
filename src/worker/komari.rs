@@ -221,15 +221,16 @@ fn handle_downstream(
 
     // v1 遗留：{"message":"terminal","request_id":...}
     let legacy_msg = v.get("message").and_then(Value::as_str).unwrap_or("");
-    // method 优先：已知 v2 method 直接分发；只有无 method 的 v1 遗留帧才按
-    // 字段存在性识别——新帧类型碰巧带 request_id/ping_task_id 不会被误路由。
+    // method 优先：已知 v2 method 直接分发；无 method 的帧只按 v1 遗留的
+    // message 字段识别 exec/terminal。仅凭 request_id 字段存在不再判定为
+    // 终端请求——那会把任意携带该字段的新帧型变成一次带 token 的外呼。
     let (is_exec, is_terminal, is_ping) = match method {
         "agent.exec" => (true, false, false),
         "agent.terminal.request" => (false, true, false),
         "agent.ping" => (false, false, true),
         "" => (
             legacy_msg == "exec",
-            legacy_msg == "terminal" || v.get("request_id").is_some(),
+            legacy_msg == "terminal",
             v.get("ping_task_id").is_some(),
         ),
         _ => (false, false, false),
@@ -394,14 +395,20 @@ async fn reject_exec(endpoint: &str, token: &str, task_id: &str) {
     let _ = client.post(url).json(&body).send().await;
 }
 
-/// terminal 回绝：拨通终端 WS 发一句说明即关闭（浏览器立即可见，不再空转 30s）
+/// terminal 回绝：拨通终端 WS 发一句说明即关闭（浏览器立即可见，不再空转 30s）。
+/// 整体限时 5s：故障服务端半开连接时不能让回绝任务永久挂起累积。
 async fn reject_terminal(endpoint: &str, token: &str, request_id: &str) {
     let base = endpoint.trim_end_matches('/').replacen("http", "ws", 1);
     let url = format!(
         "{base}/api/clients/terminal?token={}&id={request_id}",
         url_token(token)
     );
-    if let Ok((mut ws, _)) = tokio_tungstenite::connect_async(url).await {
+    if let Ok(Ok((mut ws, _))) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(url),
+    )
+    .await
+    {
         let _ = ws
             .send(Message::Text(
                 "该探针不支持远程终端（安全策略）\nRemote terminal is disabled by probe-rs.\n"

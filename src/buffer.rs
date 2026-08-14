@@ -7,6 +7,11 @@ use crate::model::{AsyncRecord, DynamicRecord, ErrorRecord};
 /// 丢弃未确认事件时会注入 source=buffer 的错误记录并打 warn 日志（节流）。
 pub const MAX_JOURNAL_RECORDS: usize = 512;
 
+/// 每个错误来源保留的近期消息条数。只比对最后一条会让 A/B/A/B 交替消息
+/// 每次都穿透去重、把 journal 刷满并驱逐真实指标；保留一个小历史窗口后，
+/// 交替消息被抑制，而真正的新错误照常入队。
+const DEDUP_HISTORY: usize = 8;
+
 /// 错误来源（类型化，journal 内部使用）。线上协议的 `ping:`/`reporter:`
 /// 前缀字符串由 Reporter 出口处（scope_errors）从该枚举生成，内部路由
 /// 不再解析自由文本前缀，磁盘/网卡名撞上前缀也不会被误路由。
@@ -67,7 +72,7 @@ pub struct BufferBatch {
 
 pub struct Buffers {
     state: Mutex<State>,
-    error_dedup: Mutex<HashMap<String, String>>,
+    error_dedup: Mutex<HashMap<String, VecDeque<String>>>,
 }
 
 impl Buffers {
@@ -106,11 +111,14 @@ impl Buffers {
     fn push_typed_error(&self, origin: ErrorOrigin, msg: String) {
         {
             let mut dedup = self.error_dedup.lock().expect("buffer lock poisoned");
-            let key = format!("{origin:?}");
-            if dedup.get(&key).is_some_and(|last| *last == msg) {
+            let history = dedup.entry(format!("{origin:?}")).or_default();
+            if history.iter().any(|recent| *recent == msg) {
                 return;
             }
-            dedup.insert(key, msg.clone());
+            history.push_back(msg.clone());
+            while history.len() > DEDUP_HISTORY {
+                history.pop_front();
+            }
         }
         self.push(Event::Error(LoggedError {
             ts: crate::model::now_millis(),
@@ -270,6 +278,25 @@ mod tests {
         buffers.push_error("gpu", "x");
         buffers.push_error("gpu", "y");
         assert_eq!(buffers.read("a").errors.len(), 2);
+    }
+
+    #[test]
+    fn alternating_error_messages_do_not_flood_the_journal() {
+        let buffers = Buffers::new();
+        buffers.register("a");
+        for _ in 0..4 {
+            buffers.push_error("gpu", "timeout");
+            buffers.push_error("gpu", "exit 1");
+        }
+        // 交替消息在历史窗口内重复，被抑制；不会驱逐 dynamic 记录。
+        let batch = buffers.read("a");
+        assert_eq!(batch.errors.len(), 2);
+        buffers.ack("a", batch.through);
+
+        // 历史窗口之外的新消息照常入队。
+        buffers.push_error("gpu", "timeout");
+        buffers.push_error("gpu", "brand new failure");
+        assert_eq!(buffers.read("a").errors.len(), 1);
     }
 
     #[test]

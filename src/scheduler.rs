@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use chrono::TimeZone;
 use tokio::sync::watch;
-use tokio::time::{interval, interval_at, Interval, MissedTickBehavior};
+use tokio::time::Interval;
 
 use crate::buffer::{BufferBatch, Buffers};
 use crate::collector::{self, net, CpuMonitor};
@@ -183,7 +183,10 @@ impl Scheduler {
             .ping_rx
             .borrow()
             .values()
-            .filter(|record| record.ts > *self.last_ping_ts.get(&record.name).unwrap_or(&0))
+            // 不等而非大于：墙钟向后跳变(手动改时/NTP 阶跃)后新快照 ts 会小于
+            // 已存值，用 > 会静默丢弃全部新数据直到墙钟追平。!= 只要求 ts
+            // 变化，时钟回拨时最多产生少量重复记录，绝不会断流。
+            .filter(|record| record.ts != *self.last_ping_ts.get(&record.name).unwrap_or(&0))
             .cloned()
             .collect();
         for record in fresh_pings {
@@ -193,7 +196,7 @@ impl Scheduler {
 
         let gpus = self.gpu_rx.borrow();
         let gpu_ts = gpus.first().map_or(0, |record| record.ts);
-        if gpu_ts > self.last_gpu_ts {
+        if gpu_ts != self.last_gpu_ts {
             self.last_gpu_ts = gpu_ts;
             for record in gpus.iter().cloned() {
                 self.buffers.push_async(AsyncRecord::Gpu(record));
@@ -202,19 +205,19 @@ impl Scheduler {
         drop(gpus);
 
         if let Some(record) = self.slow_rx.borrow().clone() {
-            if record.ts > self.last_slow_ts {
+            if record.ts != self.last_slow_ts {
                 self.last_slow_ts = record.ts;
                 self.buffers.push_async(AsyncRecord::Slow(record));
             }
         }
         if let Some(record) = self.self_rx.borrow().clone() {
-            if record.ts > self.last_self_ts {
+            if record.ts != self.last_self_ts {
                 self.last_self_ts = record.ts;
                 self.buffers.push_async(AsyncRecord::Self_(record));
             }
         }
         if let Some(record) = self.diskio_rx.borrow().clone() {
-            if record.ts > self.last_diskio_ts {
+            if record.ts != self.last_diskio_ts {
                 self.last_diskio_ts = record.ts;
                 self.buffers.push_async(AsyncRecord::DiskIo(record));
             }
@@ -541,9 +544,11 @@ impl ReporterRunner {
     }
 
     async fn report_cf(&mut self, spec: &ReporterSpec, dynamic: &[DynamicRecord]) -> bool {
-        if self.static_due(spec) {
+        // 与 report_probe 同一套簿记：static 刷新可以提前（构造 metrics 需要），
+        // 但 last_static 只在发送成功后落位——失败周期不得把 static 扣住 10 分钟。
+        let include_static = self.static_due(spec);
+        if include_static {
             self.refresh_static(spec);
-            self.last_static = Some(Instant::now());
         }
         let static_info = self
             .static_cache
@@ -633,7 +638,7 @@ impl ReporterRunner {
                     tx_correction: tx_gb,
                 };
                 match self.reporter.send_cf_confirm(&confirm).await {
-                    Ok(()) => self.netstatic.clear_confirm(&self.id),
+                    Ok(()) => self.netstatic.clear_confirm_off_runtime(&self.id).await,
                     Err(error) => tracing::warn!(
                         reporter_id = %self.id,
                         %error,
@@ -641,7 +646,7 @@ impl ReporterRunner {
                     ),
                 }
             } else {
-                self.netstatic.clear_confirm(&self.id);
+                self.netstatic.clear_confirm_off_runtime(&self.id).await;
             }
         }
 
@@ -653,6 +658,9 @@ impl ReporterRunner {
         };
         match self.reporter.send_cf(&update, &spec.config_version).await {
             Ok(response) => {
+                if include_static {
+                    self.last_static = Some(Instant::now());
+                }
                 if let Some(push) = response.push {
                     let current_pings: Vec<_> =
                         spec.pings.iter().map(|ping| ping.target.clone()).collect();
@@ -691,13 +699,15 @@ impl ReporterRunner {
                         let period_start = period_start_ms(current.reset_day, at);
                         let raw = self.netstatic.query(&filter, period_start, now_ms);
                         self.netstatic
-                            .apply_correction(&self.id, period_start, raw, rx_gb, tx_gb);
+                            .apply_correction_off_runtime(&self.id, period_start, raw, rx_gb, tx_gb)
+                            .await;
                     }
-                    _ => self.netstatic.clear_confirm(&self.id),
+                    _ => self.netstatic.clear_confirm_off_runtime(&self.id).await,
                 }
                 true
             }
             Err(error) => {
+                self.last_static = None;
                 self.report_error(error);
                 false
             }
@@ -764,7 +774,10 @@ impl ReporterRunner {
             )
         });
         if record.disk_used.is_some() {
-            scoped.disk_used = Some(scoped.disks.iter().map(|disk| disk.used).sum());
+            // glob 零匹配时保留的卷为空：按"缺失即 null"语义输出 None，
+            // 而不是把 Some(0) 伪装成真的用满了 0 字节。
+            scoped.disk_used =
+                (!scoped.disks.is_empty()).then(|| scoped.disks.iter().map(|disk| disk.used).sum());
         }
         scoped
     }
@@ -1060,19 +1073,16 @@ pub(crate) fn snapshot_valid_until(
     (now_ms <= valid_until).then_some(valid_until)
 }
 
-/// First tick is immediate.
+/// First tick is immediate. MissedTickBehavior::Skip 的不变量统一由
+/// [`crate::worker::ticker`] 维护，这里只做秒数钳制。
 fn ticker(secs: u64) -> Interval {
-    let mut ticker = interval(Duration::from_secs(secs.max(1)));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    ticker
+    crate::worker::ticker(Duration::from_secs(secs.max(1)))
 }
 
 /// Start at the next period (used when live config changes).
 fn ticker_from_next(secs: u64) -> Interval {
     let duration = Duration::from_secs(secs.max(1));
-    let mut ticker = interval_at(tokio::time::Instant::now() + duration, duration);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    ticker
+    crate::worker::ticker_at(tokio::time::Instant::now() + duration, duration)
 }
 
 #[cfg(test)]

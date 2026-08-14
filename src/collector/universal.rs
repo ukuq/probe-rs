@@ -18,6 +18,7 @@ pub struct SelfMonitor {
     system: System,
     pid: sysinfo::Pid,
     sampled_once: bool,
+    cores: f64,
 }
 
 impl SelfMonitor {
@@ -26,6 +27,7 @@ impl SelfMonitor {
             system: System::new(),
             pid: sysinfo::Pid::from_u32(std::process::id()),
             sampled_once: false,
+            cores: std::thread::available_parallelism().map_or(1.0, |n| n.get() as f64),
         }
     }
 
@@ -39,7 +41,9 @@ impl SelfMonitor {
             cpu_usage: if first {
                 None
             } else {
-                p.map(|p| p.cpu_usage() as f64)
+                // sysinfo 的进程 CPU 未按核数归一（多线程可 >100）；契约是
+                // 整机容量百分比 0-100，这里除以核数对齐 Linux 实现。
+                p.map(|p| p.cpu_usage() as f64 / self.cores)
             },
             mem_rss: p.map(|p| p.memory()),
         }
@@ -294,7 +298,11 @@ pub fn static_info(
         gpu_name,
         // DMI 检测是 Linux 专属；macOS 物理机为主，Windows 一期不做虚拟化检测
         virtualization: None,
-        boot_time: Some((System::boot_time() * 1000) as i64),
+        // 采集失败(0)必须表达为 null，否则 uptime 会被算成"自 1970 起"。
+        boot_time: {
+            let boot_seconds = System::boot_time();
+            (boot_seconds > 0).then_some((boot_seconds * 1000) as i64)
+        },
         ipv4,
         ipv6,
         agent_version: agent_version.to_string(),

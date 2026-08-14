@@ -46,12 +46,15 @@ impl SelfMonitor {
         let cpu_usage = match self_ticks() {
             Some(ticks) => {
                 let now = std::time::Instant::now();
+                // /proc/self/stat 的 utime+stime 汇总全部线程，多线程进程按
+                // 单核口径可达数百；契约是整机容量百分比 0-100，除以核数归一。
+                let cores = std::thread::available_parallelism().map_or(1.0, |n| n.get() as f64);
                 let usage = self.prev.and_then(|(prev_ticks, prev_at)| {
                     let dt = now.duration_since(prev_at).as_secs_f64();
                     if dt <= 0.0 || ticks < prev_ticks {
                         return None;
                     }
-                    Some((ticks - prev_ticks) as f64 / CLK_TCK as f64 / dt * 100.0)
+                    Some((ticks - prev_ticks) as f64 / CLK_TCK as f64 / dt * 100.0 / cores)
                 });
                 self.prev = Some((ticks, now));
                 usage

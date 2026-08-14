@@ -6,11 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use futures::future::join_all;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures_util::future::join_all;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::net::{lookup_host, UdpSocket};
 use tokio::sync::watch;
-use tokio::time::MissedTickBehavior;
 
 use crate::model::{RemoteConfig, Report, ReportTime};
 use crate::reporter_cf::{CfConfirm, CfResponse, CfUpdate};
@@ -34,6 +33,10 @@ const MIN_PLAUSIBLE_SERVER_TIME_MS: i64 = 946_684_800_000;
 const MAX_PLAUSIBLE_SERVER_TIME_MS: i64 = 4_102_444_800_000;
 /// server_time 采样的 RTT 上限(请求已受 TIMEOUT 约束,这里是显式双保险)。
 const MAX_CALIBRATION_RTT: Duration = Duration::from_secs(30);
+/// server_time 与本机墙钟允许的最大偏差。服务端校准的价值在于修正秒/分钟级
+/// 偏差;数天级的分歧几乎必然来自故障或恶意端点,而本机墙钟若真错到该量级,
+/// 正确的处置是修本机时钟,而不是让任意外部样本接管全进程时间域。
+const MAX_SERVER_LOCAL_DIVERGENCE_MS: i64 = 24 * 3600 * 1000;
 
 /// 响应信封：config 缺席 = 无配置变更；next.static = true 时下次上报强制带 static
 #[derive(serde::Deserialize)]
@@ -208,6 +211,16 @@ impl AgentClock {
             );
             return;
         }
+        let local_ms = crate::model::now_millis();
+        if server_time.saturating_sub(local_ms).abs() > MAX_SERVER_LOCAL_DIVERGENCE_MS {
+            tracing::warn!(
+                reporter_id,
+                server_time,
+                local_ms,
+                "server_time 与本机墙钟偏差超过 24h,校准样本被拒绝"
+            );
+            return;
+        }
         let calibration = ClockCalibration::from_server_time(server_time, round_trip, anchor);
         let snapshot = calibration.snapshot(crate::model::now_millis(), anchor.elapsed());
         tracing::debug!(
@@ -263,8 +276,7 @@ impl AgentClock {
     ) -> tokio::task::JoinHandle<()> {
         let clock = Arc::clone(self);
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(NTP_REFRESH_INTERVAL);
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut ticker = crate::worker::ticker(NTP_REFRESH_INTERVAL);
             loop {
                 if *shutdown_rx.borrow() {
                     return;
@@ -690,15 +702,23 @@ mod tests {
         assert!(clock.state.lock().unwrap().server.is_none());
         // 范围合法但 RTT 过大
         clock.update_server_clock(
-            1_754_300_060_123,
+            crate::model::now_millis(),
             Duration::from_secs(120),
+            anchor,
+            "primary",
+        );
+        assert!(clock.state.lock().unwrap().server.is_none());
+        // 范围合法但与本机墙钟偏差超过 24h
+        clock.update_server_clock(
+            crate::model::now_millis().saturating_add(10 * 24 * 3600 * 1000),
+            Duration::from_millis(80),
             anchor,
             "primary",
         );
         assert!(clock.state.lock().unwrap().server.is_none());
         // 合法样本接受
         clock.update_server_clock(
-            1_754_300_060_123,
+            crate::model::now_millis(),
             Duration::from_millis(80),
             anchor,
             "primary",

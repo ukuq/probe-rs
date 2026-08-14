@@ -194,7 +194,26 @@ try {
             $temporaryChecksums = Join-Path ([IO.Path]::GetTempPath()) (
                 "probe-rs-sha-{0}.txt" -f [Guid]::NewGuid().ToString("N")
             )
-            Invoke-WebRequest -Uri $checksumSource -OutFile $temporaryChecksums -UseBasicParsing
+            if (-not [string]::IsNullOrWhiteSpace($InstallGhProxy)) {
+                # Fetch the checksum directly from GitHub when possible: if the
+                # proxy delivers both binary and checksum, a compromised proxy
+                # can replace both and the check only catches transfer damage.
+                $directChecksum = "$releaseBase/SHA256SUMS"
+                try {
+                    Invoke-WebRequest -Uri $directChecksum -OutFile $temporaryChecksums -UseBasicParsing
+                    Write-Host "Checksum fetched directly from GitHub (binary via proxy)."
+                }
+                catch {
+                    Write-Warning (
+                        "Direct SHA256SUMS download failed; falling back to proxy " +
+                        "(checksum then only detects transfer corruption, not origin)."
+                    )
+                    Invoke-WebRequest -Uri $checksumSource -OutFile $temporaryChecksums -UseBasicParsing
+                }
+            }
+            else {
+                Invoke-WebRequest -Uri $checksumSource -OutFile $temporaryChecksums -UseBasicParsing
+            }
             $escapedAsset = [regex]::Escape($AssetName)
             $checksumText = [IO.File]::ReadAllText($temporaryChecksums)
             $match = [regex]::Match(

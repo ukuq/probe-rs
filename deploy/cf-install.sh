@@ -42,7 +42,8 @@ usage() {
 parse_bool() {
     case "$2" in
         1|true|TRUE|yes|YES) eval "$1=true" ;;
-        0|false|FALSE|no|NO|'') eval "$1=false" ;;
+        0|false|FALSE|no|NO) eval "$1=false" ;;
+        # 空值按非法处理：-flag= 的笔误不该被静默当成 false。
         *) die "$3 must be 0 or 1" ;;
     esac
 }
@@ -215,7 +216,19 @@ else
     if [ -n "${SUM_URL:-}" ]; then
         command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
         TMP_SUM=$(mktemp /tmp/probe-rs-sha.XXXXXX)
-        curl -fSL --connect-timeout 10 -o "$TMP_SUM" "$SUM_URL" || die "checksum download failed"
+        SUM_FETCHED=false
+        if [ -n "$GH_PROXY" ]; then
+            # 校验和优先直连 GitHub：二进制走代理时，校验和若同样经代理投递，
+            # 被攻陷的代理可以同时替换两者，校验就退化为传输完整性检查。
+            if curl -fsSL --connect-timeout 10 -o "$TMP_SUM" "$release_base/SHA256SUMS"; then
+                SUM_FETCHED=true
+                log "checksum fetched directly from GitHub (binary via proxy)"
+            else
+                log "warning: direct SHA256SUMS download failed; falling back to proxy (checksum then only detects transfer corruption, not origin)"
+            fi
+        fi
+        [ "$SUM_FETCHED" = true ] ||
+            curl -fSL --connect-timeout 10 -o "$TMP_SUM" "$SUM_URL" || die "checksum download failed"
         expected=$(awk -v name="$asset" '$2 == name || $2 == "*" name { print $1; exit }' "$TMP_SUM")
         [ -n "$expected" ] || die "checksum for $asset is missing"
         actual=$(sha256sum "$TMP_BIN" | awk '{print $1}')

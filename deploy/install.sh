@@ -101,7 +101,7 @@ report_errors = true
 report_self = false
 
 [reporters.intervals]
-collect = 1
+collect = 10
 ping = 30
 slow = 60
 gpu = 60

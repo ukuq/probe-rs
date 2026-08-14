@@ -157,7 +157,7 @@ pub struct SlowBlock {
 #[derive(Debug, Clone, Serialize)]
 pub struct SelfRecord {
     pub ts: i64,
-    /// 自身 CPU 使用率（单核百分比，0-100）
+    /// 自身 CPU 使用率（整机容量百分比，0-100；进程线程总量按核数归一）
     pub cpu_usage: Option<f64>,
     /// 自身常驻内存 RSS，字节
     pub mem_rss: Option<u64>,

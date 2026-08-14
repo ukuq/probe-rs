@@ -34,7 +34,6 @@ pub fn spawn(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let ts = crate::model::now_millis();
                     // disks()/connections()/processes() 在 Windows/macOS 上是
                     // netstat 子进程、全进程表扫描等级的阻塞操作，移出 runtime
                     // worker 线程，避免卡住同线程的上报/WS 保活任务。
@@ -55,6 +54,9 @@ pub fn spawn(
                         }
                     };
                     self_monitor = monitor;
+                    // ts 记采集完成时刻（模块契约："ts 为真实测量时刻"）。
+                    // 阻塞采集可耗时数秒，提前记开始时间会让快照更快过期。
+                    let ts = crate::model::now_millis();
                     let disk_used = disks.iter().map(|disk| disk.used).sum();
                     let (tcp_conn, udp_conn) = match connections {
                         Ok((tcp, udp)) => (Some(tcp), Some(udp)),

@@ -146,22 +146,21 @@ fn build_result(count: u32, values: &mut [i64]) -> (i64, u32) {
     (median, loss)
 }
 
-/// 防重传：首次 >1000ms 时重测最多 3 次；TCP 降幅 >800ms 判失败
+/// 防重传：首次 >1000ms 时重测最多 3 次；TCP 降幅 >800ms 判失败。
+/// 稳定的高延迟（重试后仍 >1000ms）是真实测量结果，如实返回而不是判失败
+/// ——否则卫星链路等稳定慢目标会被误报为完全掉线。
 async fn measure_with_retry(target: &ResolvedTarget) -> Result<i64> {
     let first = measure(target).await?;
     if first <= HIGH_LATENCY_MS {
         return Ok(first);
     }
-    for i in 0..HIGH_LATENCY_RETRIES {
+    for _ in 0..HIGH_LATENCY_RETRIES {
         let second = measure(target).await?;
         if second <= HIGH_LATENCY_MS {
             if target.kind() == PingKind::Tcp && first - second > RETRY_DROP_TCP_MS {
                 bail!("suspicious retransmission detected in tcp handshake");
             }
             return Ok(second);
-        }
-        if i == HIGH_LATENCY_RETRIES - 1 {
-            bail!("latency remains high after retries");
         }
     }
     Ok(first)
@@ -170,11 +169,7 @@ async fn measure_with_retry(target: &ResolvedTarget) -> Result<i64> {
 async fn measure(target: &ResolvedTarget) -> Result<i64> {
     match target {
         ResolvedTarget::Tcp { addresses } => tcp_ping(addresses).await,
-        ResolvedTarget::Http {
-            url,
-            host,
-            addresses,
-        } => http_ping(url, host, addresses).await,
+        ResolvedTarget::Http { url, client } => http_ping(url, client).await,
         ResolvedTarget::Icmp { address } => icmp_ping(*address).await,
     }
 }
@@ -186,8 +181,8 @@ enum ResolvedTarget {
     },
     Http {
         url: reqwest::Url,
-        host: String,
-        addresses: Vec<SocketAddr>,
+        /// 一轮 4 次测量共用同一 client：DNS 结果已烘焙进 client，避免每次测量重建
+        client: reqwest::Client,
     },
     Icmp {
         address: IpAddr,
@@ -224,11 +219,16 @@ async fn resolve_target(target: &str, kind: PingKind) -> Result<ResolvedTarget> 
                 .port_or_known_default()
                 .ok_or_else(|| anyhow::anyhow!("http target has no port"))?;
             let addresses = resolve_all(&host, port).await?;
-            Ok(ResolvedTarget::Http {
-                url,
-                host,
-                addresses,
-            })
+            let client = reqwest::Client::builder()
+                .timeout(PING_TIMEOUT)
+                .pool_max_idle_per_host(0)
+                // Redirects could introduce a second hostname and put its DNS lookup
+                // back inside the measured request. A redirect response is already a
+                // successful reachability result, so do not follow it.
+                .redirect(reqwest::redirect::Policy::none())
+                .resolve_to_addrs(&host, &addresses)
+                .build()?;
+            Ok(ResolvedTarget::Http { url, client })
         }
         PingKind::Icmp => {
             let host = target.trim().trim_matches(['[', ']']);
@@ -302,16 +302,7 @@ async fn tcp_ping(addresses: &[SocketAddr]) -> Result<i64> {
     Ok((start.elapsed().as_millis() as i64).max(1))
 }
 
-async fn http_ping(url: &reqwest::Url, host: &str, addresses: &[SocketAddr]) -> Result<i64> {
-    let client = reqwest::Client::builder()
-        .timeout(PING_TIMEOUT)
-        .pool_max_idle_per_host(0)
-        // Redirects could introduce a second hostname and put its DNS lookup
-        // back inside the measured request. A redirect response is already a
-        // successful reachability result, so do not follow it.
-        .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(host, addresses)
-        .build()?;
+async fn http_ping(url: &reqwest::Url, client: &reqwest::Client) -> Result<i64> {
     let start = Instant::now();
     let resp = client.get(url.clone()).send().await?;
     let ms = (start.elapsed().as_millis() as i64).max(1);
