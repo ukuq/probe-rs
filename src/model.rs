@@ -460,6 +460,8 @@ pub struct RemoteCfExt {
     pub correction: Option<bool>,
     #[serde(default)]
     pub batch: Option<bool>,
+    #[serde(default)]
+    pub connection_mode: Option<CfConnectionMode>,
 }
 
 /// 本地配置中的协议扩展容器（ext.*）
@@ -496,6 +498,10 @@ pub struct CfExt {
     /// 上报形状：true = samples[] 批量（带 ts）；false = 单条 metrics，缺省 true
     #[serde(default = "default_cf_true")]
     pub batch: bool,
+    /// auto = WSS 实时上报，连接不可用时按 report_interval 回退 POST；
+    /// http = 仅使用原有 POST /update。
+    #[serde(default)]
+    pub connection_mode: CfConnectionMode,
 }
 
 impl Default for CfExt {
@@ -503,6 +509,24 @@ impl Default for CfExt {
         Self {
             correction: true,
             batch: true,
+            connection_mode: CfConnectionMode::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CfConnectionMode {
+    #[default]
+    Auto,
+    Http,
+}
+
+impl std::fmt::Display for CfConnectionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Http => f.write_str("http"),
         }
     }
 }

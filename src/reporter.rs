@@ -602,7 +602,13 @@ impl Reporter {
         let resp = self
             .post_cf(
                 update,
-                &[("X-Agent-Config-Schema", "3"), ("X-Agent-Config-Md5", md5)],
+                &[
+                    (
+                        "X-Agent-Config-Schema",
+                        crate::reporter_cf::CF_CONFIG_SCHEMA,
+                    ),
+                    ("X-Agent-Config-Md5", md5),
+                ],
             )
             .await?;
         let status = resp.status();

@@ -861,6 +861,9 @@ impl SharedConfig {
                 if let Some(value) = cf.batch {
                     reporter.ext.cf.batch = value;
                 }
+                if let Some(value) = cf.connection_mode {
+                    reporter.ext.cf.connection_mode = value;
+                }
             }
         }
         reporter.config_version = config_version.clone();
@@ -1537,5 +1540,62 @@ ping = 30
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cf_connection_mode_remote_update_is_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = base_config();
+        cfg.reporters[0].protocol = "cf".into();
+        cfg.reporters[0].worker_url = "https://worker.example/update".into();
+        persist(&path, &cfg).unwrap();
+        let (shared, _intervals_rx, _config_rx) = SharedConfig::new(cfg, path.clone());
+
+        assert!(shared
+            .apply_remote_for(
+                "primary",
+                RemoteConfig {
+                    config_version: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                    intervals: None,
+                    report_interval: None,
+                    reset_day: None,
+                    interfaces: None,
+                    disks: None,
+                    pings: None,
+                    report_gpu: None,
+                    report_errors: None,
+                    report_self: None,
+                    ext: Some(crate::model::RemoteExt {
+                        cf: Some(crate::model::RemoteCfExt {
+                            correction: None,
+                            batch: None,
+                            connection_mode: Some(crate::model::CfConnectionMode::Http),
+                        }),
+                    }),
+                },
+            )
+            .unwrap());
+
+        assert_eq!(
+            shared
+                .get()
+                .reporter("primary")
+                .unwrap()
+                .ext
+                .cf
+                .connection_mode,
+            crate::model::CfConnectionMode::Http
+        );
+        assert_eq!(
+            load(&path)
+                .unwrap()
+                .reporter("primary")
+                .unwrap()
+                .ext
+                .cf
+                .connection_mode,
+            crate::model::CfConnectionMode::Http
+        );
     }
 }

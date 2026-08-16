@@ -17,14 +17,21 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::model::{
-    DiskIoRecord, DynamicRecord, GpuRecord, PingKind, PingRecord, PingTarget, SlowBlock, StaticInfo,
+    CfConnectionMode, DiskIoRecord, DynamicRecord, GpuRecord, PingKind, PingRecord, PingTarget,
+    SlowBlock, StaticInfo,
 };
+
+pub const CF_CONFIG_SCHEMA: &str = "4";
 
 /// 一次 /update 请求体
 #[derive(Debug, Serialize)]
 pub struct CfUpdate {
     pub id: String,
     pub secret: String,
+    pub config_schema: &'static str,
+    pub config_md5: String,
+    pub collect_interval: u64,
+    pub report_interval: u64,
     pub metrics: CfMetrics,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub samples: Vec<CfSample>,
@@ -327,6 +334,7 @@ pub struct CfPush {
     /// custom_ct/cu/cm/bd 目标（host[:port] 或 URL），缺席的组不替换
     pub custom: [Option<String>; 4],
     pub interface: Option<String>,
+    pub connection_mode: Option<CfConnectionMode>,
 }
 
 /// 把 CF 推送合成为当前 Reporter 的远端配置；其 collect 需求随后参与全局最小值聚合。
@@ -364,7 +372,15 @@ pub fn synthesize_remote(
         report_gpu: None,
         report_errors: None,
         report_self: None,
-        ext: None,
+        ext: push
+            .connection_mode
+            .map(|connection_mode| crate::model::RemoteExt {
+                cf: Some(crate::model::RemoteCfExt {
+                    correction: None,
+                    batch: None,
+                    connection_mode: Some(connection_mode),
+                }),
+            }),
     }
 }
 
@@ -449,6 +465,7 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
         reset_day: None,
         custom: [None, None, None, None],
         interface: None,
+        connection_mode: None,
     };
     let mut has_config = false;
     let mut correction: Option<(f64, f64)> = None;
@@ -488,6 +505,17 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
                 push.interface = Some(v.into_owned());
                 has_config = true;
             }
+            "connection_mode" => match v.as_ref() {
+                "auto" | "wss" | "websocket" => {
+                    push.connection_mode = Some(CfConnectionMode::Auto);
+                    has_config = true;
+                }
+                "http" => {
+                    push.connection_mode = Some(CfConnectionMode::Http);
+                    has_config = true;
+                }
+                value => tracing::warn!(value, "CF connection_mode 非法，已忽略"),
+            },
             "rx_correction" => rx_gb = v.parse::<f64>().ok().filter(|v| valid_gb(*v)),
             "tx_correction" => tx_gb = v.parse::<f64>().ok().filter(|v| valid_gb(*v)),
             // schema_version / update=1：忽略（自升级不做）
@@ -507,7 +535,7 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
             // 缺 MD5 头（非官方服务端）：从配置字段重建版本串。
             // 不能用原始 body——校正/update 字段的出现或消失会造成版本空转
             None => format!(
-                "ci={:?}&ri={:?}&rd={:?}&ct={:?}&cu={:?}&cm={:?}&bd={:?}&if={:?}",
+                "ci={:?}&ri={:?}&rd={:?}&ct={:?}&cu={:?}&cm={:?}&bd={:?}&if={:?}&conn={:?}",
                 push.collect,
                 push.report,
                 push.reset_day,
@@ -515,7 +543,8 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
                 push.custom[1],
                 push.custom[2],
                 push.custom[3],
-                push.interface
+                push.interface,
+                push.connection_mode
             ),
         };
     }
@@ -711,9 +740,9 @@ mod tests {
 
     #[test]
     fn parse_config_push() {
-        let body = "collect_interval=0&report_interval=60&reset_day=15&schema_version=3\
+        let body = "collect_interval=0&report_interval=60&reset_day=15&schema_version=4\
                     &custom_ct=gd-ct-dualstack.ip.zstaticcdn.com&custom_cu=&custom_cm=m.example.com\
-                    &custom_bd=ip.zstaticcdn.com&interface=eth0";
+                    &custom_bd=ip.zstaticcdn.com&interface=eth0&connection_mode=http";
         let r = parse_response_body(body, Some("5f4dcc3b"));
         let p = r.push.unwrap();
         assert_eq!(p.version, "5f4dcc3b");
@@ -726,6 +755,7 @@ mod tests {
         );
         assert_eq!(p.custom[1].as_deref(), Some("")); // 空值保留语义：该组清空
         assert_eq!(p.interface.as_deref(), Some("eth0"));
+        assert_eq!(p.connection_mode, Some(CfConnectionMode::Http));
         assert!(r.correction.is_none());
     }
 
@@ -738,11 +768,16 @@ mod tests {
             reset_day: None,
             custom: [None, None, None, None],
             interface: Some("eth0, eth1,,bond*".into()),
+            connection_mode: Some(CfConnectionMode::Auto),
         };
         let remote = synthesize_remote(&push, &crate::model::Intervals::default(), &[]);
         assert_eq!(remote.report_interval, Some(60));
         assert_eq!(remote.interfaces.unwrap(), vec!["eth0", "eth1", "bond*"]);
         assert!(remote.pings.is_none());
+        assert_eq!(
+            remote.ext.unwrap().cf.unwrap().connection_mode,
+            Some(CfConnectionMode::Auto)
+        );
     }
 
     #[test]
@@ -772,6 +807,7 @@ mod tests {
                 Some("https://new-bd.example".into()),
             ],
             interface: None,
+            connection_mode: None,
         };
 
         let remote = synthesize_remote(&push, &crate::model::Intervals::default(), &current);

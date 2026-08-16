@@ -197,22 +197,24 @@ cargo build --release
 
 ## CF 协议模式（protocol = "cf"）
 
-agent 可切换为 CF-Server-Monitor 的 `POST /update` 协议（适配官方服务端，零改动对接）。
+agent 可切换为 CF-Server-Monitor 的 `/update` 协议（HTTP POST 或 WSS，适配官方服务端，零改动对接）。
 
-**配置**：`protocol = "cf"`（🔒 本地，重启生效）；`server_id` 填 CF 后台分配的 UUID，`secret` 填 `API_SECRET`，`worker_url` 填 `https://<worker>/update`。
+**配置**：`protocol = "cf"`（🔒 本地，重启生效）；`server_id` 填 CF 后台分配的 UUID，`secret` 填 `API_SECRET`，`worker_url` 填 `https://<worker>/update`。`[reporters.ext.cf] connection_mode = "auto"`（默认）启用 WSS 并在不可用时按原上报周期 POST 兜底；设为 `"http"` 时只使用 POST。`correction` 与 `batch` 开关保持原语义。
 
 Windows 使用同一套 CF 协议逻辑；CF 一键安装默认启用 GPU 采集（无 `nvidia-smi` 时记录诊断但不影响其他指标）。可在管理员 PowerShell 中直接一键安装（`CollectInterval=0` 同样映射为内部 1 秒）：
 
 ```powershell
 .\deploy\cf-install.ps1 install -Id <UUID> -Secret <API_SECRET> `
-  -Url https://<worker>/update -CollectInterval 0 -Interval 60
+  -Url https://<worker>/update -CollectInterval 0 -Interval 60 -ConnectionMode auto
 ```
 
 脚本默认下载 `probe-rs-windows-x86_64.exe`，也可用 `-BinarySource`/`-Bin` 指定本地文件或 URL；卸载使用 `.\deploy\cf-install.ps1 uninstall`，加 `-Purge` 可清除配置与流量数据。也可以通过通用 `deploy/install.ps1` 安装后，手动将 `%ProgramData%\probe-rs\config.toml` 的 `protocol` 改为 `"cf"`。
 
-**上报映射**（reporter_cf.rs）：顶层 `{id, secret, metrics, samples[]}`；ram/swap/disk 字节→MB；load 转空格字符串；GPU → `gpu_info:[{id,name,info}]`（`id` 来自采集端稳定设备标识，显存/温度丢弃，利用率未知的设备不输出）；ping 按组名落 `ping_ct/cu/cm/bd` + `loss_*`（bgp 是 bd 别名，未配置为 `false`，已配置但失败或缓存过期为 `null`）；`ip_v4/v6` 不可达报数值 `0`；`dynamic[]` → `samples[]`（`ext.cf.batch=false` 时只发单条 metrics）。顶层 dynamic/slow/GPU/Ping/disk I/O 快照按各自采集周期与上报周期校验新鲜度，过期字段不再输出；带 `ts` 的 `samples[]` 仍保留历史批量语义，report 不会触发采集。errors/self/virtualization 无落点，CF 模式下不产生。
+**上报映射**（reporter_cf.rs）：顶层 `{id, secret, config_schema, config_md5, collect_interval, report_interval, metrics, samples[]}`；ram/swap/disk 字节→MB；load 转空格字符串；GPU → `gpu_info:[{id,name,info}]`（`id` 来自采集端稳定设备标识，显存/温度丢弃，利用率未知的设备不输出）；ping 按组名落 `ping_ct/cu/cm/bd` + `loss_*`（bgp 是 bd 别名，未配置为 `false`，已配置但失败或缓存过期为 `null`）；`ip_v4/v6` 不可达报数值 `0`；`dynamic[]` → `samples[]`（`ext.cf.batch=false` 时只发单条 metrics）。顶层 dynamic/slow/GPU/Ping/disk I/O 快照按各自采集周期与上报周期校验新鲜度，过期字段不再输出；带 `ts` 的 `samples[]` 仍保留历史批量语义，report 不会触发采集。errors/self/virtualization 无落点，CF 模式下不产生。
 
-**配置下发**：请求头 `X-Agent-Config-Schema: 3` + `X-Agent-Config-Md5`（复用 `config_version` 字段存 MD5，空 = `none`）。响应 204 = 无变更；200 + URL-encoded body → 解析 collect_interval/report_interval/reset_day/custom_ct/cu/cm/bd/interface，合成 `RemoteConfig`（config_version 取响应头 MD5）走 `apply_remote_for`。`collect=0` 兼容映射为当前 CF Reporter 的 1 秒采集需求，随后参与机器级最小值聚合；逗号分隔的 interface 拆成多个过滤项。`custom_*` 字段缺席时保留对应 Ping，出现空值时清除；非空值只替换对应线路并保留原 interval，`bd` 兼容旧名 `bgp`，HTTP(S) URL 推断为 HTTP 探测，其余按 TCP 探测。CF 未覆盖的 ping/slow/gpu/ip 子间隔与输出开关保持该 Reporter 现值。
+**WSS 上报**：`auto` 模式把 `https/http` 的 `worker_url` 映射为 `wss/ws`，保留路径和业务查询参数，并用 query + Header 携带 Schema 4 和配置 MD5。握手必须收到 `type=hello, protocol=update`；每个报告仍发送与 POST 相同的 JSON 文本，收到正常 ack 后才确认本地 journal 游标。ACK 等待超时会立即把当前连接标为失效并关闭 socket，遗留 pending 不会消费后续连接的 ACK。默认实时周期为 `ceil(report_interval / 15)` 秒，服务端可用 `nextWssReportAfterMs` 在 1 秒到 5 分钟内动态调整；前端实时提示会立即唤醒 Reporter。后台读循环可随时处理 `config` / `remote_config` 帧。普通网络错误按 60 秒到 5 分钟指数退避，断线时只按 `report_interval` POST；服务端 `type=error` 策略帧会同时暂停 WSS 重连和 POST 至少 120 秒，避免无效凭据、未知服务器或关闭 WSS 时形成请求风暴。
+
+**配置下发**：请求头升级为 `X-Agent-Config-Schema: 4` + `X-Agent-Config-Md5`（复用 `config_version` 字段存 MD5，空 = `none`）。POST 响应或 WSS ack/config 帧中的 URL-encoded body 会解析 collect_interval/report_interval/reset_day/custom_ct/cu/cm/bd/interface/connection_mode，合成 `RemoteConfig`（config_version 取响应/帧 MD5）走 `apply_remote_for`。`collect=0` 兼容映射为当前 CF Reporter 的 1 秒采集需求，随后参与机器级最小值聚合；逗号分隔的 interface 拆成多个过滤项。`custom_*` 字段缺席时保留对应 Ping，出现空值时清除；非空值只替换对应线路并保留原 interval，`bd` 兼容旧名 `bgp`，HTTP(S) URL 推断为 HTTP 探测，其余按 TCP 探测。`connection_mode` 支持 `auto/http`（兼容 `wss/websocket` 为 auto），应用并原子落盘后立即启停长连接。CF 未覆盖的 ping/slow/gpu/ip 子间隔与输出开关保持该 Reporter 现值。
 
 **流量校正**：响应尾部 `rx_correction/tx_correction`（GB，覆盖当月累计）。netstatic 记账期偏移（offset = 校正字节 − 原始月累计，period_start 匹配才生效，翻页自动失效），立即落盘；校正确认用**独立请求**回传（CF 服务端见到 correction 字段会把整个请求当确认、丢弃 metrics），服务端清空后停止。`ext.cf.correction = false` 时整个回路忽略。`update=1`（自升级）永远忽略。
 

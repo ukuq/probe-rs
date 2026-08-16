@@ -305,6 +305,20 @@ async fn main() -> Result<()> {
         } else {
             None
         };
+        let (cf_ws, cf_ws_events) = if spec.protocol == "cf" {
+            let enabled = spec.ext.cf.connection_mode == crate::model::CfConnectionMode::Auto;
+            let (sender, events, handle) = worker::cf::spawn(
+                spec.id.clone(),
+                spec.worker_url.clone(),
+                AGENT_VERSION.to_string(),
+                enabled,
+                spec.config_version.clone(),
+            );
+            watch_task("cf-wss", handle);
+            (Some(sender), Some(events))
+        } else {
+            (None, None)
+        };
         let runner = scheduler::ReporterRunner::new(
             spec.id.clone(),
             Arc::clone(&shared),
@@ -322,6 +336,8 @@ async fn main() -> Result<()> {
             update_check_tx.clone(),
             AGENT_VERSION.to_string(),
             komari_tx,
+            cf_ws,
+            cf_ws_events,
         );
         reporter_handles.push((spec.id.clone(), tokio::spawn(runner.run())));
     }

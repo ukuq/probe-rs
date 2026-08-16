@@ -9,18 +9,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::TimeZone;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Interval;
 
 use crate::buffer::{BufferBatch, Buffers};
 use crate::collector::{self, net, CpuMonitor};
 use crate::config::{ReporterSpec, SharedConfig};
 use crate::model::{
-    AsyncRecord, DynamicRecord, ErrorRecord, GpuRecord, Intervals, NetInterfaceSample, PingRecord,
-    Report, SelfRecord, SlowBlock, StaticInfo,
+    AsyncRecord, CfConnectionMode, DynamicRecord, ErrorRecord, GpuRecord, Intervals,
+    NetInterfaceSample, PingRecord, Report, SelfRecord, SlowBlock, StaticInfo,
 };
 use crate::netstatic::{period_start_ms, NetStatic};
 use crate::reporter::{AgentClock, Reporter};
+use crate::worker::cf::{CfWsEvent, CfWsSender};
 use crate::worker::komari::{KomariOut, TimedKomariReport};
 use crate::worker::ping::PingSnapshot;
 use crate::worker::public_ip::IpSnapshot;
@@ -243,6 +244,13 @@ pub struct ReporterRunner {
     update_check_tx: watch::Sender<u64>,
     agent_version: String,
     komari_tx: Option<watch::Sender<KomariOut>>,
+    cf_ws: Option<CfWsSender>,
+    cf_ws_events: Option<mpsc::Receiver<CfWsEvent>>,
+    cf_report_interval: Option<Duration>,
+    cf_policy_backoff_until: Option<Instant>,
+    last_cf_wss_success: Option<Instant>,
+    last_cf_post_attempt: Option<Instant>,
+    active_spec: Option<ReporterSpec>,
     last_dynamic: Option<DynamicRecord>,
     last_static: Option<Instant>,
     static_cache: Option<StaticInfo>,
@@ -270,6 +278,8 @@ impl ReporterRunner {
         update_check_tx: watch::Sender<u64>,
         agent_version: String,
         komari_tx: Option<watch::Sender<KomariOut>>,
+        cf_ws: Option<CfWsSender>,
+        cf_ws_events: Option<mpsc::Receiver<CfWsEvent>>,
     ) -> Self {
         Self {
             id,
@@ -288,6 +298,13 @@ impl ReporterRunner {
             update_check_tx,
             agent_version,
             komari_tx,
+            cf_ws,
+            cf_ws_events,
+            cf_report_interval: None,
+            cf_policy_backoff_until: None,
+            last_cf_wss_success: None,
+            last_cf_post_attempt: None,
+            active_spec: None,
             last_dynamic: None,
             last_static: None,
             static_cache: None,
@@ -301,8 +318,10 @@ impl ReporterRunner {
             tracing::error!(reporter_id = %self.id, "reporter config missing at startup");
             return;
         };
-        let mut report_interval = initial.intervals.report;
-        let mut report_ticker = ticker(report_interval);
+        self.sync_cf_ws(&initial);
+        self.active_spec = Some(initial.clone());
+        let report_timer = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(report_timer);
         tracing::info!(
             reporter_id = %self.id,
             protocol = %initial.protocol,
@@ -311,7 +330,51 @@ impl ReporterRunner {
         );
         loop {
             tokio::select! {
-                _ = report_ticker.tick() => self.on_report().await,
+                _ = &mut report_timer => {
+                    self.on_report().await;
+                    let delay = self.current_report_delay();
+                    report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
+                },
+                event = receive_cf_ws_event(&mut self.cf_ws_events) => {
+                    match event {
+                        Some(CfWsEvent::Connected) => {
+                            self.cf_report_interval = None;
+                            let delay = self.current_report_delay();
+                            report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
+                        }
+                        Some(CfWsEvent::Disconnected(reason)) => {
+                            self.cf_report_interval = None;
+                            tracing::debug!(reporter_id = %self.id, %reason, "CF WSS fallback active");
+                            let delay = self.current_report_delay();
+                            report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
+                        }
+                        Some(CfWsEvent::PolicyBackoff { reason, duration }) => {
+                            self.enter_cf_policy_backoff(duration);
+                            self.cf_report_interval = None;
+                            tracing::warn!(
+                                reporter_id = %self.id,
+                                %reason,
+                                backoff_secs = duration.as_secs(),
+                                "CF WSS policy error; WSS and POST reporting paused"
+                            );
+                            let delay = self.current_report_delay();
+                            report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
+                        }
+                        Some(CfWsEvent::ReportInterval(interval)) => {
+                            self.cf_report_interval = Some(interval);
+                            let delay = self.current_report_delay();
+                            report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
+                        }
+                        Some(CfWsEvent::Config(response)) => {
+                            if let Some(spec) = self.cfg.get().reporter(&self.id) {
+                                self.apply_cf_response(&spec, response).await;
+                            }
+                            let delay = self.current_report_delay();
+                            report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
+                        }
+                        None => self.cf_ws_events = None,
+                    }
+                },
                 changed = self.config_rx.changed() => {
                     if changed.is_err() { return; }
                     let cfg = self.config_rx.borrow().clone();
@@ -319,9 +382,17 @@ impl ReporterRunner {
                         tracing::warn!(reporter_id = %self.id, "reporter removal requires restart");
                         continue;
                     };
-                    if report_interval_changed(&mut report_interval, spec.intervals.report) {
-                        report_ticker = ticker_from_next(report_interval);
+                    let schedule_changed = self
+                        .active_spec
+                        .as_ref()
+                        .is_none_or(|previous| report_schedule_changed(previous, &spec));
+                    self.sync_cf_ws(&spec);
+                    if schedule_changed {
+                        self.cf_report_interval = None;
+                        let delay = self.current_report_delay();
+                        report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
                     }
+                    self.active_spec = Some(spec);
                     self.last_static = None;
                 }
                 changed = self.ip_rx.changed() => {
@@ -341,6 +412,55 @@ impl ReporterRunner {
                 }
             }
         }
+    }
+
+    fn sync_cf_ws(&self, spec: &ReporterSpec) {
+        if let Some(ws) = &self.cf_ws {
+            ws.set_config(
+                spec.protocol == "cf" && spec.ext.cf.connection_mode == CfConnectionMode::Auto,
+                &spec.config_version,
+            );
+        }
+    }
+
+    fn current_report_delay(&self) -> Duration {
+        let Some(spec) = self.cfg.get().reporter(&self.id) else {
+            return Duration::from_secs(60);
+        };
+        if spec.protocol == "cf" {
+            if let Some(remaining) = self.cf_policy_backoff_remaining() {
+                return remaining;
+            }
+        }
+        let report = Duration::from_secs(spec.intervals.report.max(1));
+        if spec.protocol != "cf" || spec.ext.cf.connection_mode == CfConnectionMode::Http {
+            return report;
+        }
+        if self.cf_ws.as_ref().is_some_and(CfWsSender::connected) {
+            let interval = self.cf_report_interval.unwrap_or_else(|| {
+                crate::worker::cf::default_report_interval(spec.intervals.report)
+            });
+            return self
+                .last_cf_wss_success
+                .and_then(|last| interval.checked_sub(last.elapsed()))
+                .unwrap_or(Duration::ZERO);
+        }
+        self.last_cf_post_attempt
+            .and_then(|last| report.checked_sub(last.elapsed()))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    fn enter_cf_policy_backoff(&mut self, duration: Duration) {
+        let deadline = Instant::now() + duration;
+        self.cf_policy_backoff_until = Some(
+            self.cf_policy_backoff_until
+                .map_or(deadline, |current| current.max(deadline)),
+        );
+    }
+
+    fn cf_policy_backoff_remaining(&self) -> Option<Duration> {
+        self.cf_policy_backoff_until
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
     }
 
     async fn on_report(&mut self) {
@@ -544,6 +664,16 @@ impl ReporterRunner {
     }
 
     async fn report_cf(&mut self, spec: &ReporterSpec, dynamic: &[DynamicRecord]) -> bool {
+        if let Some(remaining) = self.cf_policy_backoff_remaining() {
+            tracing::debug!(
+                reporter_id = %self.id,
+                remaining_secs = remaining.as_secs(),
+                "CF policy backoff active"
+            );
+            return false;
+        }
+        self.cf_policy_backoff_until = None;
+
         // 与 report_probe 同一套簿记：static 刷新可以提前（构造 metrics 需要），
         // 但 last_static 只在发送成功后落位——失败周期不得把 static 扣住 10 分钟。
         let include_static = self.static_due(spec);
@@ -653,57 +783,67 @@ impl ReporterRunner {
         let update = crate::reporter_cf::CfUpdate {
             id: spec.server_id.clone(),
             secret: spec.secret.clone(),
+            config_schema: crate::reporter_cf::CF_CONFIG_SCHEMA,
+            config_md5: if spec.config_version.is_empty() {
+                "none".to_string()
+            } else {
+                spec.config_version.clone()
+            },
+            collect_interval: spec.intervals.collect,
+            report_interval: spec.intervals.report,
             metrics,
             samples,
         };
+
+        if spec.ext.cf.connection_mode == CfConnectionMode::Auto {
+            if let Some(ws) = self.cf_ws.as_ref().filter(|ws| ws.connected()) {
+                match ws.send(&update).await {
+                    Ok(ack) => {
+                        self.last_cf_wss_success = Some(Instant::now());
+                        if let Some(interval) = ack.next_report_after {
+                            self.cf_report_interval = Some(interval);
+                        }
+                        if include_static {
+                            self.last_static = Some(Instant::now());
+                        }
+                        self.apply_cf_response(spec, ack.response).await;
+                        return true;
+                    }
+                    Err(error) => {
+                        if let Some(duration) = crate::worker::cf::policy_backoff(&error) {
+                            self.enter_cf_policy_backoff(duration);
+                            tracing::warn!(
+                                reporter_id = %self.id,
+                                %error,
+                                backoff_secs = duration.as_secs(),
+                                "CF WSS policy error; POST fallback suppressed"
+                            );
+                            return false;
+                        }
+                        tracing::warn!(
+                            reporter_id = %self.id,
+                            %error,
+                            "CF WSS report failed; POST fallback will follow report_interval"
+                        );
+                    }
+                }
+            }
+            let post_interval = Duration::from_secs(spec.intervals.report.max(1));
+            if self
+                .last_cf_post_attempt
+                .is_some_and(|last| last.elapsed() < post_interval)
+            {
+                return false;
+            }
+        }
+
+        self.last_cf_post_attempt = Some(Instant::now());
         match self.reporter.send_cf(&update, &spec.config_version).await {
             Ok(response) => {
                 if include_static {
                     self.last_static = Some(Instant::now());
                 }
-                if let Some(push) = response.push {
-                    let current_pings: Vec<_> =
-                        spec.pings.iter().map(|ping| ping.target.clone()).collect();
-                    let remote = crate::reporter_cf::synthesize_remote(
-                        &push,
-                        &spec.intervals,
-                        &current_pings,
-                    );
-                    match self.cfg.apply_remote_for(&self.id, remote) {
-                        Ok(true) => {
-                            self.last_static = None;
-                            self.update_check_tx.send_modify(|generation| {
-                                *generation = generation.wrapping_add(1);
-                            });
-                        }
-                        Ok(false) => {}
-                        Err(error) => {
-                            tracing::warn!(reporter_id = %self.id, %error, "CF config rejected");
-                        }
-                    }
-                }
-                let current = self
-                    .cfg
-                    .get()
-                    .reporter(&self.id)
-                    .unwrap_or_else(|| spec.clone());
-                match response.correction {
-                    Some((rx_gb, tx_gb)) if current.ext.cf.correction => {
-                        let filter = net::IfaceFilter::new(&current.interfaces);
-                        let report_time = self.reporter.report_time();
-                        let now_ms = report_time.accurate_ts.unwrap_or(report_time.local_ts);
-                        let at = chrono::Local
-                            .timestamp_millis_opt(now_ms)
-                            .single()
-                            .unwrap_or_else(chrono::Local::now);
-                        let period_start = period_start_ms(current.reset_day, at);
-                        let raw = self.netstatic.query(&filter, period_start, now_ms);
-                        self.netstatic
-                            .apply_correction_off_runtime(&self.id, period_start, raw, rx_gb, tx_gb)
-                            .await;
-                    }
-                    _ => self.netstatic.clear_confirm_off_runtime(&self.id).await,
-                }
+                self.apply_cf_response(spec, response).await;
                 true
             }
             Err(error) => {
@@ -711,6 +851,52 @@ impl ReporterRunner {
                 self.report_error(error);
                 false
             }
+        }
+    }
+
+    async fn apply_cf_response(
+        &mut self,
+        spec: &ReporterSpec,
+        response: crate::reporter_cf::CfResponse,
+    ) {
+        if let Some(push) = response.push {
+            let current_pings: Vec<_> = spec.pings.iter().map(|ping| ping.target.clone()).collect();
+            let remote =
+                crate::reporter_cf::synthesize_remote(&push, &spec.intervals, &current_pings);
+            match self.cfg.apply_remote_for(&self.id, remote) {
+                Ok(true) => {
+                    self.last_static = None;
+                    self.update_check_tx.send_modify(|generation| {
+                        *generation = generation.wrapping_add(1);
+                    });
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(reporter_id = %self.id, %error, "CF config rejected");
+                }
+            }
+        }
+        let current = self
+            .cfg
+            .get()
+            .reporter(&self.id)
+            .unwrap_or_else(|| spec.clone());
+        match response.correction {
+            Some((rx_gb, tx_gb)) if current.ext.cf.correction => {
+                let filter = net::IfaceFilter::new(&current.interfaces);
+                let report_time = self.reporter.report_time();
+                let now_ms = report_time.accurate_ts.unwrap_or(report_time.local_ts);
+                let at = chrono::Local
+                    .timestamp_millis_opt(now_ms)
+                    .single()
+                    .unwrap_or_else(chrono::Local::now);
+                let period_start = period_start_ms(current.reset_day, at);
+                let raw = self.netstatic.query(&filter, period_start, now_ms);
+                self.netstatic
+                    .apply_correction_off_runtime(&self.id, period_start, raw, rx_gb, tx_gb)
+                    .await;
+            }
+            _ => self.netstatic.clear_confirm_off_runtime(&self.id).await,
         }
     }
 
@@ -890,6 +1076,13 @@ impl ReporterRunner {
     }
 }
 
+fn report_schedule_changed(previous: &ReporterSpec, current: &ReporterSpec) -> bool {
+    previous.protocol != current.protocol
+        || previous.intervals.report != current.intervals.report
+        || (current.protocol == "cf"
+            && previous.ext.cf.connection_mode != current.ext.cf.connection_mode)
+}
+
 fn dynamic_traffic_window(record: &DynamicRecord, reset_day: u8) -> (i64, i64) {
     let report_ts = record.report_ts();
     let at = chrono::Local
@@ -1024,12 +1217,12 @@ fn disk_selected<'a>(patterns: &[String], values: impl IntoIterator<Item = &'a s
     })
 }
 
-fn report_interval_changed(current: &mut u64, next: u64) -> bool {
-    if *current == next {
-        false
-    } else {
-        *current = next;
-        true
+async fn receive_cf_ws_event(
+    receiver: &mut Option<mpsc::Receiver<CfWsEvent>>,
+) -> Option<CfWsEvent> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1071,12 +1264,6 @@ pub(crate) fn snapshot_valid_until(
     let max_age_ms = max_age_secs.saturating_mul(1_000).min(i64::MAX as u64) as i64;
     let valid_until = measured_at_ms.saturating_add(max_age_ms);
     (now_ms <= valid_until).then_some(valid_until)
-}
-
-/// First tick is immediate. MissedTickBehavior::Skip 的不变量统一由
-/// [`crate::worker::ticker`] 维护，这里只做秒数钳制。
-fn ticker(secs: u64) -> Interval {
-    crate::worker::ticker(Duration::from_secs(secs.max(1)))
 }
 
 /// Start at the next period (used when live config changes).
@@ -1150,6 +1337,29 @@ mod tests {
     }
 
     #[test]
+    fn only_cadence_or_active_transport_changes_reset_report_schedule() {
+        let original = reporter_with_ping_aliases();
+
+        let mut unrelated = original.clone();
+        unrelated.interfaces.push("eth0".into());
+        assert!(!report_schedule_changed(&original, &unrelated));
+
+        let mut inactive_cf_extension = original.clone();
+        inactive_cf_extension.ext.cf.connection_mode = CfConnectionMode::Http;
+        assert!(!report_schedule_changed(&original, &inactive_cf_extension));
+
+        let mut cadence = original.clone();
+        cadence.intervals.report += 1;
+        assert!(report_schedule_changed(&original, &cadence));
+
+        let mut cf = original.clone();
+        cf.protocol = "cf".into();
+        let mut cf_http = cf.clone();
+        cf_http.ext.cf.connection_mode = CfConnectionMode::Http;
+        assert!(report_schedule_changed(&cf, &cf_http));
+    }
+
+    #[test]
     fn cf_ping_scoping_drops_expired_cache_but_keeps_configured_aliases_fresh() {
         let spec = reporter_with_ping_aliases();
         let task_id = spec.pings[0].task_id.clone();
@@ -1170,15 +1380,6 @@ mod tests {
 
         let expired = scope_fresh_cf_pings(&pings, &spec, 72_001);
         assert!(expired.is_empty());
-    }
-
-    #[test]
-    fn report_interval_changes_only_when_value_differs() {
-        let mut current = 30;
-        assert!(!report_interval_changed(&mut current, 30));
-        assert_eq!(current, 30);
-        assert!(report_interval_changed(&mut current, 60));
-        assert_eq!(current, 60);
     }
 
     #[test]

@@ -22,6 +22,7 @@ usage() {
         'CF-compatible options:' \
         '  -collect_interval= / -collect=       collection seconds (0 maps to 1)' \
         '  -interval=                           report seconds' \
+        '  -connection_mode=                    auto (WSS + fallback) / http' \
         '  -reset_day=                          0-31' \
         '  -ct= -cu= -cm= -bd=                 ping targets' \
         '  -interface= / -interfaces= / -iface= comma-separated interface globs' \
@@ -80,12 +81,12 @@ case "$COMMAND" in
 esac
 
 ID= SECRET= URL= BIN=
-COLLECT= REPORT= RESET_DAY= INTERFACES=
+COLLECT= REPORT= RESET_DAY= INTERFACES= CONNECTION_MODE=
 CT= CU= CM= BD=
 AUTO_UPDATE= UPDATE_CHANNEL= RX_CORRECTION= TX_CORRECTION=
 REPORTER_ID= INSTALL_VERSION=$SCRIPT_VERSION GH_PROXY=
 DEBUG=false NO_START=false REPLACE_CF=false
-COLLECT_SET=false REPORT_SET=false RESET_SET=false INTERFACES_SET=false
+COLLECT_SET=false REPORT_SET=false RESET_SET=false INTERFACES_SET=false CONNECTION_MODE_SET=false
 CT_SET=false CU_SET=false CM_SET=false BD_SET=false
 AUTO_UPDATE_SET=false UPDATE_CHANNEL_SET=false REPORTER_ID_SET=false
 RX_SET=false TX_SET=false DEBUG_SET=false
@@ -97,6 +98,7 @@ for arg in "$@"; do
         -url=*) URL=${arg#*=} ;;
         -collect_interval=*|-collect=*) COLLECT=${arg#*=}; COLLECT_SET=true ;;
         -interval=*) REPORT=${arg#*=}; REPORT_SET=true ;;
+        -connection_mode=*|-connection-mode=*) CONNECTION_MODE=${arg#*=}; CONNECTION_MODE_SET=true ;;
         -reset_day=*) RESET_DAY=${arg#*=}; RESET_SET=true ;;
         -ct=*) CT=${arg#*=}; CT_SET=true ;;
         -cu=*) CU=${arg#*=}; CU_SET=true ;;
@@ -147,6 +149,9 @@ fi
 if [ "$REPORT_SET" = true ]; then
     REPORT=$(normalize_uint interval "$REPORT")
     [ "$REPORT" -gt 0 ] || die "interval must be at least 1"
+fi
+if [ "$CONNECTION_MODE_SET" = true ]; then
+    case "$CONNECTION_MODE" in auto|http) ;; *) die "connection_mode must be auto or http" ;; esac
 fi
 if [ "$RESET_SET" = true ]; then
     RESET_DAY=$(normalize_uint reset_day "$RESET_DAY")
@@ -251,6 +256,7 @@ set -- configure-cf --config "$CONFIG_PATH" --net-static-path "$DATA_DIR/net_sta
     --server-id "$ID" --secret "$SECRET" --url "$URL"
 [ "$COLLECT_SET" = false ] || set -- "$@" --collect "$COLLECT"
 [ "$REPORT_SET" = false ] || set -- "$@" --report-interval "$REPORT"
+[ "$CONNECTION_MODE_SET" = false ] || set -- "$@" --connection-mode "$CONNECTION_MODE"
 [ "$RESET_SET" = false ] || set -- "$@" --reset-day "$RESET_DAY"
 [ "$INTERFACES_SET" = false ] || set -- "$@" --interfaces "$INTERFACES"
 [ "$CT_SET" = false ] || set -- "$@" --ct "$CT"

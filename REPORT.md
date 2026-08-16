@@ -266,7 +266,7 @@ Ping 聚合规则：机器内部按“类型 + 规范化目标”去重，TCP �
 | `report_gpu` | 可选；当前 Reporter 是否输出 GPU（布尔），同时参与机器级 GPU worker 的 OR 聚合 |
 | `report_errors` | 可选；是否上报 errors 错误事件（布尔，缺省 true） |
 | `report_self` | 可选；是否上报探针自身资源占用 kind:"self"（布尔，缺省 false） |
-| `ext` | 可选；协议扩展 `{cf: {correction?, batch?}}`，仅对应协议启用时生效 |
+| `ext` | 可选；协议扩展 `{cf: {correction?, batch?, connection_mode?}}`，仅对应协议启用时生效；CF 的 `connection_mode` 为 `auto/http` |
 
 `config` 内除 `config_version` 外的字段均可选：出现的才应用，缺席的保持现值。响应只修改产生该响应的 Reporter，不会影响其他上报线路。
 

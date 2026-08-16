@@ -32,6 +32,10 @@ param(
     [ValidateRange(1, 2147483647)]
     [int]$ReportInterval = 60,
 
+    [Alias("connection_mode", "connection-mode")]
+    [ValidateSet("auto", "http")]
+    [string]$ConnectionMode,
+
     [Alias("reset_day")]
     [ValidateRange(0, 31)]
     [int]$ResetDay = 1,
@@ -258,6 +262,9 @@ try {
     }
     if ($PSBoundParameters.ContainsKey("ReportInterval")) {
         $configureArgs += @("--report-interval", $ReportInterval.ToString())
+    }
+    if ($PSBoundParameters.ContainsKey("ConnectionMode")) {
+        $configureArgs += @("--connection-mode", $ConnectionMode.ToLowerInvariant())
     }
     if ($PSBoundParameters.ContainsKey("ResetDay")) {
         $configureArgs += @("--reset-day", $ResetDay.ToString())

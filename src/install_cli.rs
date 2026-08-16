@@ -11,7 +11,7 @@ use chrono::{Local, TimeZone};
 
 use crate::collector::net::IfaceFilter;
 use crate::config::{self, AutoUpdateConfig, LocalConfig, UpdateChannel};
-use crate::model::{CollectionIntervals, PingKind, PingTarget, ReporterConfig};
+use crate::model::{CfConnectionMode, CollectionIntervals, PingKind, PingTarget, ReporterConfig};
 use crate::netstatic::{self, NetStatic};
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -50,6 +50,7 @@ struct ConfigureCfOptions {
     reporter_id: Option<String>,
     collect: Option<u64>,
     report_interval: Option<u64>,
+    connection_mode: Option<CfConnectionMode>,
     reset_day: Option<u8>,
     interfaces: Option<Vec<String>>,
     pings: Vec<(String, String)>,
@@ -67,6 +68,7 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
     let mut reporter_id = None;
     let mut collect = None;
     let mut report_interval = None;
+    let mut connection_mode = None;
     let mut reset_day = None;
     let mut interfaces = None;
     let mut pings = Vec::new();
@@ -89,6 +91,13 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
             "--collect" => collect = Some(parse_positive_u64(&arg, &value(&mut args)?)?),
             "--report-interval" => {
                 report_interval = Some(parse_positive_u64(&arg, &value(&mut args)?)?)
+            }
+            "--connection-mode" => {
+                connection_mode = Some(match value(&mut args)?.to_ascii_lowercase().as_str() {
+                    "auto" => CfConnectionMode::Auto,
+                    "http" => CfConnectionMode::Http,
+                    _ => bail!("--connection-mode must be auto or http"),
+                });
             }
             "--reset-day" => {
                 let parsed = value(&mut args)?
@@ -138,6 +147,7 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
         reporter_id,
         collect,
         report_interval,
+        connection_mode,
         reset_day,
         interfaces,
         pings,
@@ -207,6 +217,9 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
     }
     if let Some(value) = options.report_interval {
         reporter.report_interval = value;
+    }
+    if let Some(value) = options.connection_mode {
+        reporter.ext.cf.connection_mode = value;
     }
     if let Some(value) = options.reset_day {
         reporter.reset_day = value;
@@ -450,6 +463,7 @@ mod tests {
             reporter_id: None,
             collect: Some(2),
             report_interval: Some(60),
+            connection_mode: Some(CfConnectionMode::Auto),
             reset_day: Some(20),
             interfaces: None,
             pings: vec![("ct".into(), "ct.example.com".into())],
@@ -469,6 +483,7 @@ mod tests {
         assert_eq!(reporter.intervals.collect, 2);
         assert_eq!(reporter.reset_day, 20);
         assert_eq!(reporter.pings[0].target.target, "ct.example.com");
+        assert_eq!(reporter.ext.cf.connection_mode, CfConnectionMode::Auto);
         assert!(config.auto_update.enabled);
         assert_eq!(config.auto_update.channel, UpdateChannel::Prerelease);
     }
