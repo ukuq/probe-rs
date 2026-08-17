@@ -8,7 +8,7 @@ CONF_DIR=/etc/probe-rs
 DATA_DIR=/var/lib/probe-rs
 UNIT_DST=/etc/systemd/system/probe-rs.service
 CONFIG_PATH=$CONF_DIR/config.toml
-SCRIPT_VERSION=v0.1.3-beta.9
+SCRIPT_VERSION=v0.1.3
 GITHUB_REPO=https://github.com/ukuq/probe-rs
 
 log() { printf '%s\n' "[probe-rs] $*"; }
