@@ -1,8 +1,9 @@
 //! CF `/update` WebSocket transport.
 //!
 //! The socket actor owns reconnect/backoff and reads server-pushed config even
-//! while the Reporter is sleeping. Metrics still originate in ReporterRunner,
-//! so buffer acknowledgement remains tied to a real server ack.
+//! while the Reporter is sleeping. Metrics are fire-and-forget: the Reporter
+//! publishes the latest snapshot without waiting for a server ACK, while ACK
+//! and config frames are handled independently by the actor.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -11,7 +12,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::USER_AGENT;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -23,12 +24,12 @@ use crate::reporter_cf::{
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-const SEND_TIMEOUT: Duration = Duration::from_secs(12);
+const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const ACK_SILENCE_TIMEOUT: Duration = Duration::from_secs(15);
 const RETRY_MIN: Duration = Duration::from_secs(60);
 const RETRY_MAX: Duration = Duration::from_secs(300);
 pub const POLICY_BACKOFF: Duration = Duration::from_secs(120);
-const REPORT_MIN: Duration = Duration::from_secs(1);
-const REPORT_MAX: Duration = Duration::from_secs(300);
+pub const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Control {
@@ -36,24 +37,18 @@ struct Control {
     config_md5: String,
 }
 
-struct Command {
-    payload: String,
-    reply: oneshot::Sender<std::result::Result<CfWsAck, ReplyError>>,
-}
-
 #[derive(Debug, Clone)]
-enum ReplyError {
-    Transport(String),
-    Policy(PolicyError),
+struct Outbound {
+    payload: String,
+    through: u64,
+    included_static: bool,
 }
 
-impl fmt::Display for ReplyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Transport(reason) => f.write_str(reason),
-            Self::Policy(error) => error.fmt(f),
-        }
-    }
+#[derive(Debug)]
+struct PendingDelivery {
+    through: u64,
+    included_static: bool,
+    deadline: tokio::time::Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -75,27 +70,19 @@ impl fmt::Display for PolicyError {
 impl std::error::Error for PolicyError {}
 
 #[derive(Debug)]
-pub struct CfWsAck {
-    pub response: CfResponse,
-    pub next_report_after: Option<Duration>,
-}
-
-#[derive(Debug)]
 pub enum CfWsEvent {
     Connected,
     Disconnected(String),
     PolicyBackoff { reason: String, duration: Duration },
-    ReportInterval(Duration),
+    Acknowledged { through: u64, included_static: bool },
     Config(CfResponse),
 }
 
 #[derive(Clone)]
 pub struct CfWsSender {
-    command_tx: mpsc::Sender<Command>,
+    payload_tx: watch::Sender<Option<Outbound>>,
     control_tx: watch::Sender<Control>,
-    connected_tx: watch::Sender<bool>,
     connected_rx: watch::Receiver<bool>,
-    invalidate_tx: watch::Sender<u64>,
 }
 
 impl CfWsSender {
@@ -118,51 +105,23 @@ impl CfWsSender {
         });
     }
 
-    pub async fn send(&self, update: &CfUpdate) -> Result<CfWsAck> {
+    /// Publish the latest report without waiting for a server ACK.
+    ///
+    /// The watch channel keeps only one payload. If the socket is temporarily
+    /// slower than the 1s producer, fresh metrics replace stale ones instead of
+    /// building an unbounded queue.
+    pub fn send(&self, update: &CfUpdate, through: u64, included_static: bool) -> Result<()> {
         if !self.connected() {
             bail!("WSS 尚未连接");
         }
         let payload = serde_json::to_string(update).context("序列化 CF WSS 上报失败")?;
-        self.send_payload_with_timeout(payload, SEND_TIMEOUT).await
+        self.payload_tx.send_replace(Some(Outbound {
+            payload,
+            through,
+            included_static,
+        }));
+        Ok(())
     }
-
-    async fn send_payload_with_timeout(
-        &self,
-        payload: String,
-        timeout: Duration,
-    ) -> Result<CfWsAck> {
-        let (reply, response) = oneshot::channel();
-        tokio::time::timeout(timeout, self.command_tx.send(Command { payload, reply }))
-            .await
-            .context("提交 CF WSS 上报超时")?
-            .map_err(|_| anyhow::anyhow!("CF WSS worker 已退出"))?;
-        match tokio::time::timeout(timeout, response).await {
-            Ok(Ok(Ok(ack))) => Ok(ack),
-            Ok(Ok(Err(ReplyError::Transport(reason)))) => Err(anyhow::Error::msg(reason)),
-            Ok(Ok(Err(ReplyError::Policy(error)))) => Err(anyhow::Error::new(error)),
-            Ok(Err(_)) => {
-                self.invalidate_session();
-                bail!("CF WSS ack 通道已关闭")
-            }
-            Err(_) => {
-                // The actor still owns this command's reply sender. Force the
-                // current socket generation to end so the orphaned pending
-                // entry cannot consume a later ACK or grow without bound.
-                self.invalidate_session();
-                bail!("等待 CF WSS ack 超时")
-            }
-        }
-    }
-
-    fn invalidate_session(&self) {
-        self.connected_tx.send_replace(false);
-        self.invalidate_tx
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
-    }
-}
-
-pub fn policy_backoff(error: &anyhow::Error) -> Option<Duration> {
-    error.downcast_ref::<PolicyError>().map(|_| POLICY_BACKOFF)
 }
 
 pub fn spawn(
@@ -176,58 +135,49 @@ pub fn spawn(
     mpsc::Receiver<CfWsEvent>,
     tokio::task::JoinHandle<()>,
 ) {
-    let (command_tx, command_rx) = mpsc::channel(4);
+    let (payload_tx, payload_rx) = watch::channel(None);
     let (event_tx, event_rx) = mpsc::channel(32);
     let (control_tx, control_rx) = watch::channel(Control {
         enabled,
         config_md5: normalized_md5(&config_md5),
     });
     let (connected_tx, connected_rx) = watch::channel(false);
-    let (invalidate_tx, invalidate_rx) = watch::channel(0_u64);
     let sender = CfWsSender {
-        command_tx,
+        payload_tx,
         control_tx,
-        connected_tx: connected_tx.clone(),
         connected_rx,
-        invalidate_tx,
     };
     let task = tokio::spawn(run_actor(
         reporter_id,
         endpoint,
         agent_version,
-        command_rx,
+        payload_rx,
         event_tx,
         control_rx,
         connected_tx,
-        invalidate_rx,
     ));
     (sender, event_rx, task)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_actor(
     reporter_id: String,
     endpoint: String,
     agent_version: String,
-    mut command_rx: mpsc::Receiver<Command>,
+    mut payload_rx: watch::Receiver<Option<Outbound>>,
     event_tx: mpsc::Sender<CfWsEvent>,
     mut control_rx: watch::Receiver<Control>,
     connected_tx: watch::Sender<bool>,
-    mut invalidate_rx: watch::Receiver<u64>,
 ) {
     let mut retry = RETRY_MIN;
     loop {
         if !control_rx.borrow().enabled {
-            if !wait_disabled(&mut control_rx, &mut command_rx).await {
+            if !wait_disabled(&mut control_rx, &mut payload_rx).await {
                 return;
             }
             retry = RETRY_MIN;
             continue;
         }
 
-        // ACK timeouts that raced with a previous disconnect must not poison
-        // the next socket generation.
-        invalidate_rx.borrow_and_update();
         let config_md5 = control_rx.borrow().config_md5.clone();
         match connect(&endpoint, &agent_version, &config_md5).await {
             Ok(ws) => {
@@ -235,16 +185,11 @@ async fn run_actor(
                 connected_tx.send_replace(true);
                 let _ = event_tx.send(CfWsEvent::Connected).await;
                 tracing::info!(reporter_id, "CF WSS connected");
-                let result = run_session(
-                    ws,
-                    &mut command_rx,
-                    &event_tx,
-                    &mut control_rx,
-                    &mut invalidate_rx,
-                )
-                .await;
+                // Never replay a snapshot queued for a previous socket
+                // generation; the next 1s tick publishes a fresh one.
+                payload_rx.borrow_and_update();
+                let result = run_session(ws, &mut payload_rx, &event_tx, &mut control_rx).await;
                 connected_tx.send_replace(false);
-                fail_queued(&mut command_rx, "CF WSS disconnected");
                 match result {
                     Ok(()) if !control_rx.borrow().enabled => {
                         tracing::info!(reporter_id, "CF WSS disabled");
@@ -279,7 +224,7 @@ async fn run_actor(
             }
         }
 
-        if !wait_retry(retry, &mut control_rx, &mut command_rx).await {
+        if !wait_retry(retry, &mut control_rx, &mut payload_rx).await {
             return;
         }
         retry = retry.saturating_mul(2).min(RETRY_MAX);
@@ -288,7 +233,7 @@ async fn run_actor(
 
 async fn wait_disabled(
     control_rx: &mut watch::Receiver<Control>,
-    command_rx: &mut mpsc::Receiver<Command>,
+    payload_rx: &mut watch::Receiver<Option<Outbound>>,
 ) -> bool {
     loop {
         tokio::select! {
@@ -296,9 +241,9 @@ async fn wait_disabled(
                 if changed.is_err() { return false; }
                 if control_rx.borrow().enabled { return true; }
             }
-            command = command_rx.recv() => match command {
-                Some(command) => { let _ = command.reply.send(Err(ReplyError::Transport("CF WSS disabled".into()))); }
-                None => return false,
+            changed = payload_rx.changed() => {
+                if changed.is_err() { return false; }
+                payload_rx.borrow_and_update();
             }
         }
     }
@@ -307,7 +252,7 @@ async fn wait_disabled(
 async fn wait_retry(
     duration: Duration,
     control_rx: &mut watch::Receiver<Control>,
-    command_rx: &mut mpsc::Receiver<Command>,
+    payload_rx: &mut watch::Receiver<Option<Outbound>>,
 ) -> bool {
     let sleep = tokio::time::sleep(duration);
     tokio::pin!(sleep);
@@ -318,19 +263,11 @@ async fn wait_retry(
                 if changed.is_err() { return false; }
                 if !control_rx.borrow().enabled { return true; }
             }
-            command = command_rx.recv() => match command {
-                Some(command) => { let _ = command.reply.send(Err(ReplyError::Transport("CF WSS reconnecting".into()))); }
-                None => return false,
+            changed = payload_rx.changed() => {
+                if changed.is_err() { return false; }
+                payload_rx.borrow_and_update();
             }
         }
-    }
-}
-
-fn fail_queued(command_rx: &mut mpsc::Receiver<Command>, reason: &str) {
-    while let Ok(command) = command_rx.try_recv() {
-        let _ = command
-            .reply
-            .send(Err(ReplyError::Transport(reason.to_string())));
     }
 }
 
@@ -384,60 +321,73 @@ async fn connect(endpoint: &str, agent_version: &str, config_md5: &str) -> Resul
 
 async fn run_session(
     mut ws: WsStream,
-    command_rx: &mut mpsc::Receiver<Command>,
+    payload_rx: &mut watch::Receiver<Option<Outbound>>,
     event_tx: &mpsc::Sender<CfWsEvent>,
     control_rx: &mut watch::Receiver<Control>,
-    invalidate_rx: &mut watch::Receiver<u64>,
 ) -> Result<()> {
-    let mut pending: VecDeque<oneshot::Sender<std::result::Result<CfWsAck, ReplyError>>> =
-        VecDeque::new();
+    let mut pending = VecDeque::<PendingDelivery>::new();
     loop {
         tokio::select! {
+            _ = wait_for_ack_deadline(pending.front().map(|delivery| delivery.deadline)) => {
+                let _ = tokio::time::timeout(SOCKET_WRITE_TIMEOUT, ws.close(None)).await;
+                bail!("CF WSS 连续 {} 秒未收到 ACK", ACK_SILENCE_TIMEOUT.as_secs());
+            }
             changed = control_rx.changed() => {
                 if changed.is_err() || !control_rx.borrow().enabled {
                     let _ = ws.close(None).await;
-                    fail_pending(&mut pending, "CF WSS disabled");
                     return Ok(());
                 }
             }
-            changed = invalidate_rx.changed() => {
-                let reason = if changed.is_err() {
-                    "CF WSS sender closed"
-                } else {
-                    "CF WSS session invalidated after ACK timeout"
-                };
-                let _ = ws.close(None).await;
-                fail_pending(&mut pending, reason);
-                bail!(reason);
-            }
-            command = command_rx.recv() => {
-                let Some(command) = command else {
-                    fail_pending(&mut pending, "CF WSS worker stopped");
+            changed = payload_rx.changed() => {
+                if changed.is_err() {
                     return Ok(());
-                };
-                if let Err(error) = ws.send(Message::Text(command.payload.into())).await {
-                    let reason = format!("发送 CF WSS 报告失败: {error}");
-                    let _ = command
-                        .reply
-                        .send(Err(ReplyError::Transport(reason.clone())));
-                    fail_pending(&mut pending, &reason);
-                    bail!(reason);
                 }
-                pending.push_back(command.reply);
+                let outbound = payload_rx.borrow_and_update().clone();
+                if let Some(outbound) = outbound {
+                    let Outbound {
+                        payload,
+                        through,
+                        included_static,
+                    } = outbound;
+                    tokio::time::timeout(
+                        SOCKET_WRITE_TIMEOUT,
+                        ws.send(Message::Text(payload.into())),
+                    )
+                        .await
+                        .context("发送 CF WSS 报告超时")?
+                        .context("发送 CF WSS 报告失败")?;
+                    // ReporterRunner never waits for this ACK. Only compact
+                    // cursor metadata is retained so the server response can
+                    // confirm journal progress asynchronously.
+                    pending.push_back(PendingDelivery {
+                        through,
+                        included_static,
+                        deadline: tokio::time::Instant::now() + ACK_SILENCE_TIMEOUT,
+                    });
+                }
             }
             message = ws.next() => {
                 let Some(message) = message else {
-                    fail_pending(&mut pending, "CF WSS connection closed");
                     bail!("CF WSS connection closed");
                 };
                 match message.context("读取 CF WSS 帧失败")? {
                     Message::Text(text) => {
-                        handle_frame(text.as_ref(), &mut pending, event_tx).await?;
+                        if handle_frame(text.as_ref(), event_tx).await? {
+                            if let Some(delivery) = pending.pop_front() {
+                                let _ = event_tx
+                                    .send(CfWsEvent::Acknowledged {
+                                        through: delivery.through,
+                                        included_static: delivery.included_static,
+                                    })
+                                    .await;
+                            } else {
+                                tracing::debug!("ignored unsolicited CF WSS ACK");
+                            }
+                        }
                     }
                     Message::Ping(payload) => ws.send(Message::Pong(payload)).await.context("发送 CF WSS pong 失败")?,
                     Message::Pong(_) => {}
                     Message::Close(frame) => {
-                        fail_pending(&mut pending, "CF WSS server closed connection");
                         bail!("CF WSS server closed connection: {frame:?}");
                     }
                     Message::Binary(_) | Message::Frame(_) => {}
@@ -447,75 +397,48 @@ async fn run_session(
     }
 }
 
-async fn handle_frame(
-    text: &str,
-    pending: &mut VecDeque<oneshot::Sender<std::result::Result<CfWsAck, ReplyError>>>,
-    event_tx: &mpsc::Sender<CfWsEvent>,
-) -> Result<()> {
+async fn wait_for_ack_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Returns true when the frame proves that the server has acknowledged at
+/// least one report. Config frames are still delivered independently.
+async fn handle_frame(text: &str, event_tx: &mpsc::Sender<CfWsEvent>) -> Result<bool> {
     let frame: ServerFrame = serde_json::from_str(text).context("解析 CF WSS 服务端帧失败")?;
-    match frame.kind.as_str() {
+    let acknowledged = match frame.kind.as_str() {
         "ack" => {
-            let next_report_after = frame
-                .next_wss_report_after_ms
-                .and_then(clamped_report_interval);
-            if let Some(duration) = next_report_after {
-                // Interval hints are replaceable state. Never let a burst of
-                // hints fill the event channel and block delivery of the ack
-                // that the Reporter is currently waiting for.
-                let _ = event_tx.try_send(CfWsEvent::ReportInterval(duration));
-            }
             let response = frame_response(&frame);
-            if frame.realtime_hint {
-                if response.push.is_some() || response.correction.is_some() {
-                    let _ = event_tx.send(CfWsEvent::Config(response)).await;
-                }
-                return Ok(());
-            }
-            if let Some(reply) = pending.pop_front() {
-                let _ = reply.send(Ok(CfWsAck {
-                    response,
-                    next_report_after,
-                }));
-            } else if response.push.is_some() || response.correction.is_some() {
+            if response.push.is_some() || response.correction.is_some() {
                 let _ = event_tx.send(CfWsEvent::Config(response)).await;
             }
+            // A realtime hint reuses the ACK-shaped envelope but is not tied
+            // to an outbound report and must not advance its journal cursor.
+            !frame.realtime_hint
         }
         "config" | "remote_config" => {
             let response = frame_response(&frame);
             if response.push.is_some() || response.correction.is_some() {
                 let _ = event_tx.send(CfWsEvent::Config(response)).await;
             }
+            false
         }
         "error" => {
             let error = PolicyError {
                 code: frame.code,
                 reason: frame.error.unwrap_or_else(|| "server_error".into()),
             };
-            fail_pending_policy(pending, error.clone());
             return Err(error.into());
         }
-        "hello" => {}
-        _ => tracing::debug!(frame_type = %frame.kind, "ignored CF WSS frame"),
-    }
-    Ok(())
-}
-
-fn fail_pending(
-    pending: &mut VecDeque<oneshot::Sender<std::result::Result<CfWsAck, ReplyError>>>,
-    reason: &str,
-) {
-    while let Some(reply) = pending.pop_front() {
-        let _ = reply.send(Err(ReplyError::Transport(reason.to_string())));
-    }
-}
-
-fn fail_pending_policy(
-    pending: &mut VecDeque<oneshot::Sender<std::result::Result<CfWsAck, ReplyError>>>,
-    error: PolicyError,
-) {
-    while let Some(reply) = pending.pop_front() {
-        let _ = reply.send(Err(ReplyError::Policy(error.clone())));
-    }
+        "hello" => false,
+        _ => {
+            tracing::debug!(frame_type = %frame.kind, "ignored CF WSS frame");
+            false
+        }
+    };
+    Ok(acknowledged)
 }
 
 fn frame_response(frame: &ServerFrame) -> CfResponse {
@@ -531,13 +454,6 @@ fn frame_response(frame: &ServerFrame) -> CfResponse {
         })
         .unwrap_or("");
     parse_response_body(body, frame.config_md5.as_deref())
-}
-
-fn clamped_report_interval(ms: i64) -> Option<Duration> {
-    if ms <= 0 {
-        return None;
-    }
-    Some(Duration::from_millis(ms as u64).clamp(REPORT_MIN, REPORT_MAX))
 }
 
 fn normalized_md5(value: &str) -> String {
@@ -576,10 +492,6 @@ pub fn websocket_url(endpoint: &str, config_md5: &str) -> Result<String> {
     Ok(url.into())
 }
 
-pub fn default_report_interval(report_interval_secs: u64) -> Duration {
-    Duration::from_secs(report_interval_secs.max(1).div_ceil(30)).clamp(REPORT_MIN, REPORT_MAX)
-}
-
 #[derive(Debug, Deserialize)]
 struct HelloFrame {
     #[serde(rename = "type")]
@@ -593,8 +505,6 @@ struct HelloFrame {
 struct ServerFrame {
     #[serde(rename = "type")]
     kind: String,
-    #[serde(default)]
-    next_wss_report_after_ms: Option<i64>,
     #[serde(default)]
     realtime_hint: bool,
     #[serde(default)]
@@ -614,64 +524,75 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn ack_timeout_invalidates_the_current_socket_generation() {
-        let (command_tx, mut command_rx) = mpsc::channel(1);
+    async fn sender_replaces_an_unsent_snapshot_without_waiting_for_ack() {
+        let (payload_tx, mut payload_rx) = watch::channel(None);
         let (control_tx, _control_rx) = watch::channel(Control {
             enabled: true,
             config_md5: "none".into(),
         });
-        let (connected_tx, connected_rx) = watch::channel(true);
-        let (invalidate_tx, mut invalidate_rx) = watch::channel(0_u64);
+        let (_connected_tx, connected_rx) = watch::channel(true);
         let sender = CfWsSender {
-            command_tx,
+            payload_tx,
             control_tx,
-            connected_tx,
             connected_rx,
-            invalidate_tx,
         };
-        let held_command = tokio::spawn(async move {
-            let command = command_rx.recv().await.unwrap();
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            drop(command);
-        });
 
-        let error = sender
-            .send_payload_with_timeout("{}".into(), Duration::from_millis(10))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("ack 超时"));
-        assert!(!sender.connected());
-        tokio::time::timeout(Duration::from_millis(100), invalidate_rx.changed())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(*invalidate_rx.borrow(), 1);
-        held_command.abort();
+        sender.payload_tx.send_replace(Some(Outbound {
+            payload: "first".into(),
+            through: 1,
+            included_static: false,
+        }));
+        sender.payload_tx.send_replace(Some(Outbound {
+            payload: "second".into(),
+            through: 2,
+            included_static: true,
+        }));
+
+        payload_rx.changed().await.unwrap();
+        let latest = payload_rx.borrow_and_update().clone().unwrap();
+        assert_eq!(latest.payload, "second");
+        assert_eq!(latest.through, 2);
+        assert!(latest.included_static);
     }
 
     #[tokio::test]
-    async fn server_error_frames_mark_pending_reports_for_policy_backoff() {
-        let (reply, response) = oneshot::channel();
-        let mut pending = VecDeque::from([reply]);
+    async fn server_error_frames_trigger_policy_backoff() {
         let (event_tx, _event_rx) = mpsc::channel(1);
 
         let error = handle_frame(
             r#"{"type":"error","code":401,"error":"Invalid secret"}"#,
-            &mut pending,
             &event_tx,
         )
         .await
         .unwrap_err();
 
-        assert_eq!(policy_backoff(&error), Some(POLICY_BACKOFF));
-        assert!(pending.is_empty());
-        match response.await.unwrap().unwrap_err() {
-            ReplyError::Policy(error) => {
-                assert_eq!(error.code, 401);
-                assert_eq!(error.reason, "Invalid secret");
-            }
-            other => panic!("expected policy error, got {other:?}"),
-        }
+        let error = error.downcast_ref::<PolicyError>().unwrap();
+        assert_eq!(error.code, 401);
+        assert_eq!(error.reason, "Invalid secret");
+    }
+
+    #[tokio::test]
+    async fn realtime_hint_does_not_ack_an_outbound_report() {
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let acknowledged = handle_frame(r#"{"type":"ack","realtimeHint":true}"#, &event_tx)
+            .await
+            .unwrap();
+        assert!(!acknowledged);
+    }
+
+    #[tokio::test]
+    async fn ack_watchdog_is_disabled_without_pending_reports() {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), wait_for_ack_deadline(None),)
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_ack_deadline(Some(tokio::time::Instant::now() + Duration::from_millis(5))),
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -697,22 +618,19 @@ mod tests {
         assert_eq!(query.len(), 3);
     }
 
-    #[test]
-    fn report_interval_uses_one_thirtieth_and_respects_limits() {
-        assert_eq!(default_report_interval(60), Duration::from_secs(2));
-        assert_eq!(default_report_interval(31), Duration::from_secs(2));
-        assert_eq!(default_report_interval(30), Duration::from_secs(1));
-        assert_eq!(default_report_interval(1), Duration::from_secs(1));
-    }
-
-    #[test]
-    fn server_frame_accepts_snake_case_config_fields() {
-        let frame: ServerFrame = serde_json::from_str(
+    #[tokio::test]
+    async fn ack_config_is_delivered_without_a_pending_report() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let acknowledged = handle_frame(
             r#"{"type":"ack","nextWssReportAfterMs":4000,"config_md5":"abc","config_body":"report_interval=60&connection_mode=http"}"#,
+            &event_tx,
         )
+        .await
         .unwrap();
-        assert_eq!(frame.next_wss_report_after_ms, Some(4000));
-        let response = frame_response(&frame);
+        assert!(acknowledged);
+        let CfWsEvent::Config(response) = event_rx.recv().await.unwrap() else {
+            panic!("expected config event");
+        };
         let push = response.push.unwrap();
         assert_eq!(push.report, Some(60));
         assert_eq!(

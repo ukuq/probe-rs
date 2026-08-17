@@ -246,9 +246,7 @@ pub struct ReporterRunner {
     komari_tx: Option<watch::Sender<KomariOut>>,
     cf_ws: Option<CfWsSender>,
     cf_ws_events: Option<mpsc::Receiver<CfWsEvent>>,
-    cf_report_interval: Option<Duration>,
     cf_policy_backoff_until: Option<Instant>,
-    last_cf_wss_success: Option<Instant>,
     last_cf_post_attempt: Option<Instant>,
     active_spec: Option<ReporterSpec>,
     last_dynamic: Option<DynamicRecord>,
@@ -300,9 +298,7 @@ impl ReporterRunner {
             komari_tx,
             cf_ws,
             cf_ws_events,
-            cf_report_interval: None,
             cf_policy_backoff_until: None,
-            last_cf_wss_success: None,
             last_cf_post_attempt: None,
             active_spec: None,
             last_dynamic: None,
@@ -338,19 +334,16 @@ impl ReporterRunner {
                 event = receive_cf_ws_event(&mut self.cf_ws_events) => {
                     match event {
                         Some(CfWsEvent::Connected) => {
-                            self.cf_report_interval = None;
                             let delay = self.current_report_delay();
                             report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
                         }
                         Some(CfWsEvent::Disconnected(reason)) => {
-                            self.cf_report_interval = None;
                             tracing::debug!(reporter_id = %self.id, %reason, "CF WSS fallback active");
                             let delay = self.current_report_delay();
                             report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
                         }
                         Some(CfWsEvent::PolicyBackoff { reason, duration }) => {
                             self.enter_cf_policy_backoff(duration);
-                            self.cf_report_interval = None;
                             tracing::warn!(
                                 reporter_id = %self.id,
                                 %reason,
@@ -360,17 +353,16 @@ impl ReporterRunner {
                             let delay = self.current_report_delay();
                             report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
                         }
-                        Some(CfWsEvent::ReportInterval(interval)) => {
-                            self.cf_report_interval = Some(interval);
-                            let delay = self.current_report_delay();
-                            report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
+                        Some(CfWsEvent::Acknowledged { through, included_static }) => {
+                            self.buffers.ack(&self.id, through);
+                            if included_static {
+                                self.last_static = Some(Instant::now());
+                            }
                         }
                         Some(CfWsEvent::Config(response)) => {
                             if let Some(spec) = self.cfg.get().reporter(&self.id) {
                                 self.apply_cf_response(&spec, response).await;
                             }
-                            let delay = self.current_report_delay();
-                            report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
                         }
                         None => self.cf_ws_events = None,
                     }
@@ -388,7 +380,6 @@ impl ReporterRunner {
                         .is_none_or(|previous| report_schedule_changed(previous, &spec));
                     self.sync_cf_ws(&spec);
                     if schedule_changed {
-                        self.cf_report_interval = None;
                         let delay = self.current_report_delay();
                         report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
                     }
@@ -437,13 +428,7 @@ impl ReporterRunner {
             return report;
         }
         if self.cf_ws.as_ref().is_some_and(CfWsSender::connected) {
-            let interval = self.cf_report_interval.unwrap_or_else(|| {
-                crate::worker::cf::default_report_interval(spec.intervals.report)
-            });
-            return self
-                .last_cf_wss_success
-                .and_then(|last| interval.checked_sub(last.elapsed()))
-                .unwrap_or(Duration::ZERO);
+            return crate::worker::cf::REPORT_INTERVAL;
         }
         self.last_cf_post_attempt
             .and_then(|last| report.checked_sub(last.elapsed()))
@@ -473,14 +458,14 @@ impl ReporterRunner {
             self.last_dynamic = Some(latest.clone());
         }
 
-        let success = match spec.protocol.as_str() {
-            "cf" => self.report_cf(&spec, &dynamic).await,
+        let ack_now = match spec.protocol.as_str() {
+            "cf" => self.report_cf(&spec, &dynamic, batch.through).await,
             "komari" => self.report_komari(&spec, &dynamic, &batch).await,
             _ => self.report_probe(&spec, dynamic, &batch).await,
         };
-        // Komari 的 ack 在 WS worker 真正发出帧之后进行（见 worker/komari.rs），
-        // 这里 ack 会把尚未发送的批次标记为已确认。
-        if success && spec.protocol != "komari" {
+        // Komari 的 ack 在 WS worker 发帧后进行；CF WSS 则由 actor 收到
+        // 服务端 ACK 后异步推进。这里仅处理 HTTP 等可立即确认的结果。
+        if ack_now && spec.protocol != "komari" {
             self.buffers.ack(&self.id, batch.through);
         }
     }
@@ -663,7 +648,12 @@ impl ReporterRunner {
         true
     }
 
-    async fn report_cf(&mut self, spec: &ReporterSpec, dynamic: &[DynamicRecord]) -> bool {
+    async fn report_cf(
+        &mut self,
+        spec: &ReporterSpec,
+        dynamic: &[DynamicRecord],
+        through: u64,
+    ) -> bool {
         if let Some(remaining) = self.cf_policy_backoff_remaining() {
             tracing::debug!(
                 reporter_id = %self.id,
@@ -797,29 +787,15 @@ impl ReporterRunner {
 
         if spec.ext.cf.connection_mode == CfConnectionMode::Auto {
             if let Some(ws) = self.cf_ws.as_ref().filter(|ws| ws.connected()) {
-                match ws.send(&update).await {
-                    Ok(ack) => {
-                        self.last_cf_wss_success = Some(Instant::now());
-                        if let Some(interval) = ack.next_report_after {
-                            self.cf_report_interval = Some(interval);
-                        }
-                        if include_static {
-                            self.last_static = Some(Instant::now());
-                        }
-                        self.apply_cf_response(spec, ack.response).await;
-                        return true;
+                match ws.send(&update, through, include_static) {
+                    Ok(()) => {
+                        // ACK handling is asynchronous in the socket actor, so
+                        // this report never blocks the fixed 1s cadence. Until
+                        // an ACK event advances the cursor, replacement frames
+                        // continue to include these journal records.
+                        return false;
                     }
                     Err(error) => {
-                        if let Some(duration) = crate::worker::cf::policy_backoff(&error) {
-                            self.enter_cf_policy_backoff(duration);
-                            tracing::warn!(
-                                reporter_id = %self.id,
-                                %error,
-                                backoff_secs = duration.as_secs(),
-                                "CF WSS policy error; POST fallback suppressed"
-                            );
-                            return false;
-                        }
                         tracing::warn!(
                             reporter_id = %self.id,
                             %error,

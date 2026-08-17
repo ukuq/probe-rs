@@ -75,7 +75,7 @@ probe-rs/
 
 ### 3.3 缓冲（buffer.rs）
 
-- 共享有界事件日志（`MAX_JOURNAL_RECORDS = 512`，dynamic/async/errors 三类共用一个 journal），每 Reporter 独立 seq 游标：`read()` 非破坏读取游标之后的全部事件，上报成功才 `ack(through)`；日志只裁剪到所有 Reporter 都已确认的位置（min-cursor）。
+- 共享有界事件日志（`MAX_JOURNAL_RECORDS = 512`，dynamic/async/errors 三类共用一个 journal），每 Reporter 独立 seq 游标：`read()` 非破坏读取游标之后的全部事件；HTTP 在响应成功后 `ack(through)`，CF WSS 按 1 秒节奏异步发送、由后台收到对应服务端 ACK 后再推进游标；日志只裁剪到所有 Reporter 都已确认的位置（min-cursor）。
 - 慢端点不会阻塞采集：日志满时丢最旧事件；丢弃**未确认**事件时按 64 条节流注入一条 `source=buffer` 错误事件并打 warn 日志，长中断不静默。
 - errors 同源同文去重在入队前完成；上报失败无需"restore"，未 ack 的事件自然留在日志里待下轮重发。
 
@@ -106,13 +106,13 @@ probe-rs/
 ### 3.7 远端配置（config.rs + reporter.rs）
 
 - 响应体非空 → 解析为 `RemoteConfig` → 校验：`config_version != 当前`（空版本也跳过）、间隔 >= 1、`reset_day ∈ 0..=31`——全部通过才应用。
-- 应用 = 更新内存配置 + 重写本地 TOML（tmp + rename）+ 通知 scheduler 重建 ticker（用 `watch` 发新 intervals，scheduler select 监听变化）。
+- 应用 = 校验候选配置 → 在 `SharedConfig` 写锁内用同目录唯一临时文件写入并 fsync → 原子替换本地 TOML → 更新内存配置 → 用 `watch` 通知 scheduler；落盘失败不会改内存。该替换流程同时覆盖 Windows 已有 `config.toml`，不会依赖平台不同的 `std::fs::rename` 覆盖语义。
 - 任何一项非法：整体拒绝，`tracing::warn!` 记录原因。
 
 ### 3.8 配置热加载
 
-- main 里 3s 轮询配置文件 mtime；变更后重新 load + 校验，失败保持原配置。
-- 每个 Reporter 的 `intervals/interfaces/disks/pings/report_gpu` 经 `SharedConfig::update_local` 即时生效；实际周期取最小值、GPU 取 OR，选择项取并集。
+- main 里 3s 轮询配置文件 mtime；变更后由 `SharedConfig::update_local_from_disk` 持写锁读取、校验并提交同一文件快照，失败保持原配置。远端落盘和本地热加载因此不会发生“旧文件快照覆盖新内存配置”的竞态。
+- 每个 Reporter 的 `intervals/interfaces/disks/pings/report_gpu` 经热加载即时生效；实际周期取最小值、GPU 取 OR，选择项取并集。
 - 聚合后的 `pings` / GPU 开关变更时重建对应 worker：channel 在 main 创建一次，任务可中止重建，scheduler 无感。
 
 ### 3.9 优雅退出
@@ -212,7 +212,7 @@ Windows 使用同一套 CF 协议逻辑；CF 一键安装默认启用 GPU 采集
 
 **上报映射**（reporter_cf.rs）：顶层 `{id, secret, config_schema, config_md5, collect_interval, report_interval, metrics, samples[]}`；ram/swap/disk 字节→MB；load 转空格字符串；GPU → `gpu_info:[{id,name,info}]`（`id` 来自采集端稳定设备标识，显存/温度丢弃，利用率未知的设备不输出）；ping 按组名落 `ping_ct/cu/cm/bd` + `loss_*`（bgp 是 bd 别名，未配置为 `false`，已配置但失败或缓存过期为 `null`）；`ip_v4/v6` 不可达报数值 `0`；`dynamic[]` → `samples[]`（`ext.cf.batch=false` 时只发单条 metrics）。顶层 dynamic/slow/GPU/Ping/disk I/O 快照按各自采集周期与上报周期校验新鲜度，过期字段不再输出；带 `ts` 的 `samples[]` 仍保留历史批量语义，report 不会触发采集。errors/self/virtualization 无落点，CF 模式下不产生。
 
-**WSS 上报**：`auto` 模式把 `https/http` 的 `worker_url` 映射为 `wss/ws`，保留路径和业务查询参数，并用 query + Header 携带 Schema 4 和配置 MD5。握手必须收到 `type=hello, protocol=update`；每个报告仍发送与 POST 相同的 JSON 文本，收到正常 ack 后才确认本地 journal 游标。ACK 等待超时会立即把当前连接标为失效并关闭 socket，遗留 pending 不会消费后续连接的 ACK。默认实时周期为 `ceil(report_interval / 30)` 秒，服务端可用 `nextWssReportAfterMs` 在 1 秒到 5 分钟内动态调整；前端实时提示会立即唤醒 Reporter。后台读循环可随时处理 `config` / `remote_config` 帧。普通网络错误按 60 秒到 5 分钟指数退避，断线时只按 `report_interval` POST；服务端 `type=error` 策略帧会同时暂停 WSS 重连和 POST 至少 120 秒，避免无效凭据、未知服务器或关闭 WSS 时形成请求风暴。
+**WSS 上报**：`auto` 模式把 `https/http` 的 `worker_url` 映射为 `wss/ws`，保留路径和业务查询参数，并用 query + Header 携带 Schema 4 和配置 MD5。握手必须收到 `type=hello, protocol=update`；连接可用时固定每 1 秒发布一次与 POST 相同的最新 JSON 文本，不同步等待服务端 ACK，也不接受 `nextWssReportAfterMs` 改写节奏。发送槽使用 `watch` 单值覆盖：socket 暂时变慢时只保留最新帧，不会堆积；被覆盖帧的 journal 游标不会提前推进，其记录会合并进替代帧。写出的帧只保留紧凑的游标元数据，后台收到对应 ACK 后才推进 journal；因此 ACK 决定数据确认，但不阻塞下一次发送。从最老未确认报告起连续 15 秒没有 ACK，或单次 socket 写入超过 5 秒，会主动关闭半开连接，随后停止 WSS 发布、按 `report_interval` POST 兜底并重连。`config` 和 `remote_config` 帧也由后台读循环独立处理，其中配置仍按 MD5 幂等校验和原子落盘。普通网络错误按 60 秒到 5 分钟指数退避；服务端 `type=error` 策略帧会同时暂停 WSS 重连和 POST 至少 120 秒，避免无效凭据、未知服务器或关闭 WSS 时形成请求风暴。
 
 **配置下发**：请求头升级为 `X-Agent-Config-Schema: 4` + `X-Agent-Config-Md5`（复用 `config_version` 字段存 MD5，空 = `none`）。POST 响应或 WSS ack/config 帧中的 URL-encoded body 会解析 collect_interval/report_interval/reset_day/custom_ct/cu/cm/bd/interface/connection_mode，合成 `RemoteConfig`（config_version 取响应/帧 MD5）走 `apply_remote_for`。`collect=0` 兼容映射为当前 CF Reporter 的 1 秒采集需求，随后参与机器级最小值聚合；逗号分隔的 interface 拆成多个过滤项。`custom_*` 字段缺席时保留对应 Ping，出现空值时清除；非空值只替换对应线路并保留原 interval，`bd` 兼容旧名 `bgp`，HTTP(S) URL 推断为 HTTP 探测，其余按 TCP 探测。`connection_mode` 支持 `auto/http`（兼容 `wss/websocket` 为 auto），应用并原子落盘后立即启停长连接。CF 未覆盖的 ping/slow/gpu/ip 子间隔与输出开关保持该 Reporter 现值。
 

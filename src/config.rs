@@ -930,21 +930,43 @@ pub fn load(path: &Path) -> Result<LocalConfig> {
     Ok(cfg)
 }
 
-/// tmp + rename 原子写
+/// 同目录临时文件 + 原子替换。
+///
+/// SharedConfig 在其写锁内调用这里；唯一临时文件避免与编辑器或上次异常退出
+/// 遗留的固定 `.tmp` 冲突。配置变更路径先同步文件、替换成功后才更新内存，
+/// 从而保证磁盘始终是可恢复的事实源。
 pub(crate) fn persist(path: &Path, cfg: &LocalConfig) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
+    use std::io::Write;
+
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
     let data = toml::to_string_pretty(cfg)?;
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, data)?;
-    // 配置含 secret：rename 前固定 0600，避免 umask 把 install.sh 建的 600 降级成 644
+    let mut staged = tempfile::Builder::new()
+        .prefix(".probe-rs-config-")
+        .tempfile_in(dir)
+        .with_context(|| format!("创建配置临时文件失败: {}", dir.display()))?;
+
+    // 配置含 secret：替换前固定 0600，避免权限随旧文件或 umask 漂移。
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        staged
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    std::fs::rename(&tmp, path)?;
+    staged.write_all(data.as_bytes())?;
+    staged.as_file_mut().sync_all()?;
+    staged
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("原子替换配置失败: {}", path.display()))?;
+
+    // rename 本身持久化到目录项后，掉电恢复不会回到旧文件名状态。
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
@@ -1060,6 +1082,31 @@ mod tests {
 
         let result = shared.update_local_from_disk(&path, |_| true).unwrap();
         assert_eq!(result, LocalReload::Unchanged);
+    }
+
+    #[test]
+    fn persist_atomically_replaces_an_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let initial = base_config();
+        persist(&path, &initial).unwrap();
+
+        let mut replacement = initial;
+        replacement.reporters[0].report_interval = 7;
+        persist(&path, &replacement).unwrap();
+
+        assert_eq!(load(&path).unwrap(), replacement);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".probe-rs-config-")
+            })
+            .collect();
+        assert!(leftovers.is_empty());
     }
 
     #[test]
