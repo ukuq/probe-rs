@@ -577,7 +577,7 @@ pub fn websocket_url(endpoint: &str, config_md5: &str) -> Result<String> {
 }
 
 pub fn default_report_interval(report_interval_secs: u64) -> Duration {
-    Duration::from_secs(report_interval_secs.max(1).div_ceil(15)).clamp(REPORT_MIN, REPORT_MAX)
+    Duration::from_secs(report_interval_secs.max(1).div_ceil(30)).clamp(REPORT_MIN, REPORT_MAX)
 }
 
 #[derive(Debug, Deserialize)]
@@ -698,9 +698,10 @@ mod tests {
     }
 
     #[test]
-    fn report_interval_matches_panel_divisor_and_limits() {
-        assert_eq!(default_report_interval(60), Duration::from_secs(4));
-        assert_eq!(default_report_interval(30), Duration::from_secs(2));
+    fn report_interval_uses_one_thirtieth_and_respects_limits() {
+        assert_eq!(default_report_interval(60), Duration::from_secs(2));
+        assert_eq!(default_report_interval(31), Duration::from_secs(2));
+        assert_eq!(default_report_interval(30), Duration::from_secs(1));
         assert_eq!(default_report_interval(1), Duration::from_secs(1));
     }
 
