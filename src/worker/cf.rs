@@ -83,11 +83,26 @@ pub struct CfWsSender {
     payload_tx: watch::Sender<Option<Outbound>>,
     control_tx: watch::Sender<Control>,
     connected_rx: watch::Receiver<bool>,
+    in_flight_rx: watch::Receiver<Option<u64>>,
+}
+
+struct ActorChannels {
+    payload_rx: watch::Receiver<Option<Outbound>>,
+    event_tx: mpsc::Sender<CfWsEvent>,
+    control_rx: watch::Receiver<Control>,
+    connected_tx: watch::Sender<bool>,
+    in_flight_tx: watch::Sender<Option<u64>>,
 }
 
 impl CfWsSender {
     pub fn connected(&self) -> bool {
         *self.connected_rx.borrow()
+    }
+
+    /// Highest journal sequence claimed by a frame being written, or already
+    /// written, on the current socket generation.
+    pub fn in_flight_through(&self) -> Option<u64> {
+        *self.in_flight_rx.borrow()
     }
 
     pub fn set_config(&self, enabled: bool, config_md5: &str) {
@@ -142,19 +157,24 @@ pub fn spawn(
         config_md5: normalized_md5(&config_md5),
     });
     let (connected_tx, connected_rx) = watch::channel(false);
+    let (in_flight_tx, in_flight_rx) = watch::channel(None);
     let sender = CfWsSender {
         payload_tx,
         control_tx,
         connected_rx,
+        in_flight_rx,
     };
     let task = tokio::spawn(run_actor(
         reporter_id,
         endpoint,
         agent_version,
-        payload_rx,
-        event_tx,
-        control_rx,
-        connected_tx,
+        ActorChannels {
+            payload_rx,
+            event_tx,
+            control_rx,
+            connected_tx,
+            in_flight_tx,
+        },
     ));
     (sender, event_rx, task)
 }
@@ -163,11 +183,15 @@ async fn run_actor(
     reporter_id: String,
     endpoint: String,
     agent_version: String,
-    mut payload_rx: watch::Receiver<Option<Outbound>>,
-    event_tx: mpsc::Sender<CfWsEvent>,
-    mut control_rx: watch::Receiver<Control>,
-    connected_tx: watch::Sender<bool>,
+    channels: ActorChannels,
 ) {
+    let ActorChannels {
+        mut payload_rx,
+        event_tx,
+        mut control_rx,
+        connected_tx,
+        in_flight_tx,
+    } = channels;
     let mut retry = RETRY_MIN;
     loop {
         if !control_rx.borrow().enabled {
@@ -182,14 +206,23 @@ async fn run_actor(
         match connect(&endpoint, &agent_version, &config_md5).await {
             Ok(ws) => {
                 retry = RETRY_MIN;
+                // Drop the previous generation's queued snapshot before the
+                // connected flag allows the Reporter to publish a fresh one.
+                payload_rx.borrow_and_update();
+                in_flight_tx.send_replace(None);
                 connected_tx.send_replace(true);
                 let _ = event_tx.send(CfWsEvent::Connected).await;
                 tracing::info!(reporter_id, "CF WSS connected");
-                // Never replay a snapshot queued for a previous socket
-                // generation; the next 1s tick publishes a fresh one.
-                payload_rx.borrow_and_update();
-                let result = run_session(ws, &mut payload_rx, &event_tx, &mut control_rx).await;
+                let result = run_session(
+                    ws,
+                    &mut payload_rx,
+                    &event_tx,
+                    &mut control_rx,
+                    &in_flight_tx,
+                )
+                .await;
                 connected_tx.send_replace(false);
+                in_flight_tx.send_replace(None);
                 match result {
                     Ok(()) if !control_rx.borrow().enabled => {
                         tracing::info!(reporter_id, "CF WSS disabled");
@@ -218,6 +251,7 @@ async fn run_actor(
             }
             Err(error) => {
                 connected_tx.send_replace(false);
+                in_flight_tx.send_replace(None);
                 let reason = error.to_string();
                 tracing::warn!(reporter_id, error = %reason, retry_secs = retry.as_secs(), "CF WSS connect failed");
                 let _ = event_tx.send(CfWsEvent::Disconnected(reason)).await;
@@ -324,6 +358,7 @@ async fn run_session(
     payload_rx: &mut watch::Receiver<Option<Outbound>>,
     event_tx: &mpsc::Sender<CfWsEvent>,
     control_rx: &mut watch::Receiver<Control>,
+    in_flight_tx: &watch::Sender<Option<u64>>,
 ) -> Result<()> {
     let mut pending = VecDeque::<PendingDelivery>::new();
     loop {
@@ -349,6 +384,10 @@ async fn run_session(
                         through,
                         included_static,
                     } = outbound;
+                    // Claim the batch before the potentially slow socket
+                    // write. A replacement that happens while this write is
+                    // in progress must contain only records after this frame.
+                    advance_in_flight(in_flight_tx, through);
                     tokio::time::timeout(
                         SOCKET_WRITE_TIMEOUT,
                         ws.send(Message::Text(payload.into())),
@@ -395,6 +434,18 @@ async fn run_session(
             }
         }
     }
+}
+
+fn advance_in_flight(in_flight_tx: &watch::Sender<Option<u64>>, through: u64) {
+    in_flight_tx.send_if_modified(|current| {
+        let next = Some(current.map_or(through, |sent| sent.max(through)));
+        if *current == next {
+            false
+        } else {
+            *current = next;
+            true
+        }
+    });
 }
 
 async fn wait_for_ack_deadline(deadline: Option<tokio::time::Instant>) {
@@ -531,10 +582,12 @@ mod tests {
             config_md5: "none".into(),
         });
         let (_connected_tx, connected_rx) = watch::channel(true);
+        let (_in_flight_tx, in_flight_rx) = watch::channel(None);
         let sender = CfWsSender {
             payload_tx,
             control_tx,
             connected_rx,
+            in_flight_rx,
         };
 
         sender.payload_tx.send_replace(Some(Outbound {
@@ -593,6 +646,17 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn in_flight_cursor_is_monotonic_within_a_socket_generation() {
+        let (in_flight_tx, in_flight_rx) = watch::channel(None);
+        advance_in_flight(&in_flight_tx, 4);
+        advance_in_flight(&in_flight_tx, 3);
+        assert_eq!(*in_flight_rx.borrow(), Some(4));
+
+        in_flight_tx.send_replace(None);
+        assert_eq!(*in_flight_rx.borrow(), None);
     }
 
     #[test]

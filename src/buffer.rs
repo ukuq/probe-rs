@@ -142,12 +142,21 @@ impl Buffers {
 
     /// 非破坏性读取：同一批数据可被任意数量 Reporter 独立消费。
     pub fn read(&self, reporter_id: &str) -> BufferBatch {
+        self.read_after(reporter_id, None)
+    }
+
+    /// 从 Reporter 已确认游标和额外的临时游标中较新的位置开始读取。
+    ///
+    /// 临时游标用于已经写入传输层、但尚未收到远端 ACK 的数据。它不会修改
+    /// journal 的持久确认位置，因此连接中断后丢弃临时游标即可安全重发。
+    pub fn read_after(&self, reporter_id: &str, after: Option<u64>) -> BufferBatch {
         let mut state = self.state.lock().expect("buffer lock poisoned");
         let default_cursor = state.next_seq.saturating_sub(1);
-        let cursor = *state
+        let acknowledged = *state
             .cursors
             .entry(reporter_id.to_string())
             .or_insert(default_cursor);
+        let cursor = after.map_or(acknowledged, |after| acknowledged.max(after));
         let mut batch = BufferBatch {
             through: state.events.back().map_or(cursor, |(seq, _)| *seq),
             ..Default::default()
@@ -268,6 +277,61 @@ mod tests {
         let retry = buffers.read("a");
         assert_eq!(first.through, retry.through);
         assert_eq!(retry.dynamic[0].ts, 1);
+    }
+
+    #[test]
+    fn temporary_sent_cursor_prevents_replay_before_ack_and_resets_for_retry() {
+        let buffers = Buffers::new();
+        buffers.register("a");
+        buffers.push_dynamic(rec(1));
+        let first = buffers.read("a");
+
+        buffers.push_dynamic(rec(2));
+        let unsent = buffers.read_after("a", Some(first.through));
+        assert_eq!(
+            unsent
+                .dynamic
+                .iter()
+                .map(|record| record.ts)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+
+        // A second frame can advance independently while the first ACK is
+        // still outstanding; neither frame's samples are replayed.
+        buffers.push_dynamic(rec(3));
+        let third = buffers.read_after("a", Some(unsent.through));
+        assert_eq!(
+            third
+                .dynamic
+                .iter()
+                .map(|record| record.ts)
+                .collect::<Vec<_>>(),
+            [3]
+        );
+
+        // Dropping the transport-local cursor on disconnect exposes all
+        // unacknowledged records again.
+        let retry = buffers.read("a");
+        assert_eq!(
+            retry
+                .dynamic
+                .iter()
+                .map(|record| record.ts)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+
+        buffers.ack("a", first.through);
+        let after_ack = buffers.read_after("a", Some(unsent.through));
+        assert_eq!(
+            after_ack
+                .dynamic
+                .iter()
+                .map(|record| record.ts)
+                .collect::<Vec<_>>(),
+            [3]
+        );
     }
 
     #[test]

@@ -452,14 +452,34 @@ impl ReporterRunner {
         let Some(spec) = self.cfg.get().reporter(&self.id) else {
             return;
         };
-        let batch = self.buffers.read(&self.id);
+        let cf_inflight_through = (spec.protocol == "cf"
+            && spec.ext.cf.connection_mode == CfConnectionMode::Auto)
+            .then(|| {
+                self.cf_ws
+                    .as_ref()
+                    .filter(|ws| ws.connected())
+                    .and_then(CfWsSender::in_flight_through)
+            })
+            .flatten();
+        let batch = match cf_inflight_through {
+            Some(through) => self.buffers.read_after(&self.id, Some(through)),
+            None => self.buffers.read(&self.id),
+        };
         let dynamic = self.scope_dynamic_batch(&batch.dynamic, &spec);
         if let Some(latest) = dynamic.last() {
             self.last_dynamic = Some(latest.clone());
         }
 
         let ack_now = match spec.protocol.as_str() {
-            "cf" => self.report_cf(&spec, &dynamic, batch.through).await,
+            "cf" => {
+                self.report_cf(
+                    &spec,
+                    &dynamic,
+                    batch.through,
+                    cf_inflight_through.is_some(),
+                )
+                .await
+            }
             "komari" => self.report_komari(&spec, &dynamic, &batch).await,
             _ => self.report_probe(&spec, dynamic, &batch).await,
         };
@@ -653,6 +673,7 @@ impl ReporterRunner {
         spec: &ReporterSpec,
         dynamic: &[DynamicRecord],
         through: u64,
+        batch_starts_after_inflight: bool,
     ) -> bool {
         if let Some(remaining) = self.cf_policy_backoff_remaining() {
             tracing::debug!(
@@ -789,10 +810,10 @@ impl ReporterRunner {
             if let Some(ws) = self.cf_ws.as_ref().filter(|ws| ws.connected()) {
                 match ws.send(&update, through, include_static) {
                     Ok(()) => {
-                        // ACK handling is asynchronous in the socket actor, so
-                        // this report never blocks the fixed 1s cadence. Until
-                        // an ACK event advances the cursor, replacement frames
-                        // continue to include these journal records.
+                        // The socket actor reports the sequence actually
+                        // written. Subsequent ticks skip those in-flight
+                        // samples while ACK handling independently advances
+                        // the durable journal cursor.
                         return false;
                     }
                     Err(error) => {
@@ -803,6 +824,13 @@ impl ReporterRunner {
                         );
                     }
                 }
+            }
+            // The batch was built without older records already in flight on
+            // WSS. If that socket disappeared meanwhile, do not let a POST of
+            // this partial batch acknowledge across the gap. The immediate
+            // fallback tick will reread from the durable ACK cursor.
+            if batch_starts_after_inflight {
+                return false;
             }
             let post_interval = Duration::from_secs(spec.intervals.report.max(1));
             if self
