@@ -771,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "probe-rs"
-version = "0.1.3"
+version = "0.1.4-beta.1"
 dependencies = [
  "anyhow",
  "chrono",
