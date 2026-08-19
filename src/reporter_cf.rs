@@ -21,7 +21,7 @@ use crate::model::{
     SlowBlock, StaticInfo,
 };
 
-pub const CF_CONFIG_SCHEMA: &str = "4";
+pub const CF_CONFIG_SCHEMA: &str = "5";
 
 /// 一次 /update 请求体
 #[derive(Debug, Serialize)]
@@ -330,6 +330,10 @@ pub struct CfPush {
     pub version: String,
     pub collect: Option<u64>,
     pub report: Option<u64>,
+    /// Schema 5 configured realtime cadence. The authoritative per-frame
+    /// cadence still comes from `nextWssReportAfterMs` because the server may
+    /// slow idle agents independently of this value.
+    pub wss_report_interval: Option<u64>,
     pub reset_day: Option<u8>,
     /// custom_ct/cu/cm/bd 目标（host[:port] 或 URL），缺席的组不替换
     pub custom: [Option<String>; 4],
@@ -462,6 +466,7 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
         version: String::new(), // 解析完后统一计算
         collect: None,
         report: None,
+        wss_report_interval: None,
         reset_day: None,
         custom: [None, None, None, None],
         interface: None,
@@ -481,6 +486,13 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
                 push.report = v.parse::<u64>().ok().map(|n| n.max(1));
                 has_config = true;
             }
+            "wss_report_interval" => match v.parse::<u64>().ok().filter(|n| (1..=5).contains(n)) {
+                Some(value) => {
+                    push.wss_report_interval = Some(value);
+                    has_config = true;
+                }
+                None => tracing::warn!(value = %v, "CF wss_report_interval 非法，已忽略"),
+            },
             "reset_day" => {
                 push.reset_day = v.parse::<u8>().ok().filter(|d| *d <= 31);
                 has_config = true;
@@ -535,9 +547,10 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
             // 缺 MD5 头（非官方服务端）：从配置字段重建版本串。
             // 不能用原始 body——校正/update 字段的出现或消失会造成版本空转
             None => format!(
-                "ci={:?}&ri={:?}&rd={:?}&ct={:?}&cu={:?}&cm={:?}&bd={:?}&if={:?}&conn={:?}",
+                "ci={:?}&ri={:?}&wss={:?}&rd={:?}&ct={:?}&cu={:?}&cm={:?}&bd={:?}&if={:?}&conn={:?}",
                 push.collect,
                 push.report,
+                push.wss_report_interval,
                 push.reset_day,
                 push.custom[0],
                 push.custom[1],
@@ -740,7 +753,7 @@ mod tests {
 
     #[test]
     fn parse_config_push() {
-        let body = "collect_interval=0&report_interval=60&reset_day=15&schema_version=4\
+        let body = "collect_interval=0&report_interval=60&wss_report_interval=2&reset_day=15&schema_version=5\
                     &custom_ct=gd-ct-dualstack.ip.zstaticcdn.com&custom_cu=&custom_cm=m.example.com\
                     &custom_bd=ip.zstaticcdn.com&interface=eth0&connection_mode=http";
         let r = parse_response_body(body, Some("5f4dcc3b"));
@@ -748,6 +761,7 @@ mod tests {
         assert_eq!(p.version, "5f4dcc3b");
         assert_eq!(p.collect, Some(1)); // CF 的 0 输入兼容映射为内部 1 秒
         assert_eq!(p.report, Some(60));
+        assert_eq!(p.wss_report_interval, Some(2));
         assert_eq!(p.reset_day, Some(15));
         assert_eq!(
             p.custom[0].as_deref(),
@@ -765,6 +779,7 @@ mod tests {
             version: "v1".into(),
             collect: Some(0),
             report: Some(60),
+            wss_report_interval: Some(2),
             reset_day: None,
             custom: [None, None, None, None],
             interface: Some("eth0, eth1,,bond*".into()),
@@ -799,6 +814,7 @@ mod tests {
             version: "v2".into(),
             collect: None,
             report: None,
+            wss_report_interval: None,
             reset_day: None,
             custom: [
                 Some("new-ct.example:443".into()),
@@ -841,5 +857,25 @@ mod tests {
         // 非法校正值：忽略
         let r2 = parse_response_body("rx_correction=-3&tx_correction=abc", None);
         assert!(r2.correction.is_none());
+    }
+
+    #[test]
+    fn schema5_wss_interval_is_validated_and_affects_synthetic_version() {
+        let two = parse_response_body(
+            "collect_interval=2&report_interval=60&wss_report_interval=2",
+            None,
+        );
+        let four = parse_response_body(
+            "collect_interval=2&report_interval=60&wss_report_interval=4",
+            None,
+        );
+        assert_eq!(two.push.as_ref().unwrap().wss_report_interval, Some(2));
+        assert_ne!(
+            two.push.as_ref().unwrap().version,
+            four.push.as_ref().unwrap().version
+        );
+
+        let invalid = parse_response_body("wss_report_interval=6", None);
+        assert!(invalid.push.is_none());
     }
 }

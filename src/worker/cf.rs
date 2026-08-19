@@ -29,7 +29,9 @@ const ACK_SILENCE_TIMEOUT: Duration = Duration::from_secs(15);
 const RETRY_MIN: Duration = Duration::from_secs(60);
 const RETRY_MAX: Duration = Duration::from_secs(300);
 pub const POLICY_BACKOFF: Duration = Duration::from_secs(120);
-pub const REPORT_INTERVAL: Duration = Duration::from_secs(1);
+pub const DEFAULT_REPORT_INTERVAL: Duration = Duration::from_secs(2);
+const MIN_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_REPORT_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Control {
@@ -73,6 +75,7 @@ impl std::error::Error for PolicyError {}
 pub enum CfWsEvent {
     Connected,
     Disconnected(String),
+    ReportIntervalChanged(Duration),
     PolicyBackoff { reason: String, duration: Duration },
     Acknowledged { through: u64, included_static: bool },
     Config(CfResponse),
@@ -84,6 +87,7 @@ pub struct CfWsSender {
     control_tx: watch::Sender<Control>,
     connected_rx: watch::Receiver<bool>,
     in_flight_rx: watch::Receiver<Option<u64>>,
+    report_interval_rx: watch::Receiver<Duration>,
 }
 
 struct ActorChannels {
@@ -92,6 +96,7 @@ struct ActorChannels {
     control_rx: watch::Receiver<Control>,
     connected_tx: watch::Sender<bool>,
     in_flight_tx: watch::Sender<Option<u64>>,
+    report_interval_tx: watch::Sender<Duration>,
 }
 
 impl CfWsSender {
@@ -103,6 +108,10 @@ impl CfWsSender {
     /// written, on the current socket generation.
     pub fn in_flight_through(&self) -> Option<u64> {
         *self.in_flight_rx.borrow()
+    }
+
+    pub fn report_interval(&self) -> Duration {
+        *self.report_interval_rx.borrow()
     }
 
     pub fn set_config(&self, enabled: bool, config_md5: &str) {
@@ -158,11 +167,13 @@ pub fn spawn(
     });
     let (connected_tx, connected_rx) = watch::channel(false);
     let (in_flight_tx, in_flight_rx) = watch::channel(None);
+    let (report_interval_tx, report_interval_rx) = watch::channel(DEFAULT_REPORT_INTERVAL);
     let sender = CfWsSender {
         payload_tx,
         control_tx,
         connected_rx,
         in_flight_rx,
+        report_interval_rx,
     };
     let task = tokio::spawn(run_actor(
         reporter_id,
@@ -174,6 +185,7 @@ pub fn spawn(
             control_rx,
             connected_tx,
             in_flight_tx,
+            report_interval_tx,
         },
     ));
     (sender, event_rx, task)
@@ -191,6 +203,7 @@ async fn run_actor(
         mut control_rx,
         connected_tx,
         in_flight_tx,
+        report_interval_tx,
     } = channels;
     let mut retry = RETRY_MIN;
     loop {
@@ -210,6 +223,7 @@ async fn run_actor(
                 // connected flag allows the Reporter to publish a fresh one.
                 payload_rx.borrow_and_update();
                 in_flight_tx.send_replace(None);
+                report_interval_tx.send_replace(DEFAULT_REPORT_INTERVAL);
                 connected_tx.send_replace(true);
                 let _ = event_tx.send(CfWsEvent::Connected).await;
                 tracing::info!(reporter_id, "CF WSS connected");
@@ -219,6 +233,7 @@ async fn run_actor(
                     &event_tx,
                     &mut control_rx,
                     &in_flight_tx,
+                    &report_interval_tx,
                 )
                 .await;
                 connected_tx.send_replace(false);
@@ -359,6 +374,7 @@ async fn run_session(
     event_tx: &mpsc::Sender<CfWsEvent>,
     control_rx: &mut watch::Receiver<Control>,
     in_flight_tx: &watch::Sender<Option<u64>>,
+    report_interval_tx: &watch::Sender<Duration>,
 ) -> Result<()> {
     let mut pending = VecDeque::<PendingDelivery>::new();
     loop {
@@ -411,7 +427,7 @@ async fn run_session(
                 };
                 match message.context("读取 CF WSS 帧失败")? {
                     Message::Text(text) => {
-                        if handle_frame(text.as_ref(), event_tx).await? {
+                        if handle_frame(text.as_ref(), event_tx, report_interval_tx).await? {
                             if let Some(delivery) = pending.pop_front() {
                                 let _ = event_tx
                                     .send(CfWsEvent::Acknowledged {
@@ -457,10 +473,30 @@ async fn wait_for_ack_deadline(deadline: Option<tokio::time::Instant>) {
 
 /// Returns true when the frame proves that the server has acknowledged at
 /// least one report. Config frames are still delivered independently.
-async fn handle_frame(text: &str, event_tx: &mpsc::Sender<CfWsEvent>) -> Result<bool> {
+async fn handle_frame(
+    text: &str,
+    event_tx: &mpsc::Sender<CfWsEvent>,
+    report_interval_tx: &watch::Sender<Duration>,
+) -> Result<bool> {
     let frame: ServerFrame = serde_json::from_str(text).context("解析 CF WSS 服务端帧失败")?;
     let acknowledged = match frame.kind.as_str() {
         "ack" => {
+            if let Some(next) = frame
+                .next_wss_report_after_ms
+                .and_then(normalize_report_interval)
+            {
+                let changed = report_interval_tx.send_if_modified(|current| {
+                    if *current == next {
+                        false
+                    } else {
+                        *current = next;
+                        true
+                    }
+                });
+                if changed {
+                    let _ = event_tx.send(CfWsEvent::ReportIntervalChanged(next)).await;
+                }
+            }
             let response = frame_response(&frame);
             if response.push.is_some() || response.correction.is_some() {
                 let _ = event_tx.send(CfWsEvent::Config(response)).await;
@@ -490,6 +526,17 @@ async fn handle_frame(text: &str, event_tx: &mpsc::Sender<CfWsEvent>) -> Result<
         }
     };
     Ok(acknowledged)
+}
+
+fn normalize_report_interval(milliseconds: i64) -> Option<Duration> {
+    let milliseconds = u64::try_from(milliseconds)
+        .ok()
+        .filter(|value| *value > 0)?;
+    Some(
+        Duration::from_millis(milliseconds)
+            .max(MIN_REPORT_INTERVAL)
+            .min(MAX_REPORT_INTERVAL),
+    )
 }
 
 fn frame_response(frame: &ServerFrame) -> CfResponse {
@@ -559,6 +606,8 @@ struct ServerFrame {
     #[serde(default)]
     realtime_hint: bool,
     #[serde(default)]
+    next_wss_report_after_ms: Option<i64>,
+    #[serde(default)]
     error: Option<String>,
     #[serde(default)]
     code: i64,
@@ -583,11 +632,13 @@ mod tests {
         });
         let (_connected_tx, connected_rx) = watch::channel(true);
         let (_in_flight_tx, in_flight_rx) = watch::channel(None);
+        let (_report_interval_tx, report_interval_rx) = watch::channel(DEFAULT_REPORT_INTERVAL);
         let sender = CfWsSender {
             payload_tx,
             control_tx,
             connected_rx,
             in_flight_rx,
+            report_interval_rx,
         };
 
         sender.payload_tx.send_replace(Some(Outbound {
@@ -611,10 +662,12 @@ mod tests {
     #[tokio::test]
     async fn server_error_frames_trigger_policy_backoff() {
         let (event_tx, _event_rx) = mpsc::channel(1);
+        let (report_interval_tx, _report_interval_rx) = watch::channel(DEFAULT_REPORT_INTERVAL);
 
         let error = handle_frame(
             r#"{"type":"error","code":401,"error":"Invalid secret"}"#,
             &event_tx,
+            &report_interval_tx,
         )
         .await
         .unwrap_err();
@@ -625,12 +678,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realtime_hint_does_not_ack_an_outbound_report() {
-        let (event_tx, _event_rx) = mpsc::channel(1);
-        let acknowledged = handle_frame(r#"{"type":"ack","realtimeHint":true}"#, &event_tx)
-            .await
-            .unwrap();
+    async fn realtime_hint_updates_cadence_without_acking_an_outbound_report() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (report_interval_tx, report_interval_rx) = watch::channel(DEFAULT_REPORT_INTERVAL);
+        let acknowledged = handle_frame(
+            r#"{"type":"ack","realtimeHint":true,"nextWssReportAfterMs":1000}"#,
+            &event_tx,
+            &report_interval_tx,
+        )
+        .await
+        .unwrap();
         assert!(!acknowledged);
+        assert_eq!(*report_interval_rx.borrow(), Duration::from_secs(1));
+        let CfWsEvent::ReportIntervalChanged(interval) = event_rx.recv().await.unwrap() else {
+            panic!("expected report interval event");
+        };
+        assert_eq!(interval, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn server_report_interval_is_bounded_and_rejects_non_positive_values() {
+        assert_eq!(normalize_report_interval(1), Some(Duration::from_secs(1)));
+        assert_eq!(
+            normalize_report_interval(600_000),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(normalize_report_interval(0), None);
+        assert_eq!(normalize_report_interval(-1), None);
     }
 
     #[tokio::test]
@@ -684,22 +758,30 @@ mod tests {
 
     #[tokio::test]
     async fn ack_config_is_delivered_without_a_pending_report() {
-        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let (report_interval_tx, report_interval_rx) = watch::channel(DEFAULT_REPORT_INTERVAL);
         let acknowledged = handle_frame(
-            r#"{"type":"ack","nextWssReportAfterMs":4000,"config_md5":"abc","config_body":"report_interval=60&connection_mode=http"}"#,
+            r#"{"type":"ack","nextWssReportAfterMs":4000,"config_md5":"abc","config_body":"report_interval=60&wss_report_interval=4&connection_mode=auto"}"#,
             &event_tx,
+            &report_interval_tx,
         )
         .await
         .unwrap();
         assert!(acknowledged);
+        assert_eq!(*report_interval_rx.borrow(), Duration::from_secs(4));
+        let CfWsEvent::ReportIntervalChanged(interval) = event_rx.recv().await.unwrap() else {
+            panic!("expected report interval event");
+        };
+        assert_eq!(interval, Duration::from_secs(4));
         let CfWsEvent::Config(response) = event_rx.recv().await.unwrap() else {
             panic!("expected config event");
         };
         let push = response.push.unwrap();
         assert_eq!(push.report, Some(60));
+        assert_eq!(push.wss_report_interval, Some(4));
         assert_eq!(
             push.connection_mode,
-            Some(crate::model::CfConnectionMode::Http)
+            Some(crate::model::CfConnectionMode::Auto)
         );
     }
 }

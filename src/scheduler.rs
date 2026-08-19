@@ -342,6 +342,15 @@ impl ReporterRunner {
                             let delay = self.current_report_delay();
                             report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
                         }
+                        Some(CfWsEvent::ReportIntervalChanged(interval)) => {
+                            tracing::debug!(
+                                reporter_id = %self.id,
+                                interval_ms = interval.as_millis(),
+                                "CF WSS report interval updated"
+                            );
+                            let delay = self.current_report_delay();
+                            report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
+                        }
                         Some(CfWsEvent::PolicyBackoff { reason, duration }) => {
                             self.enter_cf_policy_backoff(duration);
                             tracing::warn!(
@@ -427,8 +436,8 @@ impl ReporterRunner {
         if spec.protocol != "cf" || spec.ext.cf.connection_mode == CfConnectionMode::Http {
             return report;
         }
-        if self.cf_ws.as_ref().is_some_and(CfWsSender::connected) {
-            return crate::worker::cf::REPORT_INTERVAL;
+        if let Some(ws) = self.cf_ws.as_ref().filter(|ws| ws.connected()) {
+            return ws.report_interval();
         }
         self.last_cf_post_attempt
             .and_then(|last| report.checked_sub(last.elapsed()))
