@@ -343,12 +343,37 @@ impl CollectionIntervals {
     }
 }
 
+/// Reporter 使用的上报协议。配置与线上回执仍序列化为小写字符串。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReporterProtocol {
+    Probe,
+    Cf,
+    Komari,
+}
+
+impl ReporterProtocol {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Probe => "probe",
+            Self::Cf => "cf",
+            Self::Komari => "komari",
+        }
+    }
+}
+
+impl std::fmt::Display for ReporterProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// 一条独立上报线路；所有连接信息和输出策略都只存在于 Reporter 内。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReporterConfig {
     pub id: String,
-    pub protocol: String,
+    pub protocol: ReporterProtocol,
     pub server_id: String,
     pub secret: String,
     pub worker_url: String,
@@ -397,7 +422,7 @@ pub struct GlobalConfigSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct ReporterSummary {
     pub id: String,
-    pub protocol: String,
+    pub protocol: ReporterProtocol,
     pub intervals: CollectionIntervals,
     pub report_interval: u64,
     pub reset_day: u8,
@@ -673,5 +698,26 @@ mod tests {
             ..Default::default()
         };
         assert!(zero.validate().is_err());
+    }
+
+    #[test]
+    fn reporter_protocol_keeps_lowercase_wire_values() {
+        for (protocol, value) in [
+            (ReporterProtocol::Probe, "probe"),
+            (ReporterProtocol::Cf, "cf"),
+            (ReporterProtocol::Komari, "komari"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&protocol).unwrap(),
+                format!("\"{value}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<ReporterProtocol>(&format!("\"{value}\"")).unwrap(),
+                protocol
+            );
+            assert_eq!(protocol.as_str(), value);
+            assert_eq!(protocol.to_string(), value);
+        }
+        assert!(serde_json::from_str::<ReporterProtocol>("\"unknown\"").is_err());
     }
 }

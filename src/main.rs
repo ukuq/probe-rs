@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use tokio::sync::watch;
 
 use crate::config::{LocalConfig, LocalReload, SharedConfig};
+use crate::model::ReporterProtocol;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -66,7 +67,7 @@ async fn main() -> Result<()> {
             protocol = %spec.protocol,
             "reporter configured"
         );
-        if spec.protocol == "cf" {
+        if spec.protocol == ReporterProtocol::Cf {
             for ping in &spec.pings {
                 if !["ct", "cu", "cm", "bd", "bgp"].contains(&ping.target.name.as_str()) {
                     tracing::warn!(
@@ -87,7 +88,7 @@ async fn main() -> Result<()> {
     }
     let legacy_cf_reporter = initial_specs
         .iter()
-        .find(|spec| spec.protocol == "cf")
+        .find(|spec| spec.protocol == ReporterProtocol::Cf)
         .map(|spec| spec.id.as_str());
     let net = netstatic::NetStatic::load_with_legacy_reporter(&net_static_path, legacy_cf_reporter);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -284,12 +285,12 @@ async fn main() -> Result<()> {
                 &spec.secret,
                 AGENT_VERSION,
                 &spec.id,
-                &spec.protocol,
+                spec.protocol,
                 Arc::clone(&agent_clock),
             )
             .with_context(|| format!("failed to initialize Reporter {}", spec.id))?,
         );
-        let komari_tx = if spec.protocol == "komari" {
+        let komari_tx = if spec.protocol == ReporterProtocol::Komari {
             let (tx, rx) = watch::channel(worker::komari::KomariOut::default());
             let komari_handle = worker::komari::spawn(
                 spec.id.clone(),
@@ -305,7 +306,7 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-        let (cf_ws, cf_ws_events) = if spec.protocol == "cf" {
+        let (cf_ws, cf_ws_events) = if spec.protocol == ReporterProtocol::Cf {
             let enabled = spec.ext.cf.connection_mode == crate::model::CfConnectionMode::Auto;
             let (sender, events, handle) = worker::cf::spawn(
                 spec.id.clone(),
@@ -379,14 +380,16 @@ fn watch_task(name: &'static str, handle: tokio::task::JoinHandle<()>) {
 
 use std::time::Duration;
 
-fn connection_signature(cfg: &LocalConfig) -> Vec<(String, String, String, String, String)> {
+fn connection_signature(
+    cfg: &LocalConfig,
+) -> Vec<(String, ReporterProtocol, String, String, String)> {
     cfg.reporter_specs()
         .into_iter()
         .map(|spec| {
             let (id, protocol, server_id, secret, worker_url) = spec.connection_key();
             (
                 id.to_string(),
-                protocol.to_string(),
+                protocol,
                 server_id.to_string(),
                 secret.to_string(),
                 worker_url.to_string(),

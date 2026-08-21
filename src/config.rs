@@ -7,8 +7,8 @@ use tokio::sync::watch;
 
 use crate::model::{
     CollectionIntervals, ExtConfig, GlobalConfigSummary, GlobalPingTarget, Intervals,
-    KomariLearnedPing, PingKind, PingTarget, RemoteConfig, ReporterConfig, ReporterSummary,
-    StaticConfig,
+    KomariLearnedPing, PingKind, PingTarget, RemoteConfig, ReporterConfig, ReporterProtocol,
+    ReporterSummary, StaticConfig,
 };
 
 pub const KOMARI_LEARNED_PING_LIMIT: usize = 5;
@@ -68,7 +68,7 @@ pub struct LocalConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReporterSpec {
     pub id: String,
-    pub protocol: String,
+    pub protocol: ReporterProtocol,
     pub server_id: String,
     pub secret: String,
     pub worker_url: String,
@@ -97,10 +97,10 @@ pub struct KomariPingRegistration {
 }
 
 impl ReporterSpec {
-    pub fn connection_key(&self) -> (&str, &str, &str, &str, &str) {
+    pub fn connection_key(&self) -> (&str, ReporterProtocol, &str, &str, &str) {
         (
             &self.id,
-            &self.protocol,
+            self.protocol,
             &self.server_id,
             &self.secret,
             &self.worker_url,
@@ -123,7 +123,7 @@ impl ReporterSpec {
             report_errors: self.report_errors,
             report_self: self.report_self,
             pings: self.pings.iter().map(|ping| ping.target.clone()).collect(),
-            ext: (self.protocol == "cf").then(|| self.ext.clone()),
+            ext: (self.protocol == ReporterProtocol::Cf).then(|| self.ext.clone()),
         }
     }
 }
@@ -178,12 +178,7 @@ impl LocalConfig {
             if !ids.insert(reporter.id.clone()) {
                 bail!("reporters.id 重复: {}", reporter.id);
             }
-            validate_connection(
-                &reporter.protocol,
-                &reporter.server_id,
-                &reporter.secret,
-                &reporter.worker_url,
-            )?;
+            validate_connection(&reporter.server_id, &reporter.secret, &reporter.worker_url)?;
             if reporter.report_interval == 0 {
                 bail!("reporter {} report_interval 必须 >= 1", reporter.id);
             }
@@ -206,7 +201,7 @@ impl LocalConfig {
             .iter()
             .map(|r| ReporterSpec {
                 id: r.id.clone(),
-                protocol: r.protocol.clone(),
+                protocol: r.protocol,
                 server_id: r.server_id.clone(),
                 secret: r.secret.clone(),
                 worker_url: r.worker_url.clone(),
@@ -215,7 +210,7 @@ impl LocalConfig {
                 reset_day: r.reset_day,
                 interfaces: r.interfaces.clone(),
                 disks: r.disks.clone(),
-                report_gpu: r.report_gpu.unwrap_or(r.protocol == "cf"),
+                report_gpu: r.report_gpu.unwrap_or(r.protocol == ReporterProtocol::Cf),
                 report_errors: r.report_errors,
                 report_self: r.report_self,
                 pings: reporter_ping_targets(r),
@@ -359,7 +354,7 @@ fn reporter_ping_targets(reporter: &ReporterConfig) -> Vec<ScopedPingTarget> {
             target,
         })
         .collect();
-    if reporter.protocol != "komari" {
+    if reporter.protocol != ReporterProtocol::Komari {
         return targets;
     }
 
@@ -484,7 +479,7 @@ fn global_ping_uri(ping: &PingTarget) -> Result<String> {
     }
 }
 
-fn validate_connection(protocol: &str, server_id: &str, secret: &str, url: &str) -> Result<()> {
+fn validate_connection(server_id: &str, secret: &str, url: &str) -> Result<()> {
     if server_id.trim().is_empty() {
         bail!("server_id 不能为空");
     }
@@ -493,9 +488,6 @@ fn validate_connection(protocol: &str, server_id: &str, secret: &str, url: &str)
     }
     if !url.starts_with("http://") && !url.starts_with("https://") {
         bail!("worker_url 必须是 http(s) URL");
-    }
-    if !["probe", "cf", "komari"].contains(&protocol) {
-        bail!("protocol 必须是 probe / cf / komari");
     }
     Ok(())
 }
@@ -534,7 +526,7 @@ fn validate_pings(pings: &[PingTarget]) -> Result<()> {
 
 fn validate_komari_pings(reporter: &ReporterConfig) -> Result<()> {
     let learned = &reporter.ext.komari.learned_pings;
-    if reporter.protocol != "komari" && !learned.is_empty() {
+    if reporter.protocol != ReporterProtocol::Komari && !learned.is_empty() {
         bail!("ext.komari.learned_pings 只允许用于 protocol=\"komari\"");
     }
     if learned.len() > KOMARI_LEARNED_PING_LIMIT {
@@ -698,7 +690,7 @@ impl SharedConfig {
             .position(|reporter| reporter.id == reporter_id)
             .ok_or_else(|| anyhow::anyhow!("Reporter 不存在: {reporter_id}"))?;
         let reporter = &cfg.reporters[reporter_index];
-        if reporter.protocol != "komari" {
+        if reporter.protocol != ReporterProtocol::Komari {
             bail!("Reporter {reporter_id} 不是 Komari 协议");
         }
         let default_interval = reporter.intervals.ping;
@@ -820,7 +812,9 @@ impl SharedConfig {
             .ok_or_else(|| anyhow::anyhow!("Reporter 不存在: {reporter_id}"))?;
         // 协议守卫:ext.cf 只对 CF 协议 Reporter 有意义,其他线路收到应整体
         // 拒绝,避免把无意义的协议扩展写进 TOML。
-        if ext.as_ref().is_some_and(|ext| ext.cf.is_some()) && reporter.protocol != "cf" {
+        if ext.as_ref().is_some_and(|ext| ext.cf.is_some())
+            && reporter.protocol != ReporterProtocol::Cf
+        {
             bail!(
                 "ext.cf 仅对 CF 协议 Reporter 生效,当前协议: {}",
                 reporter.protocol
@@ -980,7 +974,7 @@ mod tests {
             auto_update: AutoUpdateConfig::default(),
             reporters: vec![ReporterConfig {
                 id: "primary".into(),
-                protocol: "probe".into(),
+                protocol: ReporterProtocol::Probe,
                 server_id: "s1".into(),
                 secret: "sec".into(),
                 worker_url: "https://example.com/report".into(),
@@ -1169,7 +1163,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.reporters.push(ReporterConfig {
             id: "komari-a".into(),
-            protocol: "komari".into(),
+            protocol: ReporterProtocol::Komari,
             server_id: "node-a".into(),
             secret: "token".into(),
             worker_url: "http://panel.example".into(),
@@ -1196,7 +1190,7 @@ mod tests {
         });
         cfg.reporters.push(ReporterConfig {
             id: "cf-a".into(),
-            protocol: "cf".into(),
+            protocol: ReporterProtocol::Cf,
             server_id: "cf-id".into(),
             secret: "cf-secret".into(),
             worker_url: "https://worker.example/update".into(),
@@ -1387,7 +1381,7 @@ diskio = 10
         let cfg: LocalConfig = toml::from_str(text).unwrap();
         cfg.validate().unwrap();
         let komari = cfg.reporter("komari").unwrap();
-        assert_eq!(komari.protocol, "komari");
+        assert_eq!(komari.protocol, ReporterProtocol::Komari);
         assert_eq!(komari.reset_day, 12);
         assert_eq!(komari.intervals.collect, 1);
         assert!(komari.report_gpu);
@@ -1401,7 +1395,7 @@ diskio = 10
         let path = dir.join("config.toml");
         let mut cfg = base_config();
         let reporter = &mut cfg.reporters[0];
-        reporter.protocol = "komari".into();
+        reporter.protocol = ReporterProtocol::Komari;
         reporter.worker_url = "https://komari.example.com".into();
         reporter.pings.clear();
         persist(&path, &cfg).unwrap();
@@ -1594,7 +1588,7 @@ ping = 30
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut cfg = base_config();
-        cfg.reporters[0].protocol = "cf".into();
+        cfg.reporters[0].protocol = ReporterProtocol::Cf;
         cfg.reporters[0].worker_url = "https://worker.example/update".into();
         persist(&path, &cfg).unwrap();
         let (shared, _intervals_rx, _config_rx) = SharedConfig::new(cfg, path.clone());

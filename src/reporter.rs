@@ -11,7 +11,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::net::{lookup_host, UdpSocket};
 use tokio::sync::watch;
 
-use crate::model::{RemoteConfig, Report, ReportTime};
+use crate::model::{RemoteConfig, Report, ReportTime, ReporterProtocol};
 use crate::reporter_cf::{
     parse_wss_runtime_headers, CfConfirm, CfResponse, CfUpdate, CF_WSS_MODE_HEADER,
     CF_WSS_REASON_HEADER,
@@ -72,7 +72,7 @@ pub struct Reporter {
     secret: String,
     agent_version: String,
     reporter_id: String,
-    protocol: String,
+    protocol: ReporterProtocol,
     clock: Arc<AgentClock>,
 }
 
@@ -503,7 +503,7 @@ impl Reporter {
         secret: &str,
         agent_version: &str,
         reporter_id: &str,
-        protocol: &str,
+        protocol: ReporterProtocol,
         clock: Arc<AgentClock>,
     ) -> Result<Self> {
         let client = reqwest::Client::builder()
@@ -520,7 +520,7 @@ impl Reporter {
             secret: secret.to_string(),
             agent_version: agent_version.to_string(),
             reporter_id: reporter_id.to_string(),
-            protocol: protocol.to_string(),
+            protocol,
             clock,
         })
     }
@@ -546,7 +546,10 @@ impl Reporter {
             // Optional metadata: old servers ignore these headers. Values are
             // percent-encoded so arbitrary Unicode Reporter ids remain valid.
             .header("X-Reporter-Id", encode_header_value(&self.reporter_id))
-            .header("X-Reporter-Protocol", encode_header_value(&self.protocol))
+            .header(
+                "X-Reporter-Protocol",
+                encode_header_value(self.protocol.as_str()),
+            )
             .json(report)
             .send()
             .await

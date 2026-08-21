@@ -17,7 +17,7 @@ use crate::collector::{self, net, CpuMonitor};
 use crate::config::{ReporterSpec, SharedConfig};
 use crate::model::{
     AsyncRecord, CfConnectionMode, DynamicRecord, ErrorRecord, GpuRecord, Intervals,
-    NetInterfaceSample, PingRecord, Report, SelfRecord, SlowBlock, StaticInfo,
+    NetInterfaceSample, PingRecord, Report, ReporterProtocol, SelfRecord, SlowBlock, StaticInfo,
 };
 use crate::netstatic::{period_start_ms, NetStatic};
 use crate::reporter::{AgentClock, Reporter};
@@ -422,7 +422,8 @@ impl ReporterRunner {
     fn sync_cf_ws(&self, spec: &ReporterSpec) {
         if let Some(ws) = &self.cf_ws {
             ws.set_config(
-                spec.protocol == "cf" && spec.ext.cf.connection_mode == CfConnectionMode::Auto,
+                spec.protocol == ReporterProtocol::Cf
+                    && spec.ext.cf.connection_mode == CfConnectionMode::Auto,
                 &spec.config_version,
             );
         }
@@ -454,13 +455,15 @@ impl ReporterRunner {
         let Some(spec) = self.cfg.get().reporter(&self.id) else {
             return Duration::from_secs(60);
         };
-        if spec.protocol == "cf" {
+        if spec.protocol == ReporterProtocol::Cf {
             if let Some(remaining) = self.cf_policy_backoff_remaining() {
                 return remaining;
             }
         }
         let report = Duration::from_secs(spec.intervals.report.max(1));
-        if spec.protocol != "cf" || spec.ext.cf.connection_mode == CfConnectionMode::Http {
+        if spec.protocol != ReporterProtocol::Cf
+            || spec.ext.cf.connection_mode == CfConnectionMode::Http
+        {
             return report;
         }
         if let Some(ws) = self.cf_ws.as_ref().filter(|ws| ws.connected()) {
@@ -488,7 +491,7 @@ impl ReporterRunner {
         let Some(spec) = self.cfg.get().reporter(&self.id) else {
             return;
         };
-        let cf_inflight_through = (spec.protocol == "cf"
+        let cf_inflight_through = (spec.protocol == ReporterProtocol::Cf
             && spec.ext.cf.connection_mode == CfConnectionMode::Auto)
             .then(|| {
                 self.cf_ws
@@ -506,8 +509,8 @@ impl ReporterRunner {
             self.last_dynamic = Some(latest.clone());
         }
 
-        let ack_now = match spec.protocol.as_str() {
-            "cf" => {
+        let ack_now = match spec.protocol {
+            ReporterProtocol::Cf => {
                 self.report_cf(
                     &spec,
                     &dynamic,
@@ -516,12 +519,12 @@ impl ReporterRunner {
                 )
                 .await
             }
-            "komari" => self.report_komari(&spec, &dynamic, &batch).await,
-            _ => self.report_probe(&spec, dynamic, &batch).await,
+            ReporterProtocol::Komari => self.report_komari(&spec, &dynamic, &batch).await,
+            ReporterProtocol::Probe => self.report_probe(&spec, dynamic, &batch).await,
         };
         // Komari 的 ack 在 WS worker 发帧后进行；CF WSS 则由 actor 收到
         // 服务端 ACK 后异步推进。这里仅处理 HTTP 等可立即确认的结果。
-        if ack_now && spec.protocol != "komari" {
+        if ack_now && spec.protocol != ReporterProtocol::Komari {
             self.buffers.ack(&self.id, batch.through);
         }
     }
@@ -1122,7 +1125,7 @@ impl ReporterRunner {
 fn report_schedule_changed(previous: &ReporterSpec, current: &ReporterSpec) -> bool {
     previous.protocol != current.protocol
         || previous.intervals.report != current.intervals.report
-        || (current.protocol == "cf"
+        || (current.protocol == ReporterProtocol::Cf
             && previous.ext.cf.connection_mode != current.ext.cf.connection_mode)
 }
 
@@ -1335,7 +1338,7 @@ mod tests {
         };
         ReporterSpec {
             id: "primary".into(),
-            protocol: "probe".into(),
+            protocol: ReporterProtocol::Probe,
             server_id: "server".into(),
             secret: "secret".into(),
             worker_url: "https://example.com/report".into(),
@@ -1396,7 +1399,7 @@ mod tests {
         assert!(report_schedule_changed(&original, &cadence));
 
         let mut cf = original.clone();
-        cf.protocol = "cf".into();
+        cf.protocol = ReporterProtocol::Cf;
         let mut cf_http = cf.clone();
         cf_http.ext.cf.connection_mode = CfConnectionMode::Http;
         assert!(report_schedule_changed(&cf, &cf_http));

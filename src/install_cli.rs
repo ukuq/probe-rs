@@ -11,7 +11,9 @@ use chrono::{Local, TimeZone};
 
 use crate::collector::net::IfaceFilter;
 use crate::config::{self, AutoUpdateConfig, LocalConfig, UpdateChannel};
-use crate::model::{CfConnectionMode, CollectionIntervals, PingKind, PingTarget, ReporterConfig};
+use crate::model::{
+    CfConnectionMode, CollectionIntervals, PingKind, PingTarget, ReporterConfig, ReporterProtocol,
+};
 use crate::netstatic::{self, NetStatic};
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -169,7 +171,7 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
     let cf_ids: Vec<_> = config
         .reporters
         .iter()
-        .filter(|reporter| reporter.protocol == "cf")
+        .filter(|reporter| reporter.protocol == ReporterProtocol::Cf)
         .map(|reporter| reporter.id.clone())
         .collect();
     let selected_id = match options.reporter_id {
@@ -185,14 +187,14 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
     if config
         .reporters
         .iter()
-        .any(|reporter| reporter.id == selected_id && reporter.protocol != "cf")
+        .any(|reporter| reporter.id == selected_id && reporter.protocol != ReporterProtocol::Cf)
     {
         bail!("Reporter id '{selected_id}' already belongs to a non-CF Reporter");
     }
     if options.replace_cf {
-        config
-            .reporters
-            .retain(|reporter| reporter.protocol != "cf" || reporter.id == selected_id);
+        config.reporters.retain(|reporter| {
+            reporter.protocol != ReporterProtocol::Cf || reporter.id == selected_id
+        });
     }
 
     let index = config
@@ -207,7 +209,7 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
         .iter_mut()
         .find(|reporter| reporter.id == selected_id)
         .expect("CF Reporter was inserted");
-    reporter.protocol = "cf".to_owned();
+    reporter.protocol = ReporterProtocol::Cf;
     reporter.server_id = options.server_id;
     reporter.secret = options.secret;
     reporter.worker_url = options.worker_url;
@@ -255,7 +257,7 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
 fn new_cf_reporter(id: String) -> ReporterConfig {
     ReporterConfig {
         id,
-        protocol: "cf".to_owned(),
+        protocol: ReporterProtocol::Cf,
         server_id: String::new(),
         secret: String::new(),
         worker_url: String::new(),
@@ -377,7 +379,7 @@ fn set_traffic_correction_with_clock(
     let reporter = config
         .reporter(&options.reporter_id)
         .with_context(|| format!("Reporter '{}' does not exist", options.reporter_id))?;
-    if reporter.protocol != "cf" {
+    if reporter.protocol != ReporterProtocol::Cf {
         bail!("Reporter '{}' is not a CF Reporter", options.reporter_id);
     }
     let ledger_path = PathBuf::from(&config.net_static_path);
@@ -562,7 +564,7 @@ mod tests {
             reporter.worker_url = "https://example.com/update".into();
         }
         let mut probe = new_cf_reporter("probe".into());
-        probe.protocol = "probe".into();
+        probe.protocol = ReporterProtocol::Probe;
         probe.server_id = "probe-server".into();
         probe.secret = "probe-secret".into();
         probe.worker_url = "https://example.com/report".into();
@@ -579,7 +581,7 @@ mod tests {
             config
                 .reporter_specs()
                 .iter()
-                .filter(|reporter| reporter.protocol == "cf")
+                .filter(|reporter| reporter.protocol == ReporterProtocol::Cf)
                 .count(),
             1
         );
