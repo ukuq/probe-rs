@@ -22,6 +22,10 @@ use crate::model::{
 };
 
 pub const CF_CONFIG_SCHEMA: &str = "5";
+pub const CF_WSS_MODE_HEADER: &str = "X-Agent-Wss-Mode";
+pub const CF_WSS_REASON_HEADER: &str = "X-Agent-Wss-Reason";
+pub const CF_WSS_SCHEDULE_INACTIVE: &str = "wss_schedule_inactive";
+pub const CF_WSS_SCHEDULE_EMPTY: &str = "wss_schedule_empty";
 
 /// 一次 /update 请求体
 #[derive(Debug, Serialize)]
@@ -448,6 +452,40 @@ pub struct CfResponse {
     pub push: Option<CfPush>,
     /// 流量校正（GB，覆盖当月；不参与配置 MD5）
     pub correction: Option<(f64, f64)>,
+    /// Temporary WSS schedule state advertised by POST response headers.
+    pub wss_runtime: Option<CfWssRuntimeState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CfWssRuntimeState {
+    pub active: bool,
+    pub reason: String,
+}
+
+pub fn is_wss_schedule_inactive_reason(reason: &str) -> bool {
+    matches!(
+        reason.trim().to_ascii_lowercase().as_str(),
+        CF_WSS_SCHEDULE_INACTIVE | CF_WSS_SCHEDULE_EMPTY
+    )
+}
+
+pub fn parse_wss_runtime_headers(
+    mode: Option<&str>,
+    reason: Option<&str>,
+) -> Option<CfWssRuntimeState> {
+    let mode = mode?.trim().to_ascii_lowercase();
+    let reason = reason.unwrap_or_default().trim().to_ascii_lowercase();
+    match mode.as_str() {
+        "active" => Some(CfWssRuntimeState {
+            active: true,
+            reason,
+        }),
+        "inactive" if is_wss_schedule_inactive_reason(&reason) => Some(CfWssRuntimeState {
+            active: false,
+            reason,
+        }),
+        _ => None,
+    }
 }
 
 /// 校正 GB 值合法性（对齐官方 MAX_TRAFFIC_CORRECTION_GB 思路）
@@ -564,6 +602,7 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
     CfResponse {
         push: has_config.then_some(push),
         correction,
+        wss_runtime: None,
     }
 }
 
@@ -857,6 +896,27 @@ mod tests {
         // 非法校正值：忽略
         let r2 = parse_response_body("rx_correction=-3&tx_correction=abc", None);
         assert!(r2.correction.is_none());
+    }
+
+    #[test]
+    fn wss_runtime_headers_accept_only_official_schedule_states() {
+        assert_eq!(
+            parse_wss_runtime_headers(Some("inactive"), Some("WSS_SCHEDULE_INACTIVE")),
+            Some(CfWssRuntimeState {
+                active: false,
+                reason: "wss_schedule_inactive".into(),
+            })
+        );
+        assert_eq!(
+            parse_wss_runtime_headers(Some("active"), Some("wss_schedule_active")),
+            Some(CfWssRuntimeState {
+                active: true,
+                reason: "wss_schedule_active".into(),
+            })
+        );
+        assert!(parse_wss_runtime_headers(Some("disabled"), Some("wss_disabled")).is_none());
+        assert!(parse_wss_runtime_headers(Some("inactive"), Some("maintenance")).is_none());
+        assert!(parse_wss_runtime_headers(None, Some("wss_schedule_inactive")).is_none());
     }
 
     #[test]

@@ -12,7 +12,10 @@ use tokio::net::{lookup_host, UdpSocket};
 use tokio::sync::watch;
 
 use crate::model::{RemoteConfig, Report, ReportTime};
-use crate::reporter_cf::{CfConfirm, CfResponse, CfUpdate};
+use crate::reporter_cf::{
+    parse_wss_runtime_headers, CfConfirm, CfResponse, CfUpdate, CF_WSS_MODE_HEADER,
+    CF_WSS_REASON_HEADER,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(8);
 const NTP_SERVERS: [&str; 4] = [
@@ -612,8 +615,22 @@ impl Reporter {
             )
             .await?;
         let status = resp.status();
+        let wss_mode = resp
+            .headers()
+            .get(CF_WSS_MODE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let wss_reason = resp
+            .headers()
+            .get(CF_WSS_REASON_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let wss_runtime = parse_wss_runtime_headers(wss_mode.as_deref(), wss_reason.as_deref());
         if status.as_u16() == 204 {
-            return Ok(CfResponse::default());
+            return Ok(CfResponse {
+                wss_runtime,
+                ..Default::default()
+            });
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -625,10 +642,9 @@ impl Reporter {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         let body = resp.text().await.context("读取上报响应失败")?;
-        Ok(crate::reporter_cf::parse_response_body(
-            &body,
-            resp_md5.as_deref(),
-        ))
+        let mut response = crate::reporter_cf::parse_response_body(&body, resp_md5.as_deref());
+        response.wss_runtime = wss_runtime;
+        Ok(response)
     }
 
     /// CF 校正确认（独立请求，不带 metrics）：成功 200 纯文本 OK

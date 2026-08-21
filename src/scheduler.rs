@@ -342,6 +342,11 @@ impl ReporterRunner {
                             let delay = self.current_report_delay();
                             report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
                         }
+                        Some(CfWsEvent::ScheduleInactive { reason }) => {
+                            self.set_cf_wss_runtime_enabled(false, &reason);
+                            let delay = self.current_report_delay();
+                            report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
+                        }
                         Some(CfWsEvent::ReportIntervalChanged(interval)) => {
                             tracing::debug!(
                                 reporter_id = %self.id,
@@ -370,7 +375,7 @@ impl ReporterRunner {
                         }
                         Some(CfWsEvent::Config(response)) => {
                             if let Some(spec) = self.cfg.get().reporter(&self.id) {
-                                self.apply_cf_response(&spec, response).await;
+                                self.apply_cf_response(&spec, *response).await;
                             }
                         }
                         None => self.cf_ws_events = None,
@@ -419,6 +424,28 @@ impl ReporterRunner {
             ws.set_config(
                 spec.protocol == "cf" && spec.ext.cf.connection_mode == CfConnectionMode::Auto,
                 &spec.config_version,
+            );
+        }
+    }
+
+    fn set_cf_wss_runtime_enabled(&self, enabled: bool, reason: &str) {
+        let Some(ws) = &self.cf_ws else {
+            return;
+        };
+        if !ws.set_runtime_enabled(enabled) {
+            return;
+        }
+        if enabled {
+            tracing::info!(
+                reporter_id = %self.id,
+                reason,
+                "CF WSS schedule active; reconnecting"
+            );
+        } else {
+            tracing::info!(
+                reporter_id = %self.id,
+                reason,
+                "CF WSS schedule inactive; using POST fallback"
             );
         }
     }
@@ -872,6 +899,9 @@ impl ReporterRunner {
         spec: &ReporterSpec,
         response: crate::reporter_cf::CfResponse,
     ) {
+        if let Some(runtime) = response.wss_runtime.as_ref() {
+            self.set_cf_wss_runtime_enabled(runtime.active, &runtime.reason);
+        }
         if let Some(push) = response.push {
             let current_pings: Vec<_> = spec.pings.iter().map(|ping| ping.target.clone()).collect();
             let remote =

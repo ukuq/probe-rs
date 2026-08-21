@@ -16,10 +16,11 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::USER_AGENT;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use crate::reporter_cf::{
-    cf_agent_version, parse_response_body, CfResponse, CfUpdate, CF_CONFIG_SCHEMA,
+    cf_agent_version, is_wss_schedule_inactive_reason, parse_response_body, CfResponse, CfUpdate,
+    CF_CONFIG_SCHEMA, CF_WSS_MODE_HEADER, CF_WSS_REASON_HEADER,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -35,8 +36,15 @@ const MAX_REPORT_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Control {
-    enabled: bool,
+    configured_enabled: bool,
+    runtime_enabled: bool,
     config_md5: String,
+}
+
+impl Control {
+    fn enabled(&self) -> bool {
+        self.configured_enabled && self.runtime_enabled
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -71,14 +79,28 @@ impl fmt::Display for PolicyError {
 
 impl std::error::Error for PolicyError {}
 
+#[derive(Debug, Clone)]
+struct ScheduleInactiveError {
+    reason: String,
+}
+
+impl fmt::Display for ScheduleInactiveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CF WSS schedule inactive: {}", self.reason)
+    }
+}
+
+impl std::error::Error for ScheduleInactiveError {}
+
 #[derive(Debug)]
 pub enum CfWsEvent {
     Connected,
     Disconnected(String),
+    ScheduleInactive { reason: String },
     ReportIntervalChanged(Duration),
     PolicyBackoff { reason: String, duration: Duration },
     Acknowledged { through: u64, included_static: bool },
-    Config(CfResponse),
+    Config(Box<CfResponse>),
 }
 
 #[derive(Clone)]
@@ -115,18 +137,28 @@ impl CfWsSender {
     }
 
     pub fn set_config(&self, enabled: bool, config_md5: &str) {
-        let desired = Control {
-            enabled,
-            config_md5: normalized_md5(config_md5),
-        };
+        let config_md5 = normalized_md5(config_md5);
         self.control_tx.send_if_modified(|current| {
-            if *current == desired {
+            if current.configured_enabled == enabled && current.config_md5 == config_md5 {
                 false
             } else {
-                *current = desired;
+                current.configured_enabled = enabled;
+                current.config_md5.clone_from(&config_md5);
                 true
             }
         });
+    }
+
+    /// Temporarily gate WSS without changing the persisted connection mode.
+    pub fn set_runtime_enabled(&self, enabled: bool) -> bool {
+        self.control_tx.send_if_modified(|current| {
+            if current.runtime_enabled == enabled {
+                false
+            } else {
+                current.runtime_enabled = enabled;
+                true
+            }
+        })
     }
 
     /// Publish the latest report without waiting for a server ACK.
@@ -162,7 +194,8 @@ pub fn spawn(
     let (payload_tx, payload_rx) = watch::channel(None);
     let (event_tx, event_rx) = mpsc::channel(32);
     let (control_tx, control_rx) = watch::channel(Control {
-        enabled,
+        configured_enabled: enabled,
+        runtime_enabled: true,
         config_md5: normalized_md5(&config_md5),
     });
     let (connected_tx, connected_rx) = watch::channel(false);
@@ -207,7 +240,7 @@ async fn run_actor(
     } = channels;
     let mut retry = RETRY_MIN;
     loop {
-        if !control_rx.borrow().enabled {
+        if !control_rx.borrow().enabled() {
             if !wait_disabled(&mut control_rx, &mut payload_rx).await {
                 return;
             }
@@ -217,7 +250,14 @@ async fn run_actor(
 
         let config_md5 = control_rx.borrow().config_md5.clone();
         match connect(&endpoint, &agent_version, &config_md5).await {
-            Ok(ws) => {
+            Ok(mut ws) => {
+                // Control can change while the handshake and hello exchange are
+                // in progress. Do not advertise or use a connection that was
+                // disabled before connect() completed.
+                if !control_rx.borrow().enabled() {
+                    let _ = tokio::time::timeout(SOCKET_WRITE_TIMEOUT, ws.close(None)).await;
+                    continue;
+                }
                 retry = RETRY_MIN;
                 // Drop the previous generation's queued snapshot before the
                 // connected flag allows the Reporter to publish a fresh one.
@@ -239,7 +279,7 @@ async fn run_actor(
                 connected_tx.send_replace(false);
                 in_flight_tx.send_replace(None);
                 match result {
-                    Ok(()) if !control_rx.borrow().enabled => {
+                    Ok(()) if !control_rx.borrow().enabled() => {
                         tracing::info!(reporter_id, "CF WSS disabled");
                         continue;
                     }
@@ -248,18 +288,31 @@ async fn run_actor(
                         let _ = event_tx.send(CfWsEvent::Disconnected(reason)).await;
                     }
                     Err(error) => {
-                        let reason = error.to_string();
-                        tracing::warn!(reporter_id, error = %reason, "CF WSS disconnected");
-                        if error.downcast_ref::<PolicyError>().is_some() {
-                            retry = retry.max(POLICY_BACKOFF);
+                        if let Some(error) = error.downcast_ref::<ScheduleInactiveError>() {
+                            tracing::info!(
+                                reporter_id,
+                                reason = %error.reason,
+                                "CF WSS schedule inactive"
+                            );
                             let _ = event_tx
-                                .send(CfWsEvent::PolicyBackoff {
-                                    reason,
-                                    duration: POLICY_BACKOFF,
+                                .send(CfWsEvent::ScheduleInactive {
+                                    reason: error.reason.clone(),
                                 })
                                 .await;
                         } else {
-                            let _ = event_tx.send(CfWsEvent::Disconnected(reason)).await;
+                            let reason = error.to_string();
+                            tracing::warn!(reporter_id, error = %reason, "CF WSS disconnected");
+                            if error.downcast_ref::<PolicyError>().is_some() {
+                                retry = retry.max(POLICY_BACKOFF);
+                                let _ = event_tx
+                                    .send(CfWsEvent::PolicyBackoff {
+                                        reason,
+                                        duration: POLICY_BACKOFF,
+                                    })
+                                    .await;
+                            } else {
+                                let _ = event_tx.send(CfWsEvent::Disconnected(reason)).await;
+                            }
                         }
                     }
                 }
@@ -267,9 +320,22 @@ async fn run_actor(
             Err(error) => {
                 connected_tx.send_replace(false);
                 in_flight_tx.send_replace(None);
-                let reason = error.to_string();
-                tracing::warn!(reporter_id, error = %reason, retry_secs = retry.as_secs(), "CF WSS connect failed");
-                let _ = event_tx.send(CfWsEvent::Disconnected(reason)).await;
+                if let Some(error) = error.downcast_ref::<ScheduleInactiveError>() {
+                    tracing::info!(
+                        reporter_id,
+                        reason = %error.reason,
+                        "CF WSS schedule inactive during handshake"
+                    );
+                    let _ = event_tx
+                        .send(CfWsEvent::ScheduleInactive {
+                            reason: error.reason.clone(),
+                        })
+                        .await;
+                } else {
+                    let reason = error.to_string();
+                    tracing::warn!(reporter_id, error = %reason, retry_secs = retry.as_secs(), "CF WSS connect failed");
+                    let _ = event_tx.send(CfWsEvent::Disconnected(reason)).await;
+                }
             }
         }
 
@@ -288,7 +354,7 @@ async fn wait_disabled(
         tokio::select! {
             changed = control_rx.changed() => {
                 if changed.is_err() { return false; }
-                if control_rx.borrow().enabled { return true; }
+                if control_rx.borrow().enabled() { return true; }
             }
             changed = payload_rx.changed() => {
                 if changed.is_err() { return false; }
@@ -310,7 +376,7 @@ async fn wait_retry(
             _ = &mut sleep => return true,
             changed = control_rx.changed() => {
                 if changed.is_err() { return false; }
-                if !control_rx.borrow().enabled { return true; }
+                if !control_rx.borrow().enabled() { return true; }
             }
             changed = payload_rx.changed() => {
                 if changed.is_err() { return false; }
@@ -322,6 +388,58 @@ async fn wait_retry(
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+fn normalized_schedule_inactive_reason(reason: &str) -> Option<String> {
+    let reason = reason.trim().to_ascii_lowercase();
+    is_wss_schedule_inactive_reason(&reason).then_some(reason)
+}
+
+fn schedule_inactive_from_headers(mode: Option<&str>, reason: Option<&str>) -> Option<String> {
+    let mode = mode.unwrap_or_default().trim().to_ascii_lowercase();
+    if !mode.is_empty() && mode != "inactive" {
+        return None;
+    }
+    normalized_schedule_inactive_reason(reason.unwrap_or_default())
+}
+
+fn schedule_inactive_from_handshake(error: &WsError) -> Option<String> {
+    let WsError::Http(response) = error else {
+        return None;
+    };
+    if response.status().as_u16() != 409 {
+        return None;
+    }
+    let mode = response
+        .headers()
+        .get(CF_WSS_MODE_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let reason = response
+        .headers()
+        .get(CF_WSS_REASON_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if let Some(reason) = schedule_inactive_from_headers(mode, reason) {
+        return Some(reason);
+    }
+
+    let body = response.body().as_deref()?;
+    let body = std::str::from_utf8(body).ok()?.trim();
+    if let Some(reason) = normalized_schedule_inactive_reason(body) {
+        return Some(reason);
+    }
+    let payload: serde_json::Value = serde_json::from_str(body).ok()?;
+    ["text", "error"].into_iter().find_map(|key| {
+        payload
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(normalized_schedule_inactive_reason)
+    })
+}
+
+fn schedule_inactive_from_close(code: u16, reason: &str) -> Option<String> {
+    (code == 1013)
+        .then(|| normalized_schedule_inactive_reason(reason))
+        .flatten()
+}
 
 async fn connect(endpoint: &str, agent_version: &str, config_md5: &str) -> Result<WsStream> {
     let url = websocket_url(endpoint, config_md5)?;
@@ -343,11 +461,19 @@ async fn connect(endpoint: &str, agent_version: &str, config_md5: &str) -> Resul
         HeaderValue::from_str(&normalized_md5(config_md5)).context("CF 配置 MD5 头非法")?,
     );
 
-    let (mut ws, _) =
+    let handshake =
         tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
             .await
-            .context("CF WSS 握手超时")?
-            .context("CF WSS 握手失败")?;
+            .context("CF WSS 握手超时")?;
+    let (mut ws, _) = match handshake {
+        Ok(connected) => connected,
+        Err(error) => {
+            if let Some(reason) = schedule_inactive_from_handshake(&error) {
+                return Err(ScheduleInactiveError { reason }.into());
+            }
+            return Err(error).context("CF WSS 握手失败");
+        }
+    };
     let hello = tokio::time::timeout(HELLO_TIMEOUT, ws.next())
         .await
         .context("等待 CF WSS hello 超时")?
@@ -384,13 +510,19 @@ async fn run_session(
                 bail!("CF WSS 连续 {} 秒未收到 ACK", ACK_SILENCE_TIMEOUT.as_secs());
             }
             changed = control_rx.changed() => {
-                if changed.is_err() || !control_rx.borrow().enabled {
+                if changed.is_err() || !control_rx.borrow().enabled() {
                     let _ = ws.close(None).await;
                     return Ok(());
                 }
             }
             changed = payload_rx.changed() => {
                 if changed.is_err() {
+                    return Ok(());
+                }
+                // Prefer the latest control state even when a report and a
+                // runtime-disable notification become ready together.
+                if !control_rx.borrow().enabled() {
+                    let _ = ws.close(None).await;
                     return Ok(());
                 }
                 let outbound = payload_rx.borrow_and_update().clone();
@@ -443,6 +575,11 @@ async fn run_session(
                     Message::Ping(payload) => ws.send(Message::Pong(payload)).await.context("发送 CF WSS pong 失败")?,
                     Message::Pong(_) => {}
                     Message::Close(frame) => {
+                        if let Some(reason) = frame.as_ref().and_then(|frame| {
+                            schedule_inactive_from_close(u16::from(frame.code), frame.reason.as_ref())
+                        }) {
+                            return Err(ScheduleInactiveError { reason }.into());
+                        }
                         bail!("CF WSS server closed connection: {frame:?}");
                     }
                     Message::Binary(_) | Message::Frame(_) => {}
@@ -499,7 +636,7 @@ async fn handle_frame(
             }
             let response = frame_response(&frame);
             if response.push.is_some() || response.correction.is_some() {
-                let _ = event_tx.send(CfWsEvent::Config(response)).await;
+                let _ = event_tx.send(CfWsEvent::Config(Box::new(response))).await;
             }
             // A realtime hint reuses the ACK-shaped envelope but is not tied
             // to an outbound report and must not advance its journal cursor.
@@ -508,11 +645,26 @@ async fn handle_frame(
         "config" | "remote_config" => {
             let response = frame_response(&frame);
             if response.push.is_some() || response.correction.is_some() {
-                let _ = event_tx.send(CfWsEvent::Config(response)).await;
+                let _ = event_tx.send(CfWsEvent::Config(Box::new(response))).await;
             }
             false
         }
         "error" => {
+            if frame.code == 409 {
+                let reason = frame
+                    .text
+                    .as_deref()
+                    .and_then(normalized_schedule_inactive_reason)
+                    .or_else(|| {
+                        frame
+                            .error
+                            .as_deref()
+                            .and_then(normalized_schedule_inactive_reason)
+                    });
+                if let Some(reason) = reason {
+                    return Err(ScheduleInactiveError { reason }.into());
+                }
+            }
             let error = PolicyError {
                 code: frame.code,
                 reason: frame.error.unwrap_or_else(|| "server_error".into()),
@@ -610,6 +762,8 @@ struct ServerFrame {
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
     code: i64,
     #[serde(default)]
     body: Option<String>,
@@ -627,7 +781,8 @@ mod tests {
     async fn sender_replaces_an_unsent_snapshot_without_waiting_for_ack() {
         let (payload_tx, mut payload_rx) = watch::channel(None);
         let (control_tx, _control_rx) = watch::channel(Control {
-            enabled: true,
+            configured_enabled: true,
+            runtime_enabled: true,
             config_md5: "none".into(),
         });
         let (_connected_tx, connected_rx) = watch::channel(true);
@@ -659,6 +814,76 @@ mod tests {
         assert!(latest.included_static);
     }
 
+    #[test]
+    fn runtime_gate_does_not_change_persisted_wss_configuration() {
+        let (payload_tx, _payload_rx) = watch::channel(None);
+        let (control_tx, control_rx) = watch::channel(Control {
+            configured_enabled: true,
+            runtime_enabled: true,
+            config_md5: "none".into(),
+        });
+        let (_connected_tx, connected_rx) = watch::channel(false);
+        let (_in_flight_tx, in_flight_rx) = watch::channel(None);
+        let (_report_interval_tx, report_interval_rx) = watch::channel(DEFAULT_REPORT_INTERVAL);
+        let sender = CfWsSender {
+            payload_tx,
+            control_tx,
+            connected_rx,
+            in_flight_rx,
+            report_interval_rx,
+        };
+
+        assert!(control_rx.borrow().enabled());
+        assert!(sender.set_runtime_enabled(false));
+        assert!(!control_rx.borrow().enabled());
+        assert!(control_rx.borrow().configured_enabled);
+
+        sender.set_config(false, "abc");
+        assert!(sender.set_runtime_enabled(true));
+        assert!(!control_rx.borrow().enabled());
+        sender.set_config(true, "abc");
+        assert!(control_rx.borrow().enabled());
+    }
+
+    #[tokio::test]
+    async fn runtime_gate_wakes_retry_and_disabled_waits() {
+        let (control_tx, control_rx) = watch::channel(Control {
+            configured_enabled: true,
+            runtime_enabled: true,
+            config_md5: "none".into(),
+        });
+        let (_payload_tx, payload_rx) = watch::channel(None);
+        let retry_wait = tokio::spawn(async move {
+            let mut control_rx = control_rx;
+            let mut payload_rx = payload_rx;
+            wait_retry(Duration::from_secs(60), &mut control_rx, &mut payload_rx).await
+        });
+        tokio::task::yield_now().await;
+        control_tx.send_modify(|control| control.runtime_enabled = false);
+        assert!(tokio::time::timeout(Duration::from_secs(1), retry_wait)
+            .await
+            .expect("runtime disable did not wake retry wait")
+            .unwrap());
+
+        let (control_tx, control_rx) = watch::channel(Control {
+            configured_enabled: true,
+            runtime_enabled: false,
+            config_md5: "none".into(),
+        });
+        let (_payload_tx, payload_rx) = watch::channel(None);
+        let disabled_wait = tokio::spawn(async move {
+            let mut control_rx = control_rx;
+            let mut payload_rx = payload_rx;
+            wait_disabled(&mut control_rx, &mut payload_rx).await
+        });
+        tokio::task::yield_now().await;
+        control_tx.send_modify(|control| control.runtime_enabled = true);
+        assert!(tokio::time::timeout(Duration::from_secs(1), disabled_wait)
+            .await
+            .expect("runtime enable did not wake disabled wait")
+            .unwrap());
+    }
+
     #[tokio::test]
     async fn server_error_frames_trigger_policy_backoff() {
         let (event_tx, _event_rx) = mpsc::channel(1);
@@ -675,6 +900,88 @@ mod tests {
         let error = error.downcast_ref::<PolicyError>().unwrap();
         assert_eq!(error.code, 401);
         assert_eq!(error.reason, "Invalid secret");
+    }
+
+    #[tokio::test]
+    async fn schedule_error_frame_disables_only_runtime_wss() {
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (report_interval_tx, _report_interval_rx) = watch::channel(DEFAULT_REPORT_INTERVAL);
+
+        let error = handle_frame(
+            r#"{"type":"error","code":409,"error":"Agent WSS report outside active hours","text":"wss_schedule_inactive","connection_mode":"http"}"#,
+            &event_tx,
+            &report_interval_tx,
+        )
+        .await
+        .unwrap_err();
+
+        let schedule = error.downcast_ref::<ScheduleInactiveError>().unwrap();
+        assert_eq!(schedule.reason, "wss_schedule_inactive");
+        assert!(error.downcast_ref::<PolicyError>().is_none());
+    }
+
+    #[test]
+    fn schedule_handshake_and_close_signals_are_recognized_narrowly() {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(409)
+            .header(CF_WSS_MODE_HEADER, "inactive")
+            .header(CF_WSS_REASON_HEADER, "wss_schedule_empty")
+            .body(Some(Vec::new()))
+            .unwrap();
+        let error = WsError::Http(response);
+        assert_eq!(
+            schedule_inactive_from_handshake(&error).as_deref(),
+            Some("wss_schedule_empty")
+        );
+
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(409)
+            .header(CF_WSS_REASON_HEADER, "wss_schedule_inactive")
+            .body(Some(Vec::new()))
+            .unwrap();
+        let error = WsError::Http(response);
+        assert_eq!(
+            schedule_inactive_from_handshake(&error).as_deref(),
+            Some("wss_schedule_inactive")
+        );
+
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(409)
+            .body(Some(b"wss_schedule_empty".to_vec()))
+            .unwrap();
+        let error = WsError::Http(response);
+        assert_eq!(
+            schedule_inactive_from_handshake(&error).as_deref(),
+            Some("wss_schedule_empty")
+        );
+
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(409)
+            .body(Some(
+                br#"{"text":"wss_schedule_inactive","connection_mode":"http"}"#.to_vec(),
+            ))
+            .unwrap();
+        let error = WsError::Http(response);
+        assert_eq!(
+            schedule_inactive_from_handshake(&error).as_deref(),
+            Some("wss_schedule_inactive")
+        );
+
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(409)
+            .header(CF_WSS_MODE_HEADER, "active")
+            .header(CF_WSS_REASON_HEADER, "wss_schedule_inactive")
+            .body(Some(Vec::new()))
+            .unwrap();
+        let error = WsError::Http(response);
+        assert!(schedule_inactive_from_handshake(&error).is_none());
+
+        assert_eq!(
+            schedule_inactive_from_close(1013, "wss_schedule_inactive").as_deref(),
+            Some("wss_schedule_inactive")
+        );
+        assert!(schedule_inactive_from_close(1008, "wss_schedule_inactive").is_none());
+        assert!(schedule_inactive_from_close(1013, "try_again_later").is_none());
     }
 
     #[tokio::test]
