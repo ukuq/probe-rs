@@ -3,16 +3,59 @@
 #   curl -fsSL <url>/cf-install.sh | sh -s -- install -id=... -secret=... -url=...
 set -eu
 
-BIN_DST=/usr/local/bin/probe-rs
-CONF_DIR=/etc/probe-rs
-DATA_DIR=/var/lib/probe-rs
-UNIT_DST=/etc/systemd/system/probe-rs.service
-CONFIG_PATH=$CONF_DIR/config.toml
 SCRIPT_VERSION=v0.1.4-beta.2
 GITHUB_REPO=https://github.com/ukuq/probe-rs
 
 log() { printf '%s\n' "[probe-rs] $*"; }
 die() { printf '%s\n' "[probe-rs] error: $*" >&2; exit 1; }
+
+USER_SERVICE=false
+if [ "$(id -u)" = 0 ]; then
+    BIN_DIR=/usr/local/bin
+    CONF_DIR=/etc/probe-rs
+    DATA_DIR=/var/lib/probe-rs
+    UNIT_DST=/etc/systemd/system/probe-rs.service
+    JOURNAL_CMD='journalctl -u probe-rs'
+else
+    [ -n "${HOME:-}" ] || die "HOME is required for a non-root install"
+    USER_SERVICE=true
+    CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+    DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+    BIN_DIR=$HOME/.local/bin
+    CONF_DIR=$CONFIG_HOME/probe-rs
+    DATA_DIR=$DATA_HOME/probe-rs
+    UNIT_DST=$CONFIG_HOME/systemd/user/probe-rs.service
+    JOURNAL_CMD='journalctl --user -u probe-rs'
+fi
+BIN_DST=$BIN_DIR/probe-rs
+CONFIG_PATH=$CONF_DIR/config.toml
+
+service_ctl() {
+    if [ "$USER_SERVICE" = true ]; then
+        systemctl --user "$@"
+    else
+        systemctl "$@"
+    fi
+}
+
+require_service_manager() {
+    command -v systemctl >/dev/null 2>&1 || die "systemd is required"
+    if [ "$USER_SERVICE" = true ] && ! service_ctl show-environment >/dev/null 2>&1; then
+        die "a non-root install requires a running systemd user session (systemctl --user is unavailable)"
+    fi
+}
+
+warn_linger() {
+    [ "$USER_SERVICE" = true ] || return 0
+    command -v loginctl >/dev/null 2>&1 || return 0
+    linger=$(loginctl show-user "$(id -u)" --property=Linger --value 2>/dev/null || true)
+    if [ "$linger" = no ]; then
+        log "warning: user lingering is disabled; the service may stop after logout"
+        log "ask an administrator to run: loginctl enable-linger $(id -un)"
+    fi
+}
+
+systemd_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g'; }
 
 usage() {
     printf '%s\n' \
@@ -57,9 +100,9 @@ normalize_uint() {
 }
 
 do_uninstall() {
-    systemctl disable --now probe-rs 2>/dev/null || true
+    service_ctl disable --now probe-rs 2>/dev/null || true
     rm -f "$UNIT_DST" "$BIN_DST"
-    systemctl daemon-reload 2>/dev/null || true
+    service_ctl daemon-reload 2>/dev/null || true
     if [ "${1:-}" = "--purge" ]; then
         rm -rf "$CONF_DIR" "$DATA_DIR"
         log "uninstalled probe-rs and removed its config/data"
@@ -72,7 +115,6 @@ COMMAND=${1:-}
 [ "$#" -gt 0 ] && shift || true
 case "$COMMAND" in
     uninstall)
-        [ "$(id -u)" = 0 ] || die "root is required"
         do_uninstall "${1:-}"
         exit 0
         ;;
@@ -136,11 +178,10 @@ for arg in "$@"; do
     esac
 done
 
-[ "$(id -u)" = 0 ] || die "root is required"
 [ -n "$ID" ] || die "missing -id="
 [ -n "$SECRET" ] || die "missing -secret="
 [ -n "$URL" ] || die "missing -url="
-command -v systemctl >/dev/null 2>&1 || die "systemd is required"
+require_service_manager
 
 if [ "$COLLECT_SET" = true ]; then
     COLLECT=$(normalize_uint collect_interval "$COLLECT")
@@ -167,8 +208,10 @@ if [ "$DEBUG_SET" = false ] && [ -f "$UNIT_DST" ] && grep -q ' --debug' "$UNIT_D
     DEBUG=true
 fi
 
+install -d -m 0755 "$BIN_DIR"
 install -d -m 0755 "$DATA_DIR"
 install -d -m 0750 "$CONF_DIR"
+install -d -m 0755 "$(dirname -- "$UNIT_DST")"
 
 TMP_BIN=$(mktemp /tmp/probe-rs.XXXXXX)
 TMP_SUM=
@@ -180,7 +223,7 @@ cleanup() {
     rm -f "$TMP_BIN"
     [ -z "$TMP_SUM" ] || rm -f "$TMP_SUM"
     if [ "$status" -ne 0 ] && [ "$WAS_ACTIVE" = true ] && [ "$INSTALL_COMPLETE" = false ]; then
-        systemctl start probe-rs 2>/dev/null || true
+        service_ctl start probe-rs 2>/dev/null || true
     fi
     exit "$status"
 }
@@ -246,9 +289,9 @@ chmod 0755 "$TMP_BIN"
 if command -v pgrep >/dev/null 2>&1 && pgrep -x cf-probe >/dev/null 2>&1; then
     log "warning: official cf-probe is still running; using the same credentials will duplicate reports"
 fi
-if systemctl is-active --quiet probe-rs 2>/dev/null; then
+if service_ctl is-active --quiet probe-rs 2>/dev/null; then
     WAS_ACTIVE=true
-    systemctl stop probe-rs
+    service_ctl stop probe-rs
 fi
 
 install -m 0755 "$TMP_BIN" "$BIN_DST"
@@ -282,7 +325,26 @@ fi
 
 DEBUG_ARG=
 [ "$DEBUG" = false ] || DEBUG_ARG=' --debug'
-cat > "$UNIT_DST" <<EOF
+if [ "$USER_SERVICE" = true ]; then
+    unit_bin=$(systemd_escape "$BIN_DST")
+    unit_config=$(systemd_escape "$CONFIG_PATH")
+    cat > "$UNIT_DST" <<EOF
+[Unit]
+Description=probe-rs server monitoring agent
+
+[Service]
+Type=simple
+ExecStart="$unit_bin" --config "$unit_config"$DEBUG_ARG
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+UMask=0077
+
+[Install]
+WantedBy=default.target
+EOF
+else
+    cat > "$UNIT_DST" <<EOF
 [Unit]
 Description=probe-rs server monitoring agent
 After=network-online.target
@@ -295,27 +357,31 @@ Restart=always
 RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=-$DATA_DIR -$CONF_DIR /usr/local/bin
+ReadWritePaths=-$DATA_DIR -$CONF_DIR $BIN_DIR
 ProtectHome=true
 PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
+chmod 0644 "$UNIT_DST"
 
-systemctl daemon-reload
+service_ctl daemon-reload
 if [ "$NO_START" = true ]; then
-    systemctl disable --now probe-rs >/dev/null 2>&1 || true
+    service_ctl disable --now probe-rs >/dev/null 2>&1 || true
     INSTALL_COMPLETE=true
     log "installed without starting; Reporter '$SELECTED_REPORTER' is configured"
+    warn_linger
     exit 0
 fi
-systemctl enable probe-rs >/dev/null 2>&1 || true
-systemctl restart probe-rs
+service_ctl enable probe-rs >/dev/null 2>&1 || true
+service_ctl restart probe-rs
 INSTALL_COMPLETE=true
 sleep 1
-if systemctl is-active --quiet probe-rs; then
+if service_ctl is-active --quiet probe-rs; then
     log "installed and running; Reporter '$SELECTED_REPORTER' is configured"
+    warn_linger
 else
-    die "service failed to start; run: journalctl -u probe-rs -n 20 --no-pager"
+    die "service failed to start; run: $JOURNAL_CMD -n 20 --no-pager"
 fi

@@ -171,13 +171,16 @@ CI：`.github/workflows/ci.yml` 对所有 push/PR 在 Linux、Windows 跑 Rust �
 ```bash
 cargo build --release          # 产物 target/release/probe-rs（strip + lto）
 sudo ./deploy/install.sh       # 装二进制/unit/示例配置；已装过则保留配置并重启
+./deploy/install.sh            # 非 root：安装到当前用户并使用 systemctl --user
 ```
 
-- 二进制 → `/usr/local/bin/probe-rs`；配置 → `/etc/probe-rs/config.toml`（600，含 secret）；数据 → `/var/lib/probe-rs/`
-- 首次安装需先编辑配置填 `server_id` / `secret` / `worker_url`，再 `systemctl enable --now probe-rs`
+- root 安装：二进制 → `/usr/local/bin/probe-rs`；配置 → `/etc/probe-rs/config.toml`（600，含 secret）；数据 → `/var/lib/probe-rs/`
+- 普通用户安装：二进制 → `~/.local/bin/probe-rs`；配置/数据遵循 `XDG_CONFIG_HOME`、`XDG_DATA_HOME`（缺省为 `~/.config/probe-rs`、`~/.local/share/probe-rs`）；unit → `~/.config/systemd/user/probe-rs.service`
+- 首次安装需先编辑配置填 `server_id` / `secret` / `worker_url`，再执行 `systemctl enable --now probe-rs`（root）或 `systemctl --user enable --now probe-rs`（普通用户）
+- 用户服务需要有效的 systemd 用户会话；未启用 linger 时退出登录可能停止服务，管理员可执行 `loginctl enable-linger <user>` 允许其后台常驻
 - unit 加固：`ProtectSystem=strict` + `ReadWritePaths=/var/lib/probe-rs /etc/probe-rs /usr/local/bin`（分别用于流量落盘、配置回写和校验后的原子自替换）；ICMP 使用系统 `ping`，agent 无需 `CAP_NET_RAW`
 - 卸载：`./deploy/install.sh uninstall`（保留配置与数据，加 `--purge` 全清）
-- 一键脚本（换 URL 即可装，参数对齐各官方探针）：CF 模式 `deploy/cf-install.sh`（-id/-secret/-url/-ct/-cu/-cm/-bd）；komari 模式 `deploy/komari-install.sh`（-e 面板地址/-t token/-i 间隔，缺省 collect=1 report=3 对齐官方节奏）
+- 一键脚本同样按执行身份选择系统服务或用户服务（换 URL 即可装，参数对齐各官方探针）：CF 模式 `deploy/cf-install.sh`（-id/-secret/-url/-ct/-cu/-cm/-bd）；komari 模式 `deploy/komari-install.sh`（-e 面板地址/-t token/-i 间隔，缺省 collect=1 report=3 对齐官方节奏）
 
 ### Windows + 计划任务
 

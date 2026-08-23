@@ -2,7 +2,7 @@
 # probe-rs komari 模式一键安装脚本（自包含单文件）
 #
 # 与 komari-agent 官方 install.sh 完全同参——把管道里的 URL 换掉即可：
-#   wget -qO- https://<你的地址>/komari-install.sh | sudo bash -s -- \
+#   wget -qO- https://<你的地址>/komari-install.sh | bash -s -- \
 #     -e http://<面板地址> -t <API token> -i 1 --month-rotate 1
 #
 # 参数映射：-e/-t/-i/--month-rotate/--gpu/--include-nics/--install-version 直接生效；
@@ -13,10 +13,6 @@
 # 卸载：bash komari-install.sh uninstall [--purge]
 set -euo pipefail
 
-BIN_DST=/usr/local/bin/probe-rs
-CONF_DIR=/etc/probe-rs
-DATA_DIR=/var/lib/probe-rs
-UNIT_DST=/etc/systemd/system/probe-rs.service
 RELEASE_BASE="https://github.com/ukuq/probe-rs/releases"
 
 usage() {
@@ -46,10 +42,58 @@ warn() { echo "[probe-rs] 提示: 参数 $1 已忽略（probe-rs 不支持/不�
 has_word() { case " $1 " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
 die() { echo "[probe-rs] 错误: $*" >&2; exit 1; }
 
+USER_SERVICE=false
+if [ "$(id -u)" = 0 ]; then
+    BIN_DIR=/usr/local/bin
+    CONF_DIR=/etc/probe-rs
+    DATA_DIR=/var/lib/probe-rs
+    UNIT_DST=/etc/systemd/system/probe-rs.service
+    JOURNAL_CMD='journalctl -u probe-rs'
+else
+    [ -n "${HOME:-}" ] || die "普通用户安装需要 HOME"
+    USER_SERVICE=true
+    CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+    DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+    BIN_DIR=$HOME/.local/bin
+    CONF_DIR=$CONFIG_HOME/probe-rs
+    DATA_DIR=$DATA_HOME/probe-rs
+    UNIT_DST=$CONFIG_HOME/systemd/user/probe-rs.service
+    JOURNAL_CMD='journalctl --user -u probe-rs'
+fi
+BIN_DST=$BIN_DIR/probe-rs
+
+service_ctl() {
+    if [ "$USER_SERVICE" = true ]; then
+        systemctl --user "$@"
+    else
+        systemctl "$@"
+    fi
+}
+
+require_service_manager() {
+    command -v systemctl >/dev/null || die "仅支持 systemd 系统"
+    if [ "$USER_SERVICE" = true ] && ! service_ctl show-environment >/dev/null 2>&1; then
+        die "普通用户安装需要正在运行的 systemd 用户会话（systemctl --user 不可用）"
+    fi
+}
+
+warn_linger() {
+    [ "$USER_SERVICE" = true ] || return 0
+    command -v loginctl >/dev/null 2>&1 || return 0
+    local linger
+    linger=$(loginctl show-user "$(id -u)" --property=Linger --value 2>/dev/null || true)
+    if [ "$linger" = no ]; then
+        log "警告: 当前用户未启用 linger，退出登录后用户服务可能停止"
+        log "如需后台常驻，请让管理员执行: loginctl enable-linger $(id -un)"
+    fi
+}
+
+systemd_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g'; }
+
 do_uninstall() {
-    systemctl disable --now probe-rs 2>/dev/null || true
+    service_ctl disable --now probe-rs 2>/dev/null || true
     rm -f "$UNIT_DST" "$BIN_DST"
-    systemctl daemon-reload 2>/dev/null || true
+    service_ctl daemon-reload 2>/dev/null || true
     if [ "${1:-}" = "--purge" ]; then
         rm -rf "$CONF_DIR" "$DATA_DIR"
         log "已卸载并清除配置与数据"
@@ -59,7 +103,6 @@ do_uninstall() {
 }
 
 if [ "${1:-}" = "uninstall" ]; then
-    [ "$(id -u)" = 0 ] || die "需要 root"
     do_uninstall "${2:-}"
     exit 0
 fi
@@ -108,10 +151,9 @@ case "$UPDATE_CHANNEL" in
     *) die "--update-channel must be stable or prerelease" ;;
 esac
 
-[ "$(id -u)" = 0 ] || die "需要 root（sudo 或 root 执行）"
 [ -n "$ENDPOINT" ] || die "缺少 -e <面板地址>"
 [ -n "$TOKEN" ] || die "缺少 -t <token>"
-command -v systemctl >/dev/null || die "仅支持 systemd 系统"
+require_service_manager
 # -i 官方是 float（如 1.5）；我们按整数秒处理，不足 1 抬到 1
 INTERVAL="${INTERVAL%.*}"
 case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=3 ;; esac
@@ -132,6 +174,8 @@ if [ -n "$INTERFACES" ]; then
 fi
 
 # ---- 二进制 ----
+install -d -m 0755 "$BIN_DIR"
+install -d -m 0755 "$(dirname -- "$UNIT_DST")"
 TMP_BIN=$(mktemp /tmp/probe-rs.XXXXXX)
 TMP_SUMS=
 VERIFY_SUMS=0
@@ -358,7 +402,26 @@ upsert_auto_update_config "$CONFIG_PATH"
 chmod 600 "$CONFIG_PATH"
 
 # ---- systemd unit ----
-cat > "$UNIT_DST" <<'EOF'
+if [ "$USER_SERVICE" = true ]; then
+    unit_bin=$(systemd_escape "$BIN_DST")
+    unit_config=$(systemd_escape "$CONFIG_PATH")
+    cat > "$UNIT_DST" <<EOF
+[Unit]
+Description=probe-rs server monitoring agent
+
+[Service]
+Type=simple
+ExecStart="$unit_bin" --config "$unit_config"
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+UMask=0077
+
+[Install]
+WantedBy=default.target
+EOF
+else
+    cat > "$UNIT_DST" <<EOF
 [Unit]
 Description=probe-rs server monitoring agent
 After=network-online.target
@@ -366,25 +429,28 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/probe-rs
+ExecStart=$BIN_DST
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=-/var/lib/probe-rs -/etc/probe-rs -/usr/local/bin
+ReadWritePaths=-$DATA_DIR -$CONF_DIR $BIN_DIR
 ProtectHome=true
 PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
+chmod 0644 "$UNIT_DST"
 
-systemctl daemon-reload
-systemctl enable probe-rs >/dev/null 2>&1 || true
-systemctl restart probe-rs
+service_ctl daemon-reload
+service_ctl enable probe-rs >/dev/null 2>&1 || true
+service_ctl restart probe-rs
 sleep 1
-if systemctl is-active --quiet probe-rs; then
-    log "安装完成，服务运行中（komari 模式 → $ENDPOINT）。日志: journalctl -u probe-rs -f"
+if service_ctl is-active --quiet probe-rs; then
+    log "安装完成，服务运行中（komari 模式 → $ENDPOINT）。日志: $JOURNAL_CMD -f"
+    warn_linger
 else
-    die "服务启动失败，排查: journalctl -u probe-rs -n 20 --no-pager"
+    die "服务启动失败，排查: $JOURNAL_CMD -n 20 --no-pager"
 fi
