@@ -162,7 +162,7 @@ make build   # cargo build --release（strip + lto）
 make demo    # 本地演示服务端（8080）
 ```
 
-CI：`.github/workflows/ci.yml` 对所有 push/PR 在 Linux、Windows 跑 Rust 格式化与测试，并在 Linux 跑 Deno 门禁；`release.yml` 在 push master 时按 Cargo.toml version 发版，产出 Linux x86_64/aarch64 与 Windows x86_64 三个文件（资产完整时跳过）。版本包含 SemVer 预发布后缀（如 `-beta.1`）时发布为 GitHub prerelease。CF 一键安装脚本（cf-install.sh/cf-install.ps1）默认 pin 当前版本以保持可复现安装，`latest`/`-install-version` 为显式可选项；komari-install.sh 默认走 `latest`。
+CI：`.github/workflows/ci.yml` 对所有 push/PR 在 Linux、Windows 跑 Rust 格式化与测试，并在 Linux 跑 Deno 门禁；`release.yml` 在 push master 时按 Cargo.toml version 发版，产出 Linux x86_64/aarch64/loong64 与 Windows x86_64 四个文件（资产完整时跳过）。版本包含 SemVer 预发布后缀（如 `-beta.1`）时发布为 GitHub prerelease。CF 一键安装脚本（cf-install.sh/cf-install.ps1）默认 pin 当前版本以保持可复现安装，`latest`/`-install-version` 为显式可选项；komari-install.sh 默认走 `latest`。
 
 ## 部署
 

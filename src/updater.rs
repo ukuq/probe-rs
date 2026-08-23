@@ -391,6 +391,7 @@ fn platform_asset_name(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("linux", "x86_64") => Some("probe-rs-linux-x86_64"),
         ("linux", "aarch64") => Some("probe-rs-linux-aarch64"),
+        ("linux", "loongarch64") => Some("probe-rs-linux-loong64"),
         ("windows", "x86_64") => Some("probe-rs-windows-x86_64.exe"),
         _ => None,
     }
@@ -899,6 +900,10 @@ mod tests {
         assert_eq!(
             platform_asset_name("linux", "aarch64"),
             Some("probe-rs-linux-aarch64")
+        );
+        assert_eq!(
+            platform_asset_name("linux", "loongarch64"),
+            Some("probe-rs-linux-loong64")
         );
         assert_eq!(
             platform_asset_name("windows", "x86_64"),
