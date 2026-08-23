@@ -501,6 +501,23 @@ mod tests {
     }
 
     #[test]
+    fn windows_installer_registers_boot_logon_and_resume_triggers() {
+        let script = include_str!("../deploy/install.ps1");
+        for expected in [
+            "New-ScheduledTaskTrigger -AtStartup",
+            "New-ScheduledTaskTrigger -AtLogOn",
+            "Microsoft-Windows-Power-Troubleshooter",
+            "EventID=1",
+            "Microsoft-Windows-Kernel-Power",
+            "EventID=107",
+            "$eventTrigger.Delay = \"PT10S\"",
+            "-MultipleInstances IgnoreNew",
+        ] {
+            assert!(script.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[test]
     fn seeded_reporters_are_removed_before_cf_is_added() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");

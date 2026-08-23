@@ -192,7 +192,7 @@ cargo build --release
 ```
 
 - 二进制 → `%ProgramFiles%\probe-rs\probe-rs.exe`；配置与流量数据 → `%ProgramData%\probe-rs\`
-- 使用 `SYSTEM`、最高权限的开机计划任务常驻；异常退出后每分钟重启
+- 使用 `SYSTEM`、最高权限的计划任务常驻；开机、任意用户登录及休眠唤醒（延迟 10 秒）时触发，异常退出后每分钟重启
 - 首次安装会保留示例配置但禁用任务；填好 `server_id` / `secret` / `worker_url` 后执行 `.\deploy\install.ps1 start`
 - 状态/停止：`.\deploy\install.ps1 status` / `.\deploy\install.ps1 stop`
 - 卸载：`.\deploy\install.ps1 uninstall`（保留配置与数据，加 `-Purge` 全清）

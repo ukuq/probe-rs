@@ -3,7 +3,7 @@
 
 <#
 .SYNOPSIS
-Installs probe-rs as a SYSTEM startup task with an interactive tray companion.
+Installs probe-rs as a SYSTEM task that starts at boot, logon, and resume, with an interactive tray companion.
 
 .EXAMPLE
 .\install.ps1
@@ -30,6 +30,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $TaskName = "probe-rs"
+$SystemSid = "S-1-5-18"
+$TaskTriggerEvent = 0
+$TaskCreateOrUpdate = 6
+$TaskLogonServiceAccount = 5
 $InstallDir = Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "probe-rs"
 $DataDir = Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "probe-rs"
 $InstalledBinary = Join-Path $InstallDir "probe-rs.exe"
@@ -49,6 +53,45 @@ if ($NoStart -and $Action -ne "install") {
 
 function Get-ProbeTask {
     Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+}
+
+function Add-ProbeResumeTrigger {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    # ScheduledTasks has no cmdlet for event triggers. Update the registered
+    # definition through the Task Scheduler API while preserving its action,
+    # principal, restart policy, startup trigger, and logon trigger.
+    $subscription = @'
+<QueryList>
+  <Query Id="0" Path="System">
+    <Select Path="System">*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]</Select>
+    <Select Path="System">*[System[Provider[@Name='Microsoft-Windows-Kernel-Power'] and EventID=107]]</Select>
+  </Query>
+</QueryList>
+'@
+    $scheduler = New-Object -ComObject "Schedule.Service"
+    $scheduler.Connect()
+    $rootFolder = $scheduler.GetFolder("\")
+    $registeredTask = $rootFolder.GetTask($Name)
+    $definition = $registeredTask.Definition
+    $eventTrigger = $definition.Triggers.Create($TaskTriggerEvent)
+    $eventTrigger.Id = "ResumeFromSleep"
+    $eventTrigger.Enabled = $true
+    $eventTrigger.Delay = "PT10S"
+    $eventTrigger.Subscription = $subscription.Trim()
+
+    [void]$rootFolder.RegisterTaskDefinition(
+        $Name,
+        $definition,
+        $TaskCreateOrUpdate,
+        $SystemSid,
+        $null,
+        $TaskLogonServiceAccount,
+        $null
+    )
 }
 
 function Test-PlaceholderConfig {
@@ -223,25 +266,32 @@ function Install-Probe {
         -Execute $InstalledBinary `
         -Argument $agentArguments `
         -WorkingDirectory $InstallDir
-    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $triggers = @(
+        New-ScheduledTaskTrigger -AtStartup
+        # No -User means any interactive user logon; the task still runs as SYSTEM.
+        New-ScheduledTaskTrigger -AtLogOn
+    )
     $principal = New-ScheduledTaskPrincipal `
-        -UserId "SYSTEM" `
+        -UserId $SystemSid `
         -LogonType ServiceAccount `
         -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
+        -Disable `
         -DontStopIfGoingOnBatteries `
+        -MultipleInstances IgnoreNew `
         -StartWhenAvailable `
         -RestartCount 999 `
         -RestartInterval (New-TimeSpan -Minutes 1) `
         -ExecutionTimeLimit ([TimeSpan]::Zero)
     $task = New-ScheduledTask `
         -Action $taskAction `
-        -Trigger $trigger `
+        -Trigger $triggers `
         -Principal $principal `
         -Settings $settings `
         -Description "probe-rs server monitoring agent"
     Register-ScheduledTask -TaskName $TaskName -InputObject $task -Force | Out-Null
+    Add-ProbeResumeTrigger -Name $TaskName
     Install-TrayStartup
 
     if ($NoStart) {
@@ -320,7 +370,7 @@ function Stop-Probe {
     }
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     Stop-Tray
-    Write-Host "probe-rs stopped; it remains enabled for the next system startup."
+    Write-Host "probe-rs stopped; it remains enabled for the next startup, logon, or resume."
 }
 
 function Show-ProbeStatus {
