@@ -919,7 +919,11 @@ fn validate_remote(remote: &RemoteConfig) -> Result<()> {
 pub fn load(path: &Path) -> Result<LocalConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("读取配置失败: {}", path.display()))?;
-    let cfg: LocalConfig = toml::from_str(&raw).context("解析配置 TOML 失败")?;
+    parse_text(&raw)
+}
+
+fn parse_text(raw: &str) -> Result<LocalConfig> {
+    let cfg: LocalConfig = toml::from_str(raw).context("解析配置 TOML 失败")?;
     cfg.validate()?;
     Ok(cfg)
 }
@@ -930,6 +934,35 @@ pub fn load(path: &Path) -> Result<LocalConfig> {
 /// 遗留的固定 `.tmp` 冲突。配置变更路径先同步文件、替换成功后才更新内存，
 /// 从而保证磁盘始终是可恢复的事实源。
 pub(crate) fn persist(path: &Path, cfg: &LocalConfig) -> Result<()> {
+    let data = toml::to_string_pretty(cfg)?;
+    persist_bytes(path, data.as_bytes())
+}
+
+/// 校验托盘编辑器中的原始 TOML，并在正式配置自打开编辑器后未变化时保存。
+///
+/// 编辑内容先通过与启动加载完全相同的解析和业务校验，再备份当前正式配置，
+/// 最后执行同目录原子替换。任一步失败都不会以未校验内容覆盖正式配置。
+pub(crate) fn persist_edited_text(
+    path: &Path,
+    expected_original: &str,
+    edited: &str,
+) -> Result<PathBuf> {
+    parse_text(edited).context("编辑后的配置未通过校验")?;
+
+    let current = std::fs::read_to_string(path)
+        .with_context(|| format!("重新读取正式配置失败: {}", path.display()))?;
+    if current != expected_original {
+        bail!("正式配置在编辑期间已被其他进程修改；请取消并重新打开编辑器");
+    }
+
+    let backup_path = path.with_extension("toml.bak");
+    persist_bytes(&backup_path, current.as_bytes())
+        .with_context(|| format!("备份正式配置失败: {}", backup_path.display()))?;
+    persist_bytes(path, edited.as_bytes())?;
+    Ok(backup_path)
+}
+
+fn persist_bytes(path: &Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
 
     let dir = path
@@ -937,7 +970,6 @@ pub(crate) fn persist(path: &Path, cfg: &LocalConfig) -> Result<()> {
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
-    let data = toml::to_string_pretty(cfg)?;
     let mut staged = tempfile::Builder::new()
         .prefix(".probe-rs-config-")
         .tempfile_in(dir)
@@ -951,7 +983,7 @@ pub(crate) fn persist(path: &Path, cfg: &LocalConfig) -> Result<()> {
             .as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    staged.write_all(data.as_bytes())?;
+    staged.write_all(data)?;
     staged.as_file_mut().sync_all()?;
     staged
         .persist(path)
@@ -1101,6 +1133,61 @@ mod tests {
             })
             .collect();
         assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn invalid_edited_config_does_not_replace_the_official_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = toml::to_string_pretty(&base_config()).unwrap();
+        std::fs::write(&path, &original).unwrap();
+
+        let error = persist_edited_text(&path, &original, "this is not valid TOML").unwrap_err();
+
+        assert!(error.to_string().contains("编辑后的配置未通过校验"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!path.with_extension("toml.bak").exists());
+    }
+
+    #[test]
+    fn valid_edited_config_preserves_text_and_backs_up_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = format!(
+            "# original comment\n{}",
+            toml::to_string_pretty(&base_config()).unwrap()
+        );
+        std::fs::write(&path, &original).unwrap();
+        let edited = original
+            .replace("# original comment", "# edited comment")
+            .replace("report_interval = 60", "report_interval = 7");
+
+        let backup_path = persist_edited_text(&path, &original, &edited).unwrap();
+
+        assert_eq!(backup_path, path.with_extension("toml.bak"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        assert_eq!(std::fs::read_to_string(backup_path).unwrap(), original);
+        assert_eq!(load(&path).unwrap().reporters[0].report_interval, 7);
+    }
+
+    #[test]
+    fn edited_config_does_not_overwrite_a_concurrent_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = toml::to_string_pretty(&base_config()).unwrap();
+        std::fs::write(&path, &original).unwrap();
+
+        let mut concurrent = base_config();
+        concurrent.reporters[0].report_interval = 11;
+        let concurrent = toml::to_string_pretty(&concurrent).unwrap();
+        std::fs::write(&path, &concurrent).unwrap();
+        let edited = original.replace("report_interval = 60", "report_interval = 7");
+
+        let error = persist_edited_text(&path, &original, &edited).unwrap_err();
+
+        assert!(error.to_string().contains("编辑期间已被其他进程修改"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), concurrent);
+        assert!(!path.with_extension("toml.bak").exists());
     }
 
     #[test]

@@ -31,6 +31,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(windows)]
+    if tray::run_control_if_requested()? {
+        return Ok(());
+    }
+
     if install_cli::run_if_requested().await? {
         return Ok(());
     }

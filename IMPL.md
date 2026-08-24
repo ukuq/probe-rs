@@ -193,6 +193,7 @@ cargo build --release
 
 - 二进制 → `%ProgramFiles%\probe-rs\probe-rs.exe`；配置与流量数据 → `%ProgramData%\probe-rs\`
 - 使用 `SYSTEM`、最高权限的计划任务常驻；开机、任意用户登录及休眠唤醒（延迟 10 秒）时触发，异常退出后每分钟重启
+- 登录用户的托盘伴随程序显示探针运行状态和 PID；检测到多个探针进程时会注明数量并列出全部 PID，同时提供启动、停止、重启和查看/编辑配置。托盘本身保持普通权限，仅在执行控制操作或编辑受保护配置时通过 UAC 启动短生命周期管理员 helper；编辑器只打开临时副本，保存时执行完整 TOML/业务校验、并发修改检查和备份，全部通过后才原子替换正式配置，校验失败不会损坏现有配置
 - 首次安装会保留示例配置但禁用任务；填好 `server_id` / `secret` / `worker_url` 后执行 `.\deploy\install.ps1 start`
 - 状态/停止：`.\deploy\install.ps1 status` / `.\deploy\install.ps1 stop`
 - 卸载：`.\deploy\install.ps1 uninstall`（保留配置与数据，加 `-Purge` 全清）

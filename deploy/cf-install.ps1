@@ -45,7 +45,7 @@ param(
     [string]$Cm,
     [string]$Bd,
 
-    [Alias("interface", "interfaces", "iface")]
+    [Alias("interface", "iface")]
     [string]$Interfaces,
 
     [Alias("auto_update", "auto-update")]
