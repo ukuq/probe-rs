@@ -1,0 +1,4 @@
+[target.loongarch64-unknown-linux-musl]
+# cross 0.2.5 predates this upstream target image and otherwise falls back to
+# the host linker. Pin the official image so LoongArch64 builds stay reproducible.
+image = "ghcr.io/cross-rs/loongarch64-unknown-linux-musl@sha256:148a0ac554b0cdc79fd6ed4f0eee1645e70738291cf2894677eee6a0945ba41a"
