@@ -1,5 +1,5 @@
-# 自动构建并发版：tag 取自 Cargo.toml 的 version（v<version>）
-# release 同时具有全部平台产物才算完成；缺少任一产物时可安全重试。
+# 自动构建并发版：全部平台先构建并校验，最后才按 Cargo.toml 的 version
+# 创建 tag（v<version>）并一次性上传全部产物；缺少任一产物时可安全重试。
 # 产物命名与 deploy/cf-install.sh、deploy/cf-install.ps1 的下载地址对应。
 name: release
 
@@ -16,63 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  metadata:
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.meta.outputs.tag }}
-      ref: ${{ steps.meta.outputs.ref }}
-      skip: ${{ steps.meta.outputs.skip }}
-      prerelease: ${{ steps.meta.outputs.prerelease }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - id: meta
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -e
-          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          [ -n "$ver" ] || { echo "Cargo.toml 未找到 version" >&2; exit 1; }
-          tag="v$ver"
-          case "$ver" in
-            *-*) prerelease=true ;;
-            *) prerelease=false ;;
-          esac
-
-          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-            build_ref="$tag"
-          else
-            build_ref="$GITHUB_SHA"
-          fi
-
-          assets=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-            --json assets --jq '.assets[].name' 2>/dev/null || true)
-          published_prerelease=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-            --json isPrerelease --jq '.isPrerelease' 2>/dev/null || true)
-          complete=true
-          for name in probe-rs-linux-x86_64 probe-rs-linux-aarch64 probe-rs-linux-loong64 probe-rs-windows-x86_64.exe SHA256SUMS; do
-            if ! grep -Fxq "$name" <<<"$assets"; then
-              complete=false
-            fi
-          done
-          if [ -n "$published_prerelease" ] && [ "$published_prerelease" != "$prerelease" ]; then
-            complete=false
-          fi
-
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "ref=$build_ref" >> "$GITHUB_OUTPUT"
-          echo "skip=$complete" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
-          if [ "$complete" = true ]; then
-            echo "$tag 的全部平台产物均已存在，跳过发版"
-          else
-            echo "$tag 产物不完整，将从 $build_ref 构建并发版"
-          fi
-
   build:
-    needs: metadata
-    if: needs.metadata.outputs.skip == 'false'
     strategy:
       fail-fast: false
       matrix:
@@ -93,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.metadata.outputs.ref }}
+          ref: ${{ github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -151,17 +95,69 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [metadata, build]
-    if: needs.metadata.outputs.skip == 'false'
+    needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: 确定最终发布信息
+        id: meta
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ -n "$ver" ] || { echo "Cargo.toml 未找到 version" >&2; exit 1; }
+          tag="v$ver"
+          case "$ver" in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+
+          assets=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' 2>/dev/null || true)
+          published_prerelease=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+            --json isPrerelease --jq '.isPrerelease' 2>/dev/null || true)
+          complete=true
+          for name in probe-rs-linux-x86_64 probe-rs-linux-aarch64 probe-rs-linux-loong64 probe-rs-windows-x86_64.exe SHA256SUMS; do
+            if ! grep -Fxq "$name" <<<"$assets"; then
+              complete=false
+            fi
+          done
+          if [ -n "$published_prerelease" ] && [ "$published_prerelease" != "$prerelease" ]; then
+            complete=false
+          fi
+
+          publish=true
+          if [ "$complete" = true ]; then
+            publish=false
+            echo "$tag 的全部平台产物均已存在，跳过发版"
+          elif git show-ref --verify --quiet "refs/tags/$tag"; then
+            tag_commit=$(git rev-list -n 1 "$tag")
+            if [ "$tag_commit" != "$GITHUB_SHA" ]; then
+              echo "$tag 已指向 $tag_commit，拒绝用 $GITHUB_SHA 的产物覆盖；请更新版本号或清理未完成的 tag/Release" >&2
+              exit 1
+            fi
+            echo "$tag 指向当前提交但产物不完整，将安全重试上传"
+          else
+            echo "全部构建已完成，将为 $GITHUB_SHA 创建 $tag 并上传产物"
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
       - name: 下载全部架构产物
+        if: steps.meta.outputs.publish == 'true'
         uses: actions/download-artifact@v4
         with:
           pattern: probe-rs-*
           path: dist
           merge-multiple: true
       - name: Generate SHA-256 checksums
+        if: steps.meta.outputs.publish == 'true'
         working-directory: dist
         run: |
           sha256sum \
@@ -170,12 +166,13 @@ jobs:
             probe-rs-linux-loong64 \
             probe-rs-windows-x86_64.exe > SHA256SUMS
       - name: 一次性发布全部架构产物
+        if: steps.meta.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.metadata.outputs.tag }}
-          target_commitish: ${{ needs.metadata.outputs.ref }}
-          name: ${{ needs.metadata.outputs.tag }}
-          prerelease: ${{ needs.metadata.outputs.prerelease }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.meta.outputs.tag }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           overwrite_files: true
