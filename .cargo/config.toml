@@ -1,0 +1,4 @@
+[target.loongarch64-unknown-linux-musl]
+# Rust defaults this musl target to dynamic CRT linkage. Release artifacts must
+# remain self-contained, so opt this target into static CRT linkage explicitly.
+rustflags = ["-C", "target-feature=+crt-static"]
