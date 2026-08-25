@@ -3,7 +3,7 @@
 #   curl -fsSL <url>/cf-install.sh | sh -s -- install -id=... -secret=... -url=...
 set -eu
 
-SCRIPT_VERSION=v0.1.4-beta.2
+SCRIPT_VERSION=v0.1.4-beta.3
 GITHUB_REPO=https://github.com/ukuq/probe-rs
 
 log() { printf '%s\n' "[probe-rs] $*"; }
