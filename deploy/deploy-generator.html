@@ -1,0 +1,810 @@
+<title>probe-rs 部署命令生成器</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap">
+<style>
+  :root {
+    --bg: #f5f5f7;
+    --panel: #ffffff;
+    --border: rgba(0, 0, 0, 0.09);
+    --border-soft: rgba(0, 0, 0, 0.055);
+    --ink: #1d1d1f;
+    --ink-2: #6e6e73;
+    --ink-3: #8e8e93;
+    --accent: #007aff;
+    --accent-ink: #ffffff;
+    --accent-soft: rgba(0, 122, 255, 0.1);
+    --fill: rgba(120, 120, 128, 0.12);
+    --fill-strong: rgba(120, 120, 128, 0.2);
+    --seg-active: #ffffff;
+    --ok: #248a3d;
+    --ok-bg: rgba(52, 199, 89, 0.12);
+    --ok-border: rgba(52, 199, 89, 0.35);
+    --warn: #b25000;
+    --warn-bg: rgba(255, 159, 10, 0.12);
+    --warn-border: rgba(255, 159, 10, 0.35);
+    --err: #d70015;
+    --err-bg: rgba(255, 59, 48, 0.1);
+    --err-border: rgba(255, 59, 48, 0.3);
+    --term-bg: #1f1f22;
+    --term-bar: rgba(255, 255, 255, 0.055);
+    --term-ink: #ececf1;
+    --term-dim: #8b8b93;
+    --focus-ring: rgba(0, 122, 255, 0.32);
+    --shadow-card: 0 0.5px 1.5px rgba(0, 0, 0, 0.05), 0 10px 28px rgba(0, 0, 0, 0.07);
+    --shadow-btn: 0 0.5px 1px rgba(0, 0, 0, 0.1);
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #1c1c1e;
+      --panel: #2c2c2e;
+      --border: rgba(255, 255, 255, 0.11);
+      --border-soft: rgba(255, 255, 255, 0.07);
+      --ink: #f5f5f7;
+      --ink-2: #98989d;
+      --ink-3: #636366;
+      --accent: #0a84ff;
+      --accent-ink: #ffffff;
+      --accent-soft: rgba(10, 132, 255, 0.16);
+      --fill: rgba(120, 120, 128, 0.2);
+      --fill-strong: rgba(120, 120, 128, 0.3);
+      --seg-active: #636366;
+      --ok: #30d158;
+      --ok-bg: rgba(48, 209, 88, 0.14);
+      --ok-border: rgba(48, 209, 88, 0.32);
+      --warn: #ffd60a;
+      --warn-bg: rgba(255, 214, 10, 0.12);
+      --warn-border: rgba(255, 214, 10, 0.3);
+      --err: #ff6961;
+      --err-bg: rgba(255, 105, 97, 0.13);
+      --err-border: rgba(255, 105, 97, 0.32);
+      --term-bg: #161618;
+      --term-bar: rgba(255, 255, 255, 0.045);
+      --term-ink: #ececf1;
+      --term-dim: #7d7d85;
+      --focus-ring: rgba(10, 132, 255, 0.42);
+      --shadow-card: 0 0.5px 1.5px rgba(0, 0, 0, 0.4), 0 12px 32px rgba(0, 0, 0, 0.35);
+      --shadow-btn: 0 0.5px 1px rgba(0, 0, 0, 0.4);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #1c1c1e;
+    --panel: #2c2c2e;
+    --border: rgba(255, 255, 255, 0.11);
+    --border-soft: rgba(255, 255, 255, 0.07);
+    --ink: #f5f5f7;
+    --ink-2: #98989d;
+    --ink-3: #636366;
+    --accent: #0a84ff;
+    --accent-ink: #ffffff;
+    --accent-soft: rgba(10, 132, 255, 0.16);
+    --fill: rgba(120, 120, 128, 0.2);
+    --fill-strong: rgba(120, 120, 128, 0.3);
+    --seg-active: #636366;
+    --ok: #30d158;
+    --ok-bg: rgba(48, 209, 88, 0.14);
+    --ok-border: rgba(48, 209, 88, 0.32);
+    --warn: #ffd60a;
+    --warn-bg: rgba(255, 214, 10, 0.12);
+    --warn-border: rgba(255, 214, 10, 0.3);
+    --err: #ff6961;
+    --err-bg: rgba(255, 105, 97, 0.13);
+    --err-border: rgba(255, 105, 97, 0.32);
+    --term-bg: #161618;
+    --term-bar: rgba(255, 255, 255, 0.045);
+    --term-ink: #ececf1;
+    --term-dim: #7d7d85;
+    --focus-ring: rgba(10, 132, 255, 0.42);
+    --shadow-card: 0 0.5px 1.5px rgba(0, 0, 0, 0.4), 0 12px 32px rgba(0, 0, 0, 0.35);
+    --shadow-btn: 0 0.5px 1px rgba(0, 0, 0, 0.4);
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", "Microsoft YaHei", sans-serif;
+    font-size: 14px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  code, pre, .mono, input[type="text"], input[type="url"], input[type="number"], textarea {
+    font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  :focus-visible { outline: none; box-shadow: 0 0 0 3.5px var(--focus-ring); }
+
+  .wrap { max-width: 760px; margin: 0 auto; padding: 40px 20px 96px; }
+
+  /* ---------- header ---------- */
+  header.page { text-align: center; margin-bottom: 30px; }
+  .app-icon {
+    width: 60px; height: 60px; margin: 0 auto 14px; border-radius: 15px;
+    background: linear-gradient(160deg, #4da3ff 0%, #0066d6 100%);
+    box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.35), 0 6px 18px rgba(0, 102, 214, 0.35);
+    display: flex; align-items: center; justify-content: center;
+  }
+  header.page h1 { font-size: 21px; font-weight: 700; margin: 0 0 4px; letter-spacing: -0.01em; }
+  header.page .sub { color: var(--ink-2); font-size: 13px; }
+  .ver-pill {
+    display: inline-block; margin-top: 10px; font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+    font-size: 11.5px; color: var(--ink-2); background: var(--fill); padding: 3px 10px; border-radius: 999px;
+  }
+
+  /* ---------- cards & groups ---------- */
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow-card); margin-bottom: 22px; overflow: hidden;
+  }
+  .card-pad { padding: 16px; }
+  .card-title { font-size: 13px; font-weight: 600; color: var(--ink-2); margin: 0 0 6px 4px; }
+  .grp { margin-bottom: 26px; }
+  .grp-body {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow-card); overflow: hidden;
+  }
+  .row { display: flex; align-items: center; gap: 16px; padding: 9px 16px; min-height: 42px; }
+  .row + .row { border-top: 1px solid var(--border-soft); }
+  .row > .rlab { flex: 0 0 176px; display: flex; flex-direction: column; justify-content: center; gap: 1px; font-size: 13.5px; color: var(--ink); min-width: 0; }
+  .row > .rlab .req { color: var(--err); font-weight: 700; }
+  .row > .rctl { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  @media (max-width: 560px) {
+    .row { flex-direction: column; align-items: stretch; gap: 6px; padding: 10px 14px; }
+    .row > .rlab { flex: none; }
+    .row.flag { flex-direction: row; align-items: center; }
+  }
+  .f-hint { font-size: 11.5px; color: var(--ink-3); }
+  .row.flag { justify-content: space-between; }
+  .row.flag .flab { display: flex; flex-direction: column; justify-content: center; gap: 1px; font-size: 13.5px; min-width: 0; }
+  .arg { font-size: 11px; color: var(--ink-3); font-weight: 400; white-space: nowrap; }
+  .form-pane { display: none; }
+  .form-pane.active { display: block; }
+
+  /* ---------- inputs ---------- */
+  input[type="text"], input[type="url"], input[type="number"], select, textarea {
+    width: 100%; padding: 5px 9px; font-size: 13px; color: var(--ink);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    box-shadow: inset 0 0.5px 1.5px rgba(0, 0, 0, 0.04);
+  }
+  textarea { min-height: 92px; resize: vertical; padding: 10px 12px; line-height: 1.55; background: var(--panel); }
+  input::placeholder, textarea::placeholder { color: var(--ink-3); }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px var(--focus-ring); }
+  input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
+  input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+
+  /* ---------- macOS toggle switch ---------- */
+  .sw { position: relative; width: 40px; height: 24px; flex: none; display: inline-block; }
+  .sw input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer; z-index: 1; }
+  .sw .track {
+    position: absolute; inset: 0; border-radius: 999px; background: var(--fill-strong);
+    transition: background 0.22s ease;
+  }
+  .sw .track::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; border-radius: 50%;
+    background: #fff; box-shadow: 0 1.5px 4px rgba(0, 0, 0, 0.28), 0 0.5px 1px rgba(0, 0, 0, 0.12);
+    transition: transform 0.22s ease;
+  }
+  .sw input:checked + .track { background: var(--accent); }
+  .sw input:checked + .track::after { transform: translateX(16px); }
+  .sw input:focus-visible + .track { box-shadow: 0 0 0 3.5px var(--focus-ring); }
+
+  /* ---------- segmented control ---------- */
+  .seg-wrap { display: flex; justify-content: center; margin-bottom: 22px; }
+  .seg {
+    display: inline-flex; gap: 2px; padding: 2px; background: var(--fill); border-radius: 9px;
+  }
+  .seg button {
+    border: none; background: none; font: inherit; font-size: 13px; color: var(--ink);
+    padding: 5px 20px; border-radius: 7px; cursor: pointer; white-space: nowrap;
+  }
+  .seg button.active {
+    background: var(--seg-active); font-weight: 600;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.14), 0 0.5px 1px rgba(0, 0, 0, 0.1);
+  }
+
+  /* ---------- buttons ---------- */
+  button { font: inherit; }
+  .btn {
+    border: 1px solid var(--border); background: var(--panel); color: var(--accent);
+    border-radius: 7px; padding: 4px 14px; font-size: 13px; font-weight: 500; cursor: pointer;
+    box-shadow: var(--shadow-btn);
+  }
+  .btn:hover { background: var(--fill); }
+  .btn.primary {
+    background: var(--accent); border-color: transparent; color: var(--accent-ink); font-weight: 600;
+  }
+  .btn.primary:hover { filter: brightness(1.07); background: var(--accent); }
+  .btn-row { display: flex; gap: 10px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+  .btn.copied { color: var(--ok); border-color: var(--ok-border); }
+
+  /* ---------- parse result ---------- */
+  .parse-result { margin-top: 12px; display: none; padding: 11px 14px; border-radius: 8px; font-size: 13px; border: 1px solid; }
+  .parse-result.show { display: block; }
+  .parse-result.ok { background: var(--ok-bg); border-color: var(--ok-border); }
+  .parse-result.ok .pr-title { color: var(--ok); }
+  .parse-result.err { background: var(--err-bg); border-color: var(--err-border); }
+  .parse-result.err .pr-title { color: var(--err); }
+  .parse-result .pr-title { font-weight: 600; margin-bottom: 6px; }
+
+  /* ---------- chips ---------- */
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace; font-size: 11.5px;
+    padding: 3px 9px; border-radius: 999px; background: var(--fill); color: var(--ink-2); white-space: nowrap;
+  }
+  .chip b { color: var(--accent); font-weight: 600; }
+
+  /* ---------- terminal output ---------- */
+  .term { background: var(--term-bg); border-radius: var(--radius); overflow: hidden; margin-bottom: 16px; box-shadow: var(--shadow-card); }
+  .term-bar { display: flex; align-items: center; gap: 12px; padding: 8px 12px; background: var(--term-bar); }
+  .dots { display: flex; gap: 7px; flex: 1; }
+  .dots i { width: 11px; height: 11px; border-radius: 50%; }
+  .dots i:nth-child(1) { background: #ff5f57; }
+  .dots i:nth-child(2) { background: #febc2e; }
+  .dots i:nth-child(3) { background: #28c840; }
+  .term-title {
+    font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace; font-size: 11.5px;
+    color: var(--term-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .term-copy {
+    flex: 1; display: flex; justify-content: flex-end;
+  }
+  .term-copy .btn {
+    background: rgba(255, 255, 255, 0.09); border-color: rgba(255, 255, 255, 0.14); color: #d5d5da;
+    box-shadow: none; font-size: 11.5px; padding: 2px 10px;
+  }
+  .term-copy .btn:hover { background: rgba(255, 255, 255, 0.16); }
+  .term-copy .btn.copied { color: #30d158; border-color: rgba(48, 209, 88, 0.4); background: rgba(48, 209, 88, 0.12); }
+  .term pre {
+    margin: 0; padding: 14px 16px; color: var(--term-ink); overflow-x: auto;
+    font-size: 12.5px; line-height: 1.65; white-space: pre; tab-size: 2;
+  }
+  .missing {
+    color: var(--warn); background: var(--warn-bg); border: 1px solid var(--warn-border);
+    padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 14px; display: none;
+  }
+  .missing.show { display: block; }
+  .summary-label { font-size: 12px; font-weight: 600; color: var(--ink-2); margin: 18px 0 8px 4px; }
+
+  footer.page { margin-top: 34px; color: var(--ink-3); font-size: 12px; text-align: center; }
+  footer.page .mono { font-size: 11.5px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .sw .track, .sw .track::after { transition: none; }
+  }
+</style>
+
+<div class="wrap">
+  <header class="page">
+    <div class="app-icon">
+      <svg width="32" height="32" viewBox="0 0 34 34" fill="none" aria-hidden="true">
+        <polyline points="5,20 10.5,20 13.5,10 18,27 21.5,15 23.5,20 29,20" stroke="#fff" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </div>
+    <h1>probe-rs 部署命令生成器</h1>
+    <div class="sub">原生 / CF-Server-Monitor / Komari 三种上报模式的一键安装命令</div>
+    <span class="ver-pill">脚本基线 v0.1.4-beta.2</span>
+  </header>
+
+  <!-- ============ 解析器 ============ -->
+  <div class="card-title">快速解析</div>
+  <section class="card card-pad">
+    <textarea id="paste" spellcheck="false" placeholder='粘贴 CF-Server-Monitor 或 Komari 官方生成的安装命令，例如：
+curl -fsSL https://your-worker/install.sh | bash -s -- install -id=server123 -secret=abc -url=https://worker.example.com
+bash <(curl -sL ...) -e https://panel.example.com -t your-token -i 1 --month-rotate 1'></textarea>
+    <div class="btn-row">
+      <button class="btn" id="btn-demo-cf" type="button">CF 示例</button>
+      <button class="btn" id="btn-demo-komari" type="button">Komari 示例</button>
+      <span class="f-hint">粘贴后自动识别并填充，无需点击</span>
+    </div>
+    <div class="parse-result" id="parse-result"></div>
+  </section>
+
+  <!-- ============ 表单 ============ -->
+  <div class="seg-wrap">
+    <div class="seg" role="tablist">
+      <button class="tab active" data-mode="cf" role="tab">CF 模式</button>
+      <button class="tab" data-mode="komari" role="tab">Komari 模式</button>
+      <button class="tab" data-mode="native" role="tab">原生模式</button>
+    </div>
+  </div>
+  <div class="form-pane active" id="pane-cf"></div>
+  <div class="form-pane" id="pane-komari"></div>
+  <div class="form-pane" id="pane-native"></div>
+
+  <!-- ============ 输出 ============ -->
+  <div class="card-title">生成结果 · 随表单实时更新</div>
+  <section id="output"></section>
+
+  <footer class="page">
+    生成目标：<span class="mono">deploy/cf-install.sh · deploy/komari-install.sh · deploy/install.sh</span>（ukuq/probe-rs）
+  </footer>
+</div>
+
+<script>
+"use strict";
+
+/* ============================================================
+ * 模式与字段定义（与 deploy/ 下三个安装脚本的参数一一对应）
+ * ============================================================ */
+const SCRIPT_RAW_BASE = "https://raw.githubusercontent.com/ukuq/probe-rs/master/deploy";
+const SCRIPT_VERSION = "v0.1.4-beta.2";
+
+const FIELDS = {
+  cf: [
+    { sec: "连接信息", items: [
+      { k: "id",     label: "服务器 ID", arg: "-id",     ph: "cf-server-uuid", req: true, mono: true },
+      { k: "secret", label: "密钥 Secret", arg: "-secret", ph: "API secret",   req: true, mono: true },
+      { k: "url",    label: "上报地址 URL", arg: "-url",  ph: "https://monitor.example.com", req: true, mono: true,
+        hint: "Worker 地址，脚本会自动补 /update 等路径" },
+    ]},
+    { sec: "采集与上报", items: [
+      { k: "collect",  label: "采样间隔（秒）", arg: "-collect_interval", num: true, ph: "缺省沿用默认", hint: "传 0 会被映射为 1" },
+      { k: "interval", label: "上报间隔（秒）", arg: "-interval", num: true, ph: "缺省 60" },
+      { k: "reset_day", label: "流量重置日", arg: "-reset_day", num: true, ph: "0-31，0 = 不重置" },
+    ]},
+    { sec: "Ping 目标", items: [
+      { k: "ct", label: "CT 电信节点", arg: "-ct", ph: "host:port", mono: true },
+      { k: "cu", label: "CU 联通节点", arg: "-cu", ph: "host:port", mono: true },
+      { k: "cm", label: "CM 移动节点", arg: "-cm", ph: "host:port", mono: true },
+      { k: "bd", label: "BD 广播节点", arg: "-bd", ph: "host:port", mono: true },
+    ]},
+    { sec: "网卡与流量校正", items: [
+      { k: "interfaces", label: "网卡白名单", arg: "-interface", ph: "eth0,ens3（留空 = 全部）", mono: true },
+      { k: "rx_correction", label: "下行流量校正", arg: "-rx_correction", num: true, ph: "GiB，覆盖本月下行" },
+      { k: "tx_correction", label: "上行流量校正", arg: "-tx_correction", num: true, ph: "GiB，覆盖本月上行" },
+    ]},
+    { sec: "安装行为", items: [
+      { k: "auto_update", label: "自动更新", arg: "-auto_update", type: "select",
+        opts: [["", "缺省（保持现状）"], ["1", "开启"], ["0", "关闭"]] },
+      { k: "update_channel", label: "更新通道", arg: "-update_channel", type: "select",
+        opts: [["", "缺省 stable"], ["stable", "stable"], ["prerelease", "prerelease"]] },
+      { k: "reporter_id", label: "Reporter ID", arg: "-reporter_id", ph: "缺省自动选择", mono: true,
+        hint: "在已有配置中追加/更新指定 Reporter" },
+      { k: "install_version", label: "安装版本", arg: "-install-version", ph: "缺省脚本内置 " + SCRIPT_VERSION, mono: true },
+      { k: "ghproxy", label: "GitHub 代理前缀", arg: "-install-ghproxy", ph: "https://mirror.example.com/", mono: true },
+      { k: "bin", label: "自定义二进制来源", arg: "-bin", ph: "本地路径或 HTTP(S) URL", mono: true },
+    ], flags: [
+      { k: "replace_cf", label: "替换全部 CF Reporter", arg: "-replace_cf=1", hint: "清除其他 CF Reporter 只留本次" },
+      { k: "debug",      label: "调试日志", arg: "-debug=1", hint: "ExecStart 加 --debug" },
+      { k: "no_start",   label: "只装不启动", arg: "-no_start=1" },
+    ]},
+  ],
+
+  komari: [
+    { sec: "连接信息", items: [
+      { k: "endpoint", label: "面板地址", arg: "-e", ph: "https://komari.example.com", req: true, mono: true },
+      { k: "token",    label: "API Token", arg: "-t", ph: "面板为这台机器生成的 token", req: true, mono: true },
+    ]},
+    { sec: "采集与上报", items: [
+      { k: "interval", label: "采集/上报间隔（秒）", arg: "-i", num: true, def: "3", ph: "缺省 3",
+        hint: "官方 -i 语义；komari 按采集周期上报" },
+      { k: "month_rotate", label: "月流量重置日", arg: "--month-rotate", num: true, def: "1", ph: "缺省 1",
+        hint: "1-31，0 = 不重置" },
+      { k: "include_nics", label: "网卡白名单", arg: "--include-nics", ph: "eth0,ens3（逗号分隔）", mono: true },
+    ], flags: [
+      { k: "gpu", label: "GPU 详细采集", arg: "--gpu" },
+    ]},
+    { sec: "安装行为", items: [
+      { k: "reporter_id", label: "Reporter ID", arg: "--reporter-id", def: "komari", ph: "缺省 komari", mono: true },
+      { k: "auto_update", label: "自动更新", type: "select", def: "1",
+        opts: [["1", "开启（缺省）"], ["0", "关闭（--disable-auto-update）"]] },
+      { k: "update_channel", label: "更新通道", arg: "--update-channel", type: "select", def: "stable",
+        opts: [["stable", "stable（缺省）"], ["prerelease", "prerelease"]] },
+      { k: "install_version", label: "安装版本", arg: "--install-version", ph: "缺省 latest", mono: true },
+      { k: "bin", label: "自定义二进制来源", arg: "-bin=", ph: "本地路径或 HTTP(S) URL", mono: true },
+    ]},
+  ],
+
+  native: [
+    { sec: "连接信息", items: [
+      { k: "server_id",  label: "服务器 ID", toml: "server_id", ph: "srv-01", req: true, mono: true },
+      { k: "secret",     label: "密钥 Secret", toml: "secret", ph: "change-me", req: true, mono: true },
+      { k: "worker_url", label: "上报地址", toml: "worker_url", ph: "https://monitor.example.com/report", req: true, mono: true,
+        hint: "probe 协议的完整上报路径（含 /report）" },
+    ]},
+    { sec: "采集与上报", items: [
+      { k: "report_interval", label: "上报间隔（秒）", toml: "report_interval", num: true, def: "60" },
+      { k: "reset_day", label: "流量重置日", toml: "reset_day", num: true, def: "1", ph: "0-31，0 = 不重置" },
+      { k: "collect", label: "采样间隔（秒）", toml: "intervals.collect", num: true, def: "10" },
+      { k: "interfaces", label: "网卡白名单", toml: "interfaces", ph: "eth0,ens3（留空 = 全部）", mono: true },
+    ], flags: [
+      { k: "report_gpu",  label: "GPU 采集", toml: "report_gpu", def: true },
+      { k: "report_self", label: "自监控上报", toml: "report_self", def: false,
+        hint: "把 agent 自身指标也上报" },
+    ]},
+    { sec: "安装行为", items: [
+      { k: "reporter_id", label: "Reporter ID", toml: "id", def: "primary", ph: "缺省 primary", mono: true },
+      { k: "auto_update", label: "自动更新", type: "select", def: "0",
+        opts: [["0", "关闭（缺省）"], ["1", "开启"]] },
+      { k: "update_channel", label: "更新通道", type: "select", def: "stable",
+        opts: [["stable", "stable（缺省）"], ["prerelease", "prerelease"]] },
+      { k: "bin_path", label: "二进制路径", ph: "缺省 ../target/release/probe-rs", mono: true,
+        hint: "install.sh 的第一个参数；原生模式用本地构建的二进制" },
+    ]},
+  ],
+};
+
+/* 状态 */
+let mode = "cf";
+const vals = { cf: {}, komari: {}, native: {} };
+for (const m of Object.keys(FIELDS)) {
+  for (const sec of FIELDS[m]) {
+    for (const it of sec.items || []) vals[m][it.k] = it.def || "";
+    for (const f of sec.flags || []) vals[m][f.k] = f.def !== undefined ? f.def : false;
+  }
+}
+
+/* ============================================================
+ * 表单渲染（System Settings 风格分组行）
+ * ============================================================ */
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+function renderForm(m) {
+  const pane = document.getElementById("pane-" + m);
+  pane.innerHTML = FIELDS[m].map(sec => {
+    const rows = (sec.items || []).map(it => {
+      let ctrl;
+      if (it.type === "select") {
+        ctrl = `<select data-k="${it.k}">${it.opts.map(([v, t]) =>
+          `<option value="${esc(v)}"${String(vals[m][it.k]) === v ? " selected" : ""}>${esc(t)}</option>`).join("")}</select>`;
+      } else {
+        ctrl = `<input type="${it.num ? "number" : "text"}" data-k="${it.k}" value="${esc(vals[m][it.k])}"
+          placeholder="${esc(it.ph || "")}"${it.num ? ' min="0" inputmode="numeric"' : ""} spellcheck="false">`;
+      }
+      const argName = it.arg || it.toml;
+      return `<div class="row">
+        <div class="rlab"><span>${esc(it.label)}${it.req ? ' <span class="req">*</span>' : ""}</span>${argName ? `<span class="arg mono">${esc(argName)}</span>` : ""}</div>
+        <div class="rctl">${ctrl}${it.hint ? `<span class="f-hint">${esc(it.hint)}</span>` : ""}</div>
+      </div>`;
+    });
+    for (const f of sec.flags || []) {
+      rows.push(`<div class="row flag">
+        <div class="flab"><span>${esc(f.label)}</span>${f.arg ? `<span class="arg mono">${esc(f.arg)}</span>` : ""}${f.hint ? `<span class="f-hint">${esc(f.hint)}</span>` : ""}</div>
+        <span class="sw"><input type="checkbox" data-k="${f.k}"${vals[m][f.k] ? " checked" : ""}><span class="track"></span></span>
+      </div>`);
+    }
+    return `<div class="grp">
+      <div class="card-title">${esc(sec.sec)}</div>
+      <div class="grp-body">${rows.join("")}</div>
+    </div>`;
+  }).join("");
+}
+
+for (const m of Object.keys(FIELDS)) renderForm(m);
+
+/* 输入事件（委托） */
+for (const m of Object.keys(FIELDS)) {
+  document.getElementById("pane-" + m).addEventListener("input", e => {
+    const k = e.target.dataset.k;
+    if (!k) return;
+    vals[m][k] = e.target.type === "checkbox" ? e.target.checked : e.target.value;
+    renderOutput();
+  });
+}
+
+/* 分段切换 */
+function setMode(m) {
+  mode = m;
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.mode === m));
+  document.querySelectorAll(".form-pane").forEach(p => p.classList.toggle("active", p.id === "pane-" + m));
+  renderOutput();
+}
+document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => setMode(t.dataset.mode)));
+
+/* ============================================================
+ * shell quoting / 命令构造
+ * ============================================================ */
+const SAFE = /^[A-Za-z0-9-._~:/?#[\]@!$&()*+,;=%^]+$/;
+function shq(v) {
+  v = String(v);
+  if (v !== "" && SAFE.test(v)) return v;
+  return '"' + v.replace(/(["\\$`])/g, "\\$1") + '"';
+}
+function tomlStr(v) { return '"' + String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"'; }
+function tomlArr(csv) {
+  const parts = String(csv).split(",").map(s => s.trim()).filter(Boolean);
+  return "[" + parts.map(tomlStr).join(", ") + "]";
+}
+
+function buildCF() {
+  const v = vals.cf;
+  const missing = [];
+  if (!v.id) missing.push("服务器 ID");
+  if (!v.secret) missing.push("密钥");
+  if (!v.url) missing.push("上报地址");
+  const args = [];
+  const push = (flag, val) => { if (val !== "" && val !== undefined && val !== null) args.push(`${flag}=${shq(val)}`); };
+  push("-id", v.id); push("-secret", v.secret); push("-url", v.url);
+  push("-collect_interval", v.collect); push("-interval", v.interval);
+  push("-reset_day", v.reset_day);
+  push("-ct", v.ct); push("-cu", v.cu); push("-cm", v.cm); push("-bd", v.bd);
+  push("-interface", v.interfaces);
+  push("-auto_update", v.auto_update); push("-update_channel", v.update_channel);
+  push("-rx_correction", v.rx_correction); push("-tx_correction", v.tx_correction);
+  push("-reporter_id", v.reporter_id);
+  if (v.replace_cf) args.push("-replace_cf=1");
+  if (v.debug) args.push("-debug=1");
+  if (v.no_start) args.push("-no_start=1");
+  push("-install-version", v.install_version); push("-install-ghproxy", v.ghproxy); push("-bin", v.bin);
+  return { missing, args };
+}
+
+function buildKomari() {
+  const v = vals.komari;
+  const missing = [];
+  if (!v.endpoint) missing.push("面板地址");
+  if (!v.token) missing.push("API Token");
+  const t = [];
+  if (v.endpoint) t.push("-e", shq(v.endpoint));
+  if (v.token) t.push("-t", shq(v.token));
+  if (v.interval && v.interval !== "3") t.push("-i", shq(v.interval));
+  if (v.month_rotate && v.month_rotate !== "1") t.push("--month-rotate", shq(v.month_rotate));
+  if (v.include_nics) t.push("--include-nics", shq(v.include_nics));
+  if (v.gpu) t.push("--gpu");
+  if (v.reporter_id && v.reporter_id !== "komari") t.push("--reporter-id", shq(v.reporter_id));
+  if (v.auto_update === "0") t.push("--disable-auto-update");
+  if (v.update_channel && v.update_channel !== "stable") t.push("--update-channel", shq(v.update_channel));
+  if (v.install_version) t.push("--install-version", shq(v.install_version));
+  if (v.bin) t.push("-bin=" + shq(v.bin));
+  return { missing, args: t };
+}
+
+function buildNativeToml() {
+  const v = vals.native;
+  const missing = [];
+  if (!v.server_id) missing.push("服务器 ID");
+  if (!v.secret) missing.push("密钥");
+  if (!v.worker_url) missing.push("上报地址");
+  const ri = parseInt(v.report_interval || "60", 10) || 60;
+  const rd = parseInt(v.reset_day || "1", 10); const rdN = isNaN(rd) ? 1 : rd;
+  const ci = parseInt(v.collect || "10", 10) || 10;
+  const toml = `# /etc/probe-rs/config.toml — 由部署命令生成器生成（原生 probe 协议）
+schema = 1
+
+data_dir = "/var/lib/probe-rs"
+
+[auto_update]
+enabled = ${v.auto_update === "1"}
+channel = ${tomlStr(v.update_channel || "stable")}
+check_interval = 21600
+
+[[reporters]]
+id = ${tomlStr(v.reporter_id || "primary")}
+
+[reporters.probe]
+server_id = ${tomlStr(v.server_id)}
+secret = ${tomlStr(v.secret)}
+worker_url = ${tomlStr(v.worker_url)}
+report_interval = ${ri}
+reset_day = ${rdN}
+report_errors = true
+report_self = ${!!v.report_self}
+interfaces = ${tomlArr(v.interfaces)}
+disks = []
+report_gpu = ${!!v.report_gpu}
+
+[reporters.probe.intervals]
+collect = ${ci}
+ping = 30
+slow = 60
+gpu = 60
+ip = 600
+diskio = 10
+`;
+  return { missing, toml };
+}
+
+/* ============================================================
+ * 输出渲染
+ * ============================================================ */
+let copyStore = [];
+function chipList(pairs) {
+  return pairs.map(([k, val]) => `<span class="chip"><b>${esc(k)}</b>${val !== true ? "=" + esc(val) : ""}</span>`).join("");
+}
+
+function outBlock(title, content) {
+  const idx = copyStore.push(content) - 1;
+  return `<div class="term">
+    <div class="term-bar">
+      <span class="dots"><i></i><i></i><i></i></span>
+      <span class="term-title">${esc(title)}</span>
+      <span class="term-copy"><button class="btn" type="button" data-copy="${idx}">复制</button></span>
+    </div>
+    <pre>${esc(content)}</pre>
+  </div>`;
+}
+
+document.getElementById("output").addEventListener("click", e => {
+  const btn = e.target.closest("[data-copy]");
+  if (btn) copyText(copyStore[Number(btn.dataset.copy)], btn);
+});
+
+function renderOutput() {
+  const out = document.getElementById("output");
+  copyStore = [];
+  let html = "";
+
+  if (mode === "cf") {
+    const { missing, args } = buildCF();
+    if (missing.length) html += `<div class="missing show">缺少必填项：${missing.join("、")} — 填好后命令即可使用</div>`;
+    const cmd = `curl -fsSL ${SCRIPT_RAW_BASE}/cf-install.sh | sudo sh -s -- install ${args.join(" ")}`;
+    html += outBlock("sh — cf-install.sh", cmd);
+    const pairs = args.map(a => { const i = a.indexOf("="); return [a.slice(0, i), a.slice(i + 1)]; });
+    if (pairs.length) html += `<div class="summary-label">安装参数（${pairs.length}）</div><div class="chips">${chipList(pairs)}</div>`;
+  } else if (mode === "komari") {
+    const { missing, args } = buildKomari();
+    if (missing.length) html += `<div class="missing show">缺少必填项：${missing.join("、")} — 填好后命令即可使用</div>`;
+    const cmd = `wget -qO- ${SCRIPT_RAW_BASE}/komari-install.sh | sudo bash -s -- ${args.join(" ")}`;
+    html += outBlock("bash — komari-install.sh", cmd);
+    const pairs = [];
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a.startsWith("-bin=")) pairs.push(["-bin", a.slice(5)]);
+      else if (a.startsWith("--") && !["--disable-auto-update", "--gpu"].includes(a)) { pairs.push([a, args[i + 1]]); i++; }
+      else if (a === "-e" || a === "-t" || a === "-i") { pairs.push([a, args[i + 1]]); i++; }
+      else pairs.push([a, true]);
+    }
+    if (pairs.length) html += `<div class="summary-label">安装参数（${pairs.length}）</div><div class="chips">${chipList(pairs)}</div>`;
+  } else {
+    const { missing, toml } = buildNativeToml();
+    if (missing.length) html += `<div class="missing show">缺少必填项：${missing.join("、")} — 填好后配置即可使用</div>`;
+    html += outBlock("① config.toml — 写入 /etc/probe-rs/config.toml（权限 600）", toml);
+    const binArg = vals.native.bin_path ? ` ${shq(vals.native.bin_path)}` : "";
+    const cmd = [
+      "# 先把上面的配置写入 /etc/probe-rs/config.toml，再执行：",
+      `sudo ./deploy/install.sh${binArg}`,
+      "# 配置合法时脚本会自动 enable + restart；也可手动：",
+      "# sudo systemctl enable --now probe-rs",
+    ].join("\n");
+    html += outBlock("② sh — install.sh（需先 cargo build --release 或有现成二进制）", cmd);
+    const v = vals.native;
+    html += `<div class="summary-label">安装参数</div><div class="chips">${chipList([
+      ["protocol", "probe"], ["id", v.reporter_id || "primary"],
+      ["server_id", v.server_id || "—"], ["worker_url", v.worker_url || "—"],
+      ["report_interval", v.report_interval || "60"], ["reset_day", v.reset_day || "1"],
+      ["collect", v.collect || "10"], ["report_gpu", String(!!v.report_gpu)],
+      ["auto_update", v.auto_update === "1" ? "on" : "off"],
+    ])}</div>`;
+  }
+  out.innerHTML = html;
+}
+
+function copyText(text, btn) {
+  const done = () => { btn.textContent = "已复制"; btn.classList.add("copied"); setTimeout(() => { btn.textContent = "复制"; btn.classList.remove("copied"); }, 1400); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, done));
+  } else fallbackCopy(text, done);
+}
+function fallbackCopy(text, done) {
+  const ta = document.createElement("textarea");
+  ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); done(); } catch (e) { /* 用户手动选择复制 */ }
+  document.body.removeChild(ta);
+}
+
+/* ============================================================
+ * 官方安装命令解析
+ * ============================================================ */
+function tokenize(text) {
+  const joined = text.replace(/\\\n/g, " ");
+  const tokens = joined.match(/"[^"]*"|'[^']*'|\S+/g) || [];
+  return tokens.map(t => {
+    if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) return t.slice(1, -1);
+    return t;
+  });
+}
+
+function parseCF(rawText) {
+  const map = {};
+  const alias = {
+    id: "id", secret: "secret", url: "url",
+    collect_interval: "collect", collect: "collect",
+    interval: "interval",
+    reset_day: "reset_day",
+    ct: "ct", cu: "cu", cm: "cm", bd: "bd",
+    interface: "interfaces", interfaces: "interfaces", iface: "interfaces",
+    auto_update: "auto_update", "auto-update": "auto_update",
+    update_channel: "update_channel", "update-channel": "update_channel",
+    rx_correction: "rx_correction", tx_correction: "tx_correction",
+    reporter_id: "reporter_id", "reporter-id": "reporter_id",
+    replace_cf: "replace_cf", "replace-cf": "replace_cf",
+    debug: "debug", no_start: "no_start", "no-start": "no_start",
+    "install-version": "install_version", "install-ghproxy": "ghproxy", bin: "bin",
+  };
+  const re = /-{1,2}([A-Za-z0-9_-]+)=("[^"]*"|'[^']*'|\S*)/g;
+  let m;
+  while ((m = re.exec(rawText)) !== null) {
+    const key = alias[m[1]];
+    if (!key) continue;
+    let val = m[2];
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
+    map[key] = val;
+  }
+  if (!map.id && !map.secret && !map.url) return null;
+  const v = vals.cf;
+  for (const k of ["id","secret","url","collect","interval","reset_day","ct","cu","cm","bd",
+                   "interfaces","auto_update","update_channel","rx_correction","tx_correction","reporter_id",
+                   "install_version","ghproxy","bin"]) {
+    if (map[k] !== undefined) v[k] = map[k];
+  }
+  if (map.debug !== undefined) v.debug = map.debug === "1" || map.debug === "true";
+  if (map.no_start !== undefined) v.no_start = map.no_start === "1" || map.no_start === "true";
+  if (map.replace_cf !== undefined) v.replace_cf = map.replace_cf === "1" || map.replace_cf === "true";
+  return Object.keys(map);
+}
+
+function parseKomari(tokens) {
+  const map = {};
+  const withVal = {
+    "-e": "endpoint", "--endpoint": "endpoint",
+    "-t": "token", "--token": "token",
+    "-i": "interval", "--interval": "interval",
+    "--month-rotate": "month_rotate",
+    "--include-nics": "include_nics",
+    "--install-version": "install_version",
+    "--reporter-id": "reporter_id",
+    "--update-channel": "update_channel",
+  };
+  const flags = { "--gpu": ["gpu", true], "--disable-auto-update": ["auto_update", "0"], "--enable-auto-update": ["auto_update", "1"] };
+  for (let i = 0; i < tokens.length; i++) {
+    const tk = tokens[i];
+    if (tk.startsWith("-bin=")) { map.bin = tk.slice(5); continue; }
+    if (withVal[tk] && i + 1 < tokens.length) { map[withVal[tk]] = tokens[i + 1]; i++; continue; }
+    // 兼容 --key=value 形式
+    const eq = tk.match(/^(--[a-z-]+)=(.*)$/s);
+    if (eq && withVal[eq[1]]) { map[withVal[eq[1]]] = eq[2]; continue; }
+    if (flags[tk]) { const [k, val] = flags[tk]; map[k] = val; }
+  }
+  if (!map.endpoint && !map.token) return null;
+  Object.assign(vals.komari, map);
+  return Object.keys(map);
+}
+
+function showParseResult(ok, title, keys) {
+  const el = document.getElementById("parse-result");
+  el.className = "parse-result show " + (ok ? "ok" : "err");
+  el.innerHTML = `<div class="pr-title">${esc(title)}</div>` +
+    (keys && keys.length ? `<div class="chips">${keys.map(k => `<span class="chip"><b>${esc(k)}</b></span>`).join("")}</div>` : "");
+}
+
+function autoParse() {
+  const text = document.getElementById("paste").value.trim();
+  const resultEl = document.getElementById("parse-result");
+  if (!text) { resultEl.className = "parse-result"; resultEl.innerHTML = ""; return; }
+  const tokens = tokenize(text);
+  // 形态判断：CF 是 -id=xxx 等值形式；komari 是 -e xxx -t xxx 空格形式
+  const cfKeys = parseCF(text);
+  if (cfKeys) {
+    renderForm("cf"); setMode("cf");
+    showParseResult(true, `识别为 CF-Server-Monitor 安装命令，已填充 ${cfKeys.length} 个参数`, cfKeys);
+    return;
+  }
+  const kmKeys = parseKomari(tokens);
+  if (kmKeys) {
+    renderForm("komari"); setMode("komari");
+    showParseResult(true, `识别为 Komari 安装命令，已填充 ${kmKeys.length} 个参数`, kmKeys);
+    return;
+  }
+  if (text.includes("-")) showParseResult(false, "未识别：CF 命令需要包含 -id= / -secret= / -url=，Komari 命令需要包含 -e 与 -t");
+  else resultEl.className = "parse-result";
+}
+document.getElementById("paste").addEventListener("input", autoParse);
+
+document.getElementById("btn-demo-cf").addEventListener("click", () => {
+  document.getElementById("paste").value =
+    "curl -fsSL https://monitor.example.com/install.sh | bash -s -- install -id=3f2504e0-4f89-41d3-9a0c-0305e82c3301 " +
+    "-secret=s3cr3t-key -url=https://monitor.example.com -interval=30 -collect_interval=1 -reset_day=15 " +
+    "-ct=gd-ct.example.com:80 -cu=gd-cu.example.com:80 -interface=eth0,ens3 -auto_update=1";
+  autoParse();
+});
+document.getElementById("btn-demo-komari").addEventListener("click", () => {
+  document.getElementById("paste").value =
+    "bash <(curl -sL https://raw.githubusercontent.com/komari-monitor/komari-agent/main/install.sh) " +
+    "-e https://komari.example.com -t tok_9f8a7b6c -i 1 --month-rotate 1 --gpu --disable-web-ssh";
+  autoParse();
+});
+
+renderOutput();
+</script>
