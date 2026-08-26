@@ -1,3 +1,4 @@
+<meta charset="utf-8">
 <title>probe-rs 部署命令生成器</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap">
 <style>
@@ -337,6 +338,8 @@ const FIELDS = {
       { k: "secret", label: "密钥 Secret", arg: "-secret", ph: "API secret",   req: true, mono: true },
       { k: "url",    label: "上报地址 URL", arg: "-url",  ph: "https://monitor.example.com", req: true, mono: true,
         hint: "Worker 地址，脚本会自动补 /update 等路径" },
+      { k: "connection_mode", label: "连接模式", arg: "-connection_mode", type: "select",
+        opts: [["", "缺省（保持现状）"], ["auto", "auto（WSS + HTTP 回退）"], ["http", "http（仅 HTTP）"]] },
     ]},
     { sec: "采集与上报", items: [
       { k: "collect",  label: "采样间隔（秒）", arg: "-collect_interval", num: true, ph: "缺省沿用默认", hint: "传 0 会被映射为 1" },
@@ -366,7 +369,7 @@ const FIELDS = {
       { k: "bin", label: "自定义二进制来源", arg: "-bin", ph: "本地路径或 HTTP(S) URL", mono: true },
     ], flags: [
       { k: "replace_cf", label: "替换全部 CF Reporter", arg: "-replace_cf=1", hint: "清除其他 CF Reporter 只留本次" },
-      { k: "debug",      label: "调试日志", arg: "-debug=1", hint: "ExecStart 加 --debug" },
+      { k: "debug",      label: "调试日志", arg: "-debug=0/1", hint: "开启时添加 --debug；关闭时明确移除" },
       { k: "no_start",   label: "只装不启动", arg: "-no_start=1" },
     ]},
   ],
@@ -427,13 +430,15 @@ const FIELDS = {
 
 /* 状态 */
 let mode = "cf";
-const vals = { cf: {}, komari: {}, native: {} };
-for (const m of Object.keys(FIELDS)) {
+function modeDefaults(m) {
+  const defaults = {};
   for (const sec of FIELDS[m]) {
-    for (const it of sec.items || []) vals[m][it.k] = it.def || "";
-    for (const f of sec.flags || []) vals[m][f.k] = f.def !== undefined ? f.def : false;
+    for (const it of sec.items || []) defaults[it.k] = it.def !== undefined ? it.def : "";
+    for (const f of sec.flags || []) defaults[f.k] = f.def !== undefined ? f.def : false;
   }
+  return defaults;
 }
+const vals = Object.fromEntries(Object.keys(FIELDS).map(m => [m, modeDefaults(m)]));
 
 /* ============================================================
  * 表单渲染（System Settings 风格分组行）
@@ -495,11 +500,11 @@ document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () =>
 /* ============================================================
  * shell quoting / 命令构造
  * ============================================================ */
-const SAFE = /^[A-Za-z0-9-._~:/?#[\]@!$&()*+,;=%^]+$/;
+const SAFE = /^[A-Za-z0-9_@%+=:,./-]+$/;
 function shq(v) {
   v = String(v);
   if (v !== "" && SAFE.test(v)) return v;
-  return '"' + v.replace(/(["\\$`])/g, "\\$1") + '"';
+  return "'" + v.replace(/'/g, "'\"'\"'") + "'";
 }
 function tomlStr(v) { return '"' + String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"'; }
 function tomlArr(csv) {
@@ -516,6 +521,7 @@ function buildCF() {
   const args = [];
   const push = (flag, val) => { if (val !== "" && val !== undefined && val !== null) args.push(`${flag}=${shq(val)}`); };
   push("-id", v.id); push("-secret", v.secret); push("-url", v.url);
+  push("-connection_mode", v.connection_mode);
   push("-collect_interval", v.collect); push("-interval", v.interval);
   push("-reset_day", v.reset_day);
   push("-ct", v.ct); push("-cu", v.cu); push("-cm", v.cm); push("-bd", v.bd);
@@ -524,7 +530,7 @@ function buildCF() {
   push("-rx_correction", v.rx_correction); push("-tx_correction", v.tx_correction);
   push("-reporter_id", v.reporter_id);
   if (v.replace_cf) args.push("-replace_cf=1");
-  if (v.debug) args.push("-debug=1");
+  args.push(`-debug=${v.debug ? "1" : "0"}`);
   if (v.no_start) args.push("-no_start=1");
   push("-install-version", v.install_version); push("-install-ghproxy", v.ghproxy); push("-bin", v.bin);
   return { missing, args };
@@ -702,6 +708,7 @@ function parseCF(rawText) {
     id: "id", secret: "secret", url: "url",
     collect_interval: "collect", collect: "collect",
     interval: "interval",
+    connection_mode: "connection_mode", "connection-mode": "connection_mode",
     reset_day: "reset_day",
     ct: "ct", cu: "cu", cm: "cm", bd: "bd",
     interface: "interfaces", interfaces: "interfaces", iface: "interfaces",
@@ -723,8 +730,8 @@ function parseCF(rawText) {
     map[key] = val;
   }
   if (!map.id && !map.secret && !map.url) return null;
-  const v = vals.cf;
-  for (const k of ["id","secret","url","collect","interval","reset_day","ct","cu","cm","bd",
+  const v = modeDefaults("cf");
+  for (const k of ["id","secret","url","collect","interval","connection_mode","reset_day","ct","cu","cm","bd",
                    "interfaces","auto_update","update_channel","rx_correction","tx_correction","reporter_id",
                    "install_version","ghproxy","bin"]) {
     if (map[k] !== undefined) v[k] = map[k];
@@ -732,6 +739,7 @@ function parseCF(rawText) {
   if (map.debug !== undefined) v.debug = map.debug === "1" || map.debug === "true";
   if (map.no_start !== undefined) v.no_start = map.no_start === "1" || map.no_start === "true";
   if (map.replace_cf !== undefined) v.replace_cf = map.replace_cf === "1" || map.replace_cf === "true";
+  vals.cf = v;
   return Object.keys(map);
 }
 
@@ -758,7 +766,7 @@ function parseKomari(tokens) {
     if (flags[tk]) { const [k, val] = flags[tk]; map[k] = val; }
   }
   if (!map.endpoint && !map.token) return null;
-  Object.assign(vals.komari, map);
+  vals.komari = Object.assign(modeDefaults("komari"), map);
   return Object.keys(map);
 }
 
