@@ -85,9 +85,6 @@ pub struct StaticConfig {
     pub report_errors: bool,
     pub report_self: bool,
     pub pings: Vec<PingTarget>,
-    /// 当前 Reporter 的协议扩展；原生 probe 没有扩展时不出现在 wire 中。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ext: Option<ExtConfig>,
 }
 
 /// 一条 = 一次 collect tick，只含 fast 字段，ts 即 tick 测量时刻
@@ -368,38 +365,252 @@ impl std::fmt::Display for ReporterProtocol {
     }
 }
 
-/// 一条独立上报线路；所有连接信息和输出策略都只存在于 Reporter 内。
+/// 一条独立上报线路：协议由出现的协议段（cf / komari / probe）决定，
+/// 校验时要求恰好一个段非 None。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReporterConfig {
     pub id: String,
-    pub protocol: ReporterProtocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cf: Option<CfSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub komari: Option<KomariSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<ProbeSection>,
+}
+
+impl ReporterConfig {
+    /// 恰好一个协议段时返回协议；零个或多个返回 None（由校验报错）。
+    pub fn protocol(&self) -> Option<ReporterProtocol> {
+        match (
+            self.cf.is_some(),
+            self.komari.is_some(),
+            self.probe.is_some(),
+        ) {
+            (true, false, false) => Some(ReporterProtocol::Cf),
+            (false, true, false) => Some(ReporterProtocol::Komari),
+            (false, false, true) => Some(ReporterProtocol::Probe),
+            _ => None,
+        }
+    }
+}
+
+/// 采集配置实体：各协议段先转换为此形态，再按路合并出全局真实执行的
+/// 采集计划。形态与 probe 段的采集字段一致。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectConfig {
+    pub intervals: CollectionIntervals,
+    /// 网卡 glob；空 = 全部。
+    pub interfaces: Vec<String>,
+    /// 磁盘卷/物理盘 glob；空 = 全部。
+    pub disks: Vec<String>,
+    pub report_gpu: bool,
+    pub pings: Vec<PingTarget>,
+}
+
+/// CF 协议段（命名对齐 cfsm-agent：server_id/secret/url/interval/
+/// collect_interval/reset_day/interface/ct/cu/cm/bd）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CfSection {
+    pub server_id: String,
+    pub secret: String,
+    pub url: String,
+    /// 上报周期（原版 report_interval）。
+    #[serde(default = "default_report_interval")]
+    pub interval: u64,
+    #[serde(default = "default_collect_interval")]
+    pub collect_interval: u64,
+    #[serde(default = "default_reset_day")]
+    pub reset_day: u8,
+    /// 逗号分隔的网卡列表；空 = 全部默认物理网卡。
+    #[serde(default)]
+    pub interface: String,
+    /// 四大线路 TCP Ping 节点；缺席/空 = 不探测该线路。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ct: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cu: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bd: Option<String>,
+    #[serde(default, skip_serializing_if = "CfExt::is_empty")]
+    pub ext: CfExt,
+}
+
+impl CfSection {
+    pub fn to_collect_config(&self) -> CollectConfig {
+        let pings = [
+            ("ct", &self.ct),
+            ("cu", &self.cu),
+            ("cm", &self.cm),
+            ("bd", &self.bd),
+        ]
+        .into_iter()
+        .filter_map(|(name, target)| {
+            target.as_ref().map(|target| PingTarget {
+                name: name.to_string(),
+                kind: PingKind::Tcp,
+                target: target.clone(),
+                interval: None,
+            })
+        })
+        .collect();
+        CollectConfig {
+            intervals: CollectionIntervals {
+                collect: self.collect_interval,
+                ..Default::default()
+            },
+            interfaces: split_list(&self.interface, ','),
+            disks: Vec::new(),
+            // CF 线固定启用 GPU（沿用旧版 protocol="cf" 的缺省行为）。
+            report_gpu: true,
+            pings,
+        }
+    }
+}
+
+/// CF 段的 Agent 托管状态；不出现在示例配置中。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CfExt {
+    #[serde(
+        default,
+        deserialize_with = "de_config_version",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub config_version: String,
+}
+
+impl CfExt {
+    fn is_empty(&self) -> bool {
+        self.config_version.is_empty()
+    }
+}
+
+/// Komari 协议段（命名对齐 komari-agent：endpoint/token/interval/
+/// month_rotate/enable_gpu/include_nics/include_mountpoints）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KomariSection {
+    pub endpoint: String,
+    pub token: String,
+    /// 采集周期；komari 按采集周期上报。
+    #[serde(default = "default_komari_interval")]
+    pub interval: u64,
+    /// 流量统计月份重置日（0 = 禁用）。
+    #[serde(default)]
+    pub month_rotate: u8,
+    #[serde(default)]
+    pub enable_gpu: bool,
+    /// 逗号分隔的网卡通配符；空 = 全部。
+    #[serde(default)]
+    pub include_nics: String,
+    /// 分号分隔的挂载点列表；空 = 全部。
+    #[serde(default)]
+    pub include_mountpoints: String,
+    #[serde(default, skip_serializing_if = "KomariExt::is_empty")]
+    pub ext: KomariExt,
+}
+
+impl KomariSection {
+    pub fn to_collect_config(&self) -> CollectConfig {
+        CollectConfig {
+            intervals: CollectionIntervals {
+                collect: self.interval,
+                ..Default::default()
+            },
+            interfaces: split_list(&self.include_nics, ','),
+            disks: split_list(&self.include_mountpoints, ';'),
+            report_gpu: self.enable_gpu,
+            pings: Vec::new(),
+        }
+    }
+}
+
+/// Komari 段的探针自生成状态。`learned_pings` 由 Agent 管理，不接受面板
+/// 直接改写，也非 komari 面板配置。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KomariExt {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub learned_pings: Vec<KomariLearnedPing>,
+}
+
+impl KomariExt {
+    fn is_empty(&self) -> bool {
+        self.learned_pings.is_empty()
+    }
+}
+
+/// probe 协议段（probe-rs 原生协议；采集配置实体的完整形态）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeSection {
     pub server_id: String,
     pub secret: String,
     pub worker_url: String,
-    #[serde(default, deserialize_with = "de_config_version")]
-    pub config_version: String,
-    /// 此 Reporter 对 collector/async worker 的采集需求；全局实际周期取各路最小值。
-    pub intervals: CollectionIntervals,
     pub report_interval: u64,
     #[serde(default = "default_reset_day")]
     pub reset_day: u8,
+    #[serde(default = "default_true")]
+    pub report_errors: bool,
+    #[serde(default)]
+    pub report_self: bool,
     #[serde(default)]
     pub interfaces: Vec<String>,
     /// 磁盘卷/物理盘 glob；空 = 全部。
     #[serde(default)]
     pub disks: Vec<String>,
     #[serde(default)]
-    pub report_gpu: Option<bool>,
-    #[serde(default = "default_true")]
-    pub report_errors: bool,
+    pub report_gpu: bool,
     #[serde(default)]
-    pub report_self: bool,
-    /// 此 Reporter 自己的 Ping 任务；不同 Reporter 可安全使用同名任务。
+    pub intervals: CollectionIntervals,
+    /// 此 Reporter 声明的 Ping 任务；与其他线路按 type+规范化目标去重。
     #[serde(default)]
     pub pings: Vec<PingTarget>,
-    #[serde(default)]
-    pub ext: ExtConfig,
+    #[serde(default, skip_serializing_if = "ProbeExt::is_empty")]
+    pub ext: ProbeExt,
+}
+
+impl ProbeSection {
+    pub fn to_collect_config(&self) -> CollectConfig {
+        CollectConfig {
+            intervals: self.intervals,
+            interfaces: self.interfaces.clone(),
+            disks: self.disks.clone(),
+            report_gpu: self.report_gpu,
+            pings: self.pings.clone(),
+        }
+    }
+}
+
+/// probe 段的 Agent 托管状态。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeExt {
+    #[serde(
+        default,
+        deserialize_with = "de_config_version",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub config_version: String,
+}
+
+impl ProbeExt {
+    fn is_empty(&self) -> bool {
+        self.config_version.is_empty()
+    }
+}
+
+/// 分隔符列表解析：逐项 trim、丢弃空项。
+fn split_list(raw: &str, delimiter: char) -> Vec<String> {
+    raw.split(delimiter)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Agent 全局 collector/async worker 配置摘要。
@@ -436,7 +647,7 @@ pub struct ReporterSummary {
 }
 
 /// 服务端通过上报响应下发的远端配置（config 一级内，config_version 必填，
-/// 其余字段出现才应用）。🔒 全局采集字段与连接身份永不下发。
+/// 其余字段出现才应用）。🔒 连接身份永不下发。
 #[derive(Debug, Clone, Deserialize)]
 pub struct RemoteConfig {
     /// 版本字符串；不等才应用（>= 语义对人类可读时间戳不可靠）
@@ -458,106 +669,12 @@ pub struct RemoteConfig {
     pub pings: Option<Vec<PingTarget>>,
     #[serde(default)]
     pub report_gpu: Option<bool>,
-    /// 是否上报 errors 错误事件（默认 true）
+    /// 是否上报 errors 错误事件（默认 true；仅 probe 线可配）
     #[serde(default)]
     pub report_errors: Option<bool>,
-    /// 是否上报探针自身资源占用 kind:"self"（默认 false）
+    /// 是否上报探针自身资源占用 kind:"self"（默认 false；仅 probe 线可配）
     #[serde(default)]
     pub report_self: Option<bool>,
-    /// 协议扩展配置（ext.*；仅对应协议启用时生效）
-    #[serde(default)]
-    pub ext: Option<RemoteExt>,
-}
-
-/// 远端下发的协议扩展容器
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RemoteExt {
-    #[serde(default)]
-    pub cf: Option<RemoteCfExt>,
-}
-
-/// 远端下发的 CF 扩展（全 Option，缺席保持现值）
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RemoteCfExt {
-    #[serde(default)]
-    pub correction: Option<bool>,
-    #[serde(default)]
-    pub batch: Option<bool>,
-    #[serde(default)]
-    pub connection_mode: Option<CfConnectionMode>,
-}
-
-/// 本地配置中的协议扩展容器（ext.*）
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExtConfig {
-    #[serde(default)]
-    pub cf: CfExt,
-    #[serde(default, skip_serializing_if = "KomariExt::is_empty")]
-    pub komari: KomariExt,
-}
-
-/// Komari 专属本地状态。`learned_pings` 由 Agent 管理，不接受面板直接改写。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct KomariExt {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub learned_pings: Vec<KomariLearnedPing>,
-}
-
-impl KomariExt {
-    fn is_empty(&self) -> bool {
-        self.learned_pings.is_empty()
-    }
-}
-
-/// CF 协议扩展（ext.cf.*）：仅 protocol="cf" 时生效
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CfExt {
-    /// 是否执行流量校正回路（应用 + 回传确认），缺省 true
-    #[serde(default = "default_cf_true")]
-    pub correction: bool,
-    /// 上报形状：true = samples[] 批量（带 ts）；false = 单条 metrics，缺省 true
-    #[serde(default = "default_cf_true")]
-    pub batch: bool,
-    /// auto = WSS 实时上报，连接不可用时按 report_interval 回退 POST；
-    /// http = 仅使用原有 POST /update。
-    #[serde(default)]
-    pub connection_mode: CfConnectionMode,
-}
-
-impl Default for CfExt {
-    fn default() -> Self {
-        Self {
-            correction: true,
-            batch: true,
-            connection_mode: CfConnectionMode::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CfConnectionMode {
-    #[default]
-    Auto,
-    Http,
-}
-
-impl std::fmt::Display for CfConnectionMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Auto => f.write_str("auto"),
-            Self::Http => f.write_str("http"),
-        }
-    }
-}
-
-fn default_cf_true() -> bool {
-    true
 }
 
 fn default_true() -> bool {
@@ -565,6 +682,18 @@ fn default_true() -> bool {
 }
 
 fn default_reset_day() -> u8 {
+    1
+}
+
+fn default_report_interval() -> u64 {
+    60
+}
+
+fn default_collect_interval() -> u64 {
+    10
+}
+
+fn default_komari_interval() -> u64 {
     1
 }
 

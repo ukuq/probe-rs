@@ -39,7 +39,6 @@ $DataDir = Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "pr
 $InstalledBinary = Join-Path $InstallDir "probe-rs.exe"
 $InstalledTrayBinary = Join-Path $InstallDir "probe-rs-tray.exe"
 $ConfigPath = Join-Path $DataDir "config.toml"
-$NetStaticPath = Join-Path $DataDir "net_static.json"
 $ExampleConfig = Join-Path $PSScriptRoot "..\config.example.toml"
 $TrayShortcut = Join-Path ([Environment]::GetFolderPath("CommonStartup")) "probe-rs-tray.lnk"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -98,10 +97,12 @@ function Test-PlaceholderConfig {
     param([string]$Path)
 
     $text = [IO.File]::ReadAllText($Path)
-    return $text -match '(?m)^server_id\s*=\s*"cf-server-uuid"\s*$' -or
-        $text -match '(?m)^worker_url\s*=\s*"https://monitor\.example\.com/update"\s*$' -or
+    return $text -match '(?m)^server_id\s*=\s*"(srv-01|cf-server-uuid)"\s*$' -or
+        $text -match '(?m)^url\s*=\s*"https://monitor\.example\.com/update"\s*$' -or
+        $text -match '(?m)^endpoint\s*=\s*"https://komari\.example\.com"\s*$' -or
+        $text -match '(?m)^worker_url\s*=\s*"https://monitor\.example\.com/(report|update)"\s*$' -or
         $text -match '(?m)^worker_url\s*=\s*"https://komari\.example\.com"\s*$' -or
-        $text -match '(?m)^worker_url\s*=\s*"https://monitor\.example\.com/report"\s*$'
+        $text -match '(?m)^worker_url\s*=\s*"http://127\.0\.0\.1:8080/report"\s*$'
 }
 
 function Set-ProtectedPathAcl {
@@ -193,20 +194,23 @@ function Start-Tray {
 function Write-InitialConfig {
     if (Test-Path -LiteralPath $ExampleConfig -PathType Leaf) {
         $content = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $ExampleConfig).Path)
-        $replacement = "net_static_path = '$NetStaticPath'"
+        $replacement = "data_dir = '$DataDir'"
         $content = [Text.RegularExpressions.Regex]::Replace(
             $content,
-            '(?m)^net_static_path\s*=.*$',
+            '(?m)^data_dir\s*=.*$',
             $replacement
         )
     }
     else {
         $content = @"
-net_static_path = '$NetStaticPath'
+schema = 1
+
+data_dir = '$DataDir'
 
 [[reporters]]
 id = "primary"
-protocol = "probe"
+
+[reporters.probe]
 server_id = "srv-01"
 secret = "change-me"
 worker_url = "https://monitor.example.com/report"
@@ -218,7 +222,7 @@ report_gpu = false
 report_errors = true
 report_self = false
 
-[reporters.intervals]
+[reporters.probe.intervals]
 collect = 10
 ping = 30
 slow = 60

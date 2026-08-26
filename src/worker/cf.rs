@@ -1086,9 +1086,5 @@ mod tests {
         let push = response.push.unwrap();
         assert_eq!(push.report, Some(60));
         assert_eq!(push.wss_report_interval, Some(4));
-        assert_eq!(
-            push.connection_mode,
-            Some(crate::model::CfConnectionMode::Auto)
-        );
     }
 }

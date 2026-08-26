@@ -1,6 +1,7 @@
 mod buffer;
 mod collector;
 mod config;
+mod config_legacy;
 mod install_cli;
 mod model;
 mod netstatic;
@@ -85,7 +86,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let net_static_path = PathBuf::from(&local.net_static_path);
+    let net_static_path = local.net_static_path();
     let (shared, intervals_rx, config_rx) = SharedConfig::new(local.clone(), config_path.clone());
     let buffers = Arc::new(buffer::Buffers::new());
     for spec in &initial_specs {
@@ -196,8 +197,7 @@ async fn main() -> Result<()> {
             let mut last_mtime = mtime(&watch_path);
             let mut ticker = tokio::time::interval(Duration::from_secs(3));
             ticker.tick().await;
-            let mut applied_pings = shared.get().effective_pings();
-            let mut applied_gpu = shared.get().effective_gpu();
+            let mut applied = shared.get().merged_collect_config();
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
@@ -228,26 +228,23 @@ async fn main() -> Result<()> {
                     }
                     changed = config_rx.changed() => {
                         if changed.is_err() { return; }
-                        let cfg = config_rx.borrow().clone();
-                        let desired_pings = cfg.effective_pings();
-                        if desired_pings != applied_pings {
+                        let desired = config_rx.borrow().merged_collect_config();
+                        if desired.pings != applied.pings {
                             if let Some(worker) = ping_worker.take() {
                                 worker.stop();
                             }
-                            ping_worker = (!desired_pings.is_empty()).then(|| {
+                            ping_worker = (!desired.pings.is_empty()).then(|| {
                                 worker::ping::PingWorker::start(
-                                    desired_pings.clone(),
+                                    desired.pings.clone(),
                                     ping_tx.clone(),
                                     Arc::clone(&buffers),
                                     intervals_rx2.clone(),
                                 )
                             });
-                            applied_pings = desired_pings;
-                            tracing::info!(groups = applied_pings.len(), "ping workers reconciled");
+                            tracing::info!(groups = desired.pings.len(), "ping workers reconciled");
                         }
-                        let desired_gpu = cfg.effective_gpu();
-                        if desired_gpu != applied_gpu {
-                            if desired_gpu {
+                        if desired.report_gpu != applied.report_gpu {
+                            if desired.report_gpu {
                                 gpu_handle = Some(worker::gpu::start(
                                     gpu_name_tx.clone(),
                                     gpu_tx.clone(),
@@ -257,9 +254,9 @@ async fn main() -> Result<()> {
                             } else if let Some(handle) = gpu_handle.take() {
                                 handle.abort();
                             }
-                            applied_gpu = desired_gpu;
-                            tracing::info!(enable = applied_gpu, "GPU worker reconciled");
+                            tracing::info!(enable = desired.report_gpu, "GPU worker reconciled");
                         }
+                        applied = desired;
                     }
                 }
             }
@@ -312,12 +309,11 @@ async fn main() -> Result<()> {
             None
         };
         let (cf_ws, cf_ws_events) = if spec.protocol == ReporterProtocol::Cf {
-            let enabled = spec.ext.cf.connection_mode == crate::model::CfConnectionMode::Auto;
             let (sender, events, handle) = worker::cf::spawn(
                 spec.id.clone(),
                 spec.worker_url.clone(),
                 AGENT_VERSION.to_string(),
-                enabled,
+                true,
                 spec.config_version.clone(),
             );
             watch_task("cf-wss", handle);

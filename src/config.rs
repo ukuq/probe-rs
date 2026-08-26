@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::model::{
-    CollectionIntervals, ExtConfig, GlobalConfigSummary, GlobalPingTarget, Intervals,
+    CollectConfig, CollectionIntervals, GlobalConfigSummary, GlobalPingTarget, Intervals,
     KomariLearnedPing, PingKind, PingTarget, RemoteConfig, ReporterConfig, ReporterProtocol,
     ReporterSummary, StaticConfig,
 };
@@ -18,6 +18,10 @@ pub const MIN_UPDATE_CHECK_INTERVAL: u64 = 300;
 /// worker 任务数、回执体积与内存推到无界。上限值同步进协议文档。
 pub const MAX_REMOTE_PINGS: usize = 64;
 pub const MAX_REMOTE_PATTERNS: usize = 32;
+
+/// 当前配置文件结构版本;文件缺少 schema 键时视为旧版(schema 0),
+/// 加载时自动迁移并回写。
+pub const CONFIG_SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -57,12 +61,20 @@ impl Default for AutoUpdateConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalConfig {
-    #[serde(default = "default_net_static_path")]
-    pub net_static_path: String,
+    /// 配置结构版本,固定为 CONFIG_SCHEMA。
+    #[serde(default = "default_schema")]
+    pub schema: u32,
+    /// 数据目录:net_static.json 等运行态文件都存放在这里。
+    #[serde(default = "default_data_dir")]
+    pub data_dir: String,
     #[serde(default)]
     pub auto_update: AutoUpdateConfig,
-    /// 所有独立上报实例，包括 id="primary"。
+    /// 所有独立上报实例,协议由各条目的协议段(cf/komari/probe)决定。
     pub reporters: Vec<ReporterConfig>,
+}
+
+fn default_schema() -> u32 {
+    CONFIG_SCHEMA
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,7 +93,6 @@ pub struct ReporterSpec {
     pub report_errors: bool,
     pub report_self: bool,
     pub pings: Vec<ScopedPingTarget>,
-    pub ext: ExtConfig,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -123,7 +134,6 @@ impl ReporterSpec {
             report_errors: self.report_errors,
             report_self: self.report_self,
             pings: self.pings.iter().map(|ping| ping.target.clone()).collect(),
-            ext: (self.protocol == ReporterProtocol::Cf).then(|| self.ext.clone()),
         }
     }
 }
@@ -132,11 +142,8 @@ pub fn default_config_path() -> PathBuf {
     platform_config_dir().join("config.toml")
 }
 
-fn default_net_static_path() -> String {
-    platform_data_dir()
-        .join("net_static.json")
-        .to_string_lossy()
-        .into_owned()
+pub(crate) fn default_data_dir() -> String {
+    platform_data_dir().to_string_lossy().into_owned()
 }
 
 #[cfg(windows)]
@@ -163,7 +170,21 @@ fn platform_config_dir() -> PathBuf {
 }
 
 impl LocalConfig {
+    /// net_static 流量账本固定存放在数据目录下。
+    pub fn net_static_path(&self) -> PathBuf {
+        PathBuf::from(&self.data_dir).join("net_static.json")
+    }
+
     pub fn validate(&self) -> Result<()> {
+        if self.schema != CONFIG_SCHEMA {
+            bail!(
+                "不支持的配置 schema 版本: {}(当前支持 {CONFIG_SCHEMA})",
+                self.schema
+            );
+        }
+        if self.data_dir.trim().is_empty() {
+            bail!("data_dir 不能为空");
+        }
         if self.auto_update.check_interval < MIN_UPDATE_CHECK_INTERVAL {
             bail!("auto_update.check_interval must be >= {MIN_UPDATE_CHECK_INTERVAL} seconds");
         }
@@ -178,20 +199,104 @@ impl LocalConfig {
             if !ids.insert(reporter.id.clone()) {
                 bail!("reporters.id 重复: {}", reporter.id);
             }
-            validate_connection(&reporter.server_id, &reporter.secret, &reporter.worker_url)?;
-            if reporter.report_interval == 0 {
-                bail!("reporter {} report_interval 必须 >= 1", reporter.id);
+            match reporter.protocol() {
+                Some(ReporterProtocol::Cf) => {
+                    let cf = reporter.cf.as_ref().expect("protocol checked");
+                    validate_connection(&cf.server_id, &cf.secret, &cf.url)
+                        .with_context(|| format!("reporter {} cf 段非法", reporter.id))?;
+                    if cf.interval == 0 {
+                        bail!("reporter {} cf.interval 必须 >= 1", reporter.id);
+                    }
+                    if cf.collect_interval == 0 {
+                        bail!("reporter {} cf.collect_interval 必须 >= 1", reporter.id);
+                    }
+                    if cf.reset_day > 31 {
+                        bail!("reporter {} cf.reset_day 必须在 0-31 之间", reporter.id);
+                    }
+                    validate_patterns("interface", &split_list(&cf.interface, ','))
+                        .with_context(|| format!("reporter {} cf.interface 非法", reporter.id))?;
+                    for (name, target) in [
+                        ("ct", &cf.ct),
+                        ("cu", &cf.cu),
+                        ("cm", &cf.cm),
+                        ("bd", &cf.bd),
+                    ] {
+                        if let Some(target) = target {
+                            validate_cf_node(name, target).with_context(|| {
+                                format!("reporter {} cf.{name} 非法", reporter.id)
+                            })?;
+                        }
+                    }
+                }
+                Some(ReporterProtocol::Komari) => {
+                    let komari = reporter.komari.as_ref().expect("protocol checked");
+                    if komari.token.trim().is_empty() {
+                        bail!("reporter {} komari.token 不能为空", reporter.id);
+                    }
+                    if !komari.endpoint.starts_with("http://")
+                        && !komari.endpoint.starts_with("https://")
+                    {
+                        bail!(
+                            "reporter {} komari.endpoint 必须是 http(s) URL",
+                            reporter.id
+                        );
+                    }
+                    if komari.interval == 0 {
+                        bail!("reporter {} komari.interval 必须 >= 1", reporter.id);
+                    }
+                    if komari.month_rotate > 31 {
+                        bail!(
+                            "reporter {} komari.month_rotate 必须在 0-31 之间",
+                            reporter.id
+                        );
+                    }
+                    validate_patterns("include_nics", &split_list(&komari.include_nics, ','))
+                        .with_context(|| {
+                            format!("reporter {} komari.include_nics 非法", reporter.id)
+                        })?;
+                    validate_patterns(
+                        "include_mountpoints",
+                        &split_list(&komari.include_mountpoints, ';'),
+                    )
+                    .with_context(|| {
+                        format!("reporter {} komari.include_mountpoints 非法", reporter.id)
+                    })?;
+                    validate_komari_learned_pings(&komari.ext.learned_pings).with_context(
+                        || format!("reporter {} komari learned_pings 非法", reporter.id),
+                    )?;
+                }
+                Some(ReporterProtocol::Probe) => {
+                    let probe = reporter.probe.as_ref().expect("protocol checked");
+                    validate_connection(&probe.server_id, &probe.secret, &probe.worker_url)
+                        .with_context(|| format!("reporter {} probe 段非法", reporter.id))?;
+                    if probe.report_interval == 0 {
+                        bail!("reporter {} probe.report_interval 必须 >= 1", reporter.id);
+                    }
+                    if probe.reset_day > 31 {
+                        bail!("reporter {} probe.reset_day 必须在 0-31 之间", reporter.id);
+                    }
+                    probe
+                        .intervals
+                        .validate()
+                        .map_err(anyhow::Error::msg)
+                        .with_context(|| {
+                            format!("reporter {} probe.intervals 非法", reporter.id)
+                        })?;
+                    validate_patterns("interfaces", &probe.interfaces).with_context(|| {
+                        format!("reporter {} probe.interfaces 非法", reporter.id)
+                    })?;
+                    validate_patterns("disks", &probe.disks)
+                        .with_context(|| format!("reporter {} probe.disks 非法", reporter.id))?;
+                    validate_pings(&probe.pings)
+                        .with_context(|| format!("reporter {} probe.pings 非法", reporter.id))?;
+                }
+                None => {
+                    bail!(
+                        "reporter {} 必须恰好包含一个协议段(cf / komari / probe)",
+                        reporter.id
+                    );
+                }
             }
-            reporter.intervals.validate().map_err(anyhow::Error::msg)?;
-            if reporter.reset_day > 31 {
-                bail!("reporter {} reset_day 必须在 0-31 之间", reporter.id);
-            }
-            validate_interfaces(&reporter.interfaces)?;
-            validate_patterns("disks", &reporter.disks)?;
-            validate_pings(&reporter.pings)
-                .with_context(|| format!("reporter {} pings 非法", reporter.id))?;
-            validate_komari_pings(reporter)
-                .with_context(|| format!("reporter {} Komari Ping 非法", reporter.id))?;
         }
         Ok(())
     }
@@ -199,23 +304,84 @@ impl LocalConfig {
     pub fn reporter_specs(&self) -> Vec<ReporterSpec> {
         self.reporters
             .iter()
-            .map(|r| ReporterSpec {
-                id: r.id.clone(),
-                protocol: r.protocol,
-                server_id: r.server_id.clone(),
-                secret: r.secret.clone(),
-                worker_url: r.worker_url.clone(),
-                config_version: r.config_version.clone(),
-                intervals: r.intervals.with_report(r.report_interval),
-                reset_day: r.reset_day,
-                interfaces: r.interfaces.clone(),
-                disks: r.disks.clone(),
-                report_gpu: r.report_gpu.unwrap_or(r.protocol == ReporterProtocol::Cf),
-                report_errors: r.report_errors,
-                report_self: r.report_self,
-                pings: reporter_ping_targets(r),
-                ext: r.ext.clone(),
-            })
+            .map(
+                |reporter| match reporter.protocol().expect("validated reporter protocol") {
+                    ReporterProtocol::Cf => {
+                        let cf = reporter.cf.as_ref().expect("protocol checked");
+                        let collect = cf.to_collect_config();
+                        ReporterSpec {
+                            id: reporter.id.clone(),
+                            protocol: ReporterProtocol::Cf,
+                            server_id: cf.server_id.clone(),
+                            secret: cf.secret.clone(),
+                            worker_url: cf.url.clone(),
+                            config_version: cf.ext.config_version.clone(),
+                            intervals: collect.intervals.with_report(cf.interval),
+                            reset_day: cf.reset_day,
+                            interfaces: collect.interfaces,
+                            disks: collect.disks,
+                            report_gpu: collect.report_gpu,
+                            // cf 线固定上报 errors、不上报 self。
+                            report_errors: true,
+                            report_self: false,
+                            pings: scoped_pings(collect.pings),
+                        }
+                    }
+                    ReporterProtocol::Komari => {
+                        let komari = reporter.komari.as_ref().expect("protocol checked");
+                        let collect = komari.to_collect_config();
+                        let mut pings = scoped_pings(collect.pings);
+                        for learned in &komari.ext.learned_pings {
+                            let mut target = learned_ping_target(learned);
+                            let task_id =
+                                ping_task_key(&target).expect("validated Komari Ping target");
+                            if pings.iter().any(|ping| ping.task_id == task_id) {
+                                continue;
+                            }
+                            target.name = format!("komari:{task_id}");
+                            pings.push(ScopedPingTarget { task_id, target });
+                        }
+                        ReporterSpec {
+                            id: reporter.id.clone(),
+                            protocol: ReporterProtocol::Komari,
+                            // komari 协议没有 server_id 概念,靠 token 识别。
+                            server_id: String::new(),
+                            secret: komari.token.clone(),
+                            worker_url: komari.endpoint.clone(),
+                            config_version: String::new(),
+                            // komari 按采集周期上报。
+                            intervals: collect.intervals.with_report(komari.interval),
+                            reset_day: komari.month_rotate,
+                            interfaces: collect.interfaces,
+                            disks: collect.disks,
+                            report_gpu: collect.report_gpu,
+                            report_errors: true,
+                            report_self: false,
+                            pings,
+                        }
+                    }
+                    ReporterProtocol::Probe => {
+                        let probe = reporter.probe.as_ref().expect("protocol checked");
+                        let collect = probe.to_collect_config();
+                        ReporterSpec {
+                            id: reporter.id.clone(),
+                            protocol: ReporterProtocol::Probe,
+                            server_id: probe.server_id.clone(),
+                            secret: probe.secret.clone(),
+                            worker_url: probe.worker_url.clone(),
+                            config_version: probe.ext.config_version.clone(),
+                            intervals: collect.intervals.with_report(probe.report_interval),
+                            reset_day: probe.reset_day,
+                            interfaces: collect.interfaces,
+                            disks: collect.disks,
+                            report_gpu: collect.report_gpu,
+                            report_errors: probe.report_errors,
+                            report_self: probe.report_self,
+                            pings: scoped_pings(collect.pings),
+                        }
+                    }
+                },
+            )
             .collect()
     }
 
@@ -225,29 +391,22 @@ impl LocalConfig {
 
     /// 可安全随 static 上报的全局采集摘要。
     pub fn global_summary(&self) -> GlobalConfigSummary {
-        let interfaces: std::collections::BTreeSet<String> = self
-            .reporters
+        let specs = self.reporter_specs();
+        let interfaces: std::collections::BTreeSet<String> = specs
             .iter()
-            .flat_map(|reporter| reporter.interfaces.iter().cloned())
+            .flat_map(|spec| spec.interfaces.iter().cloned())
             .collect();
-        let disks: std::collections::BTreeSet<String> = self
-            .reporters
+        let disks: std::collections::BTreeSet<String> = specs
             .iter()
-            .flat_map(|reporter| reporter.disks.iter().cloned())
+            .flat_map(|spec| spec.disks.iter().cloned())
             .collect();
         GlobalConfigSummary {
             intervals: self.effective_collection_intervals(),
             enable_gpu: self.effective_gpu(),
             interfaces: interfaces.into_iter().collect(),
-            all_interfaces: self
-                .reporters
-                .iter()
-                .any(|reporter| reporter.interfaces.is_empty()),
+            all_interfaces: specs.iter().any(|spec| spec.interfaces.is_empty()),
             disks: disks.into_iter().collect(),
-            all_disks: self
-                .reporters
-                .iter()
-                .any(|reporter| reporter.disks.is_empty()),
+            all_disks: specs.iter().any(|spec| spec.disks.is_empty()),
             pings: {
                 let mut tasks = std::collections::BTreeMap::new();
                 for reporter in self.reporter_specs() {
@@ -328,10 +487,55 @@ impl LocalConfig {
         tasks.into_values().collect()
     }
 
-    pub fn effective_collection_intervals(&self) -> CollectionIntervals {
-        self.reporters
+    /// 合并后的全局采集配置实体:各协议段先各自转换为实体,再按路合并
+    /// (周期取 min、GPU 取 OR、网卡/磁盘取并集、Ping 去重取 min)。
+    pub fn merged_collect_config(&self) -> CollectConfig {
+        CollectConfig {
+            intervals: self.effective_collection_intervals(),
+            interfaces: self.global_interfaces(),
+            disks: self.global_disks(),
+            report_gpu: self.effective_gpu(),
+            pings: self.effective_pings(),
+        }
+    }
+
+    /// 网卡并集;任一路为空(= 全部)时结果为空(= 全部)。
+    fn global_interfaces(&self) -> Vec<String> {
+        let specs = self.reporter_specs();
+        if specs.iter().any(|spec| spec.interfaces.is_empty()) {
+            return Vec::new();
+        }
+        let union: std::collections::BTreeSet<String> = specs
             .iter()
-            .map(|reporter| reporter.intervals)
+            .flat_map(|spec| spec.interfaces.iter().cloned())
+            .collect();
+        union.into_iter().collect()
+    }
+
+    /// 磁盘并集;任一路为空(= 全部)时结果为空(= 全部)。
+    fn global_disks(&self) -> Vec<String> {
+        let specs = self.reporter_specs();
+        if specs.iter().any(|spec| spec.disks.is_empty()) {
+            return Vec::new();
+        }
+        let union: std::collections::BTreeSet<String> = specs
+            .iter()
+            .flat_map(|spec| spec.disks.iter().cloned())
+            .collect();
+        union.into_iter().collect()
+    }
+
+    pub fn effective_collection_intervals(&self) -> CollectionIntervals {
+        self.reporter_specs()
+            .iter()
+            .map(|spec| CollectionIntervals {
+                collect: spec.intervals.collect,
+                ping: spec.intervals.ping,
+                slow: spec.intervals.slow,
+                gpu: spec.intervals.gpu,
+                ip: spec.intervals.ip,
+                diskio: spec.intervals.diskio,
+            })
             .reduce(|a, b| CollectionIntervals {
                 collect: a.collect.min(b.collect),
                 ping: a.ping.min(b.ping),
@@ -344,33 +548,14 @@ impl LocalConfig {
     }
 }
 
-fn reporter_ping_targets(reporter: &ReporterConfig) -> Vec<ScopedPingTarget> {
-    let mut targets: Vec<_> = reporter
-        .pings
-        .iter()
-        .cloned()
+fn scoped_pings(pings: Vec<PingTarget>) -> Vec<ScopedPingTarget> {
+    pings
+        .into_iter()
         .map(|target| ScopedPingTarget {
             task_id: ping_task_key(&target).expect("validated ping target"),
             target,
         })
-        .collect();
-    if reporter.protocol != ReporterProtocol::Komari {
-        return targets;
-    }
-
-    let mut configured: std::collections::HashSet<_> = targets
-        .iter()
-        .map(|target| target.task_id.clone())
-        .collect();
-    for learned in &reporter.ext.komari.learned_pings {
-        let mut target = learned_ping_target(learned);
-        let task_id = ping_task_key(&target).expect("validated Komari Ping target");
-        if configured.insert(task_id.clone()) {
-            target.name = format!("komari:{task_id}");
-            targets.push(ScopedPingTarget { task_id, target });
-        }
-    }
-    targets
+        .collect()
 }
 
 fn learned_ping_target(learned: &KomariLearnedPing) -> PingTarget {
@@ -382,7 +567,40 @@ fn learned_ping_target(learned: &KomariLearnedPing) -> PingTarget {
     }
 }
 
-fn ping_task_key(ping: &PingTarget) -> Result<String> {
+/// 分隔符列表解析:逐项 trim、丢弃空项。
+pub(crate) fn split_list(raw: &str, delimiter: char) -> Vec<String> {
+    raw.split(delimiter)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// CF 四大线路节点的 Ping 类型:URL 形式为 HTTP,其余按 TCP(host[:port])。
+pub(crate) fn cf_node_ping(name: &str, target: &str) -> Result<PingTarget> {
+    if target.trim().is_empty() {
+        bail!("cf.{name} 不能为空串,不需要时请删除该键");
+    }
+    let lowercase = target.to_ascii_lowercase();
+    let kind = if lowercase.starts_with("http://") || lowercase.starts_with("https://") {
+        PingKind::Http
+    } else {
+        PingKind::Tcp
+    };
+    Ok(PingTarget {
+        name: name.to_string(),
+        kind,
+        target: target.to_string(),
+        interval: None,
+    })
+}
+
+fn validate_cf_node(name: &str, target: &str) -> Result<()> {
+    ping_task_key(&cf_node_ping(name, target)?)?;
+    Ok(())
+}
+
+pub(crate) fn ping_task_key(ping: &PingTarget) -> Result<String> {
     match ping.kind {
         PingKind::Http => {
             let url = reqwest::Url::parse(&ping.target)
@@ -436,7 +654,7 @@ fn ping_task_key(ping: &PingTarget) -> Result<String> {
     }
 }
 
-/// 全局只读摘要使用 URI 自带类型，Reporter 私有配置仍保留独立 type 字段。
+/// 全局只读摘要使用 URI 自带类型,Reporter 私有配置仍保留独立 type 字段。
 fn global_ping_uri(ping: &PingTarget) -> Result<String> {
     let authority_host = |host: &str| {
         let host = host
@@ -492,10 +710,6 @@ fn validate_connection(server_id: &str, secret: &str, url: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_interfaces(interfaces: &[String]) -> Result<()> {
-    validate_patterns("interfaces", interfaces)
-}
-
 fn validate_patterns(field: &str, patterns: &[String]) -> Result<()> {
     for pattern in patterns {
         let p = pattern.trim();
@@ -524,14 +738,10 @@ fn validate_pings(pings: &[PingTarget]) -> Result<()> {
     Ok(())
 }
 
-fn validate_komari_pings(reporter: &ReporterConfig) -> Result<()> {
-    let learned = &reporter.ext.komari.learned_pings;
-    if reporter.protocol != ReporterProtocol::Komari && !learned.is_empty() {
-        bail!("ext.komari.learned_pings 只允许用于 protocol=\"komari\"");
-    }
+fn validate_komari_learned_pings(learned: &[KomariLearnedPing]) -> Result<()> {
     if learned.len() > KOMARI_LEARNED_PING_LIMIT {
         bail!(
-            "自动学习目标最多 {} 个，当前 {} 个",
+            "自动学习目标最多 {} 个,当前 {} 个",
             KOMARI_LEARNED_PING_LIMIT,
             learned.len()
         );
@@ -552,8 +762,8 @@ fn validate_komari_pings(reporter: &ReporterConfig) -> Result<()> {
     Ok(())
 }
 
-/// 共享运行时配置：本地配置 + intervals 变更通知（scheduler 重建 ticker）
-/// + 全量变更通知（supervisor 重建 worker；本地热加载与远端下发共用）
+/// 共享运行时配置:本地配置 + intervals 变更通知(scheduler 重建 ticker)
+/// + 全量变更通知(supervisor 重建 worker;本地热加载与远端下发共用)
 pub struct SharedConfig {
     inner: RwLock<LocalConfig>,
     path: PathBuf,
@@ -599,7 +809,7 @@ impl SharedConfig {
         self.config_tx.subscribe()
     }
 
-    /// 本地文件热加载：整体替换（文件是唯一事实源，远端应用也会回写文件）。
+    /// 本地文件热加载:整体替换(文件是唯一事实源,远端应用也会回写文件)。
     /// 仅在 intervals 变化时通知 scheduler 重建 ticker
     pub fn update_local(&self, cfg: LocalConfig) {
         let mut guard = self.inner.write().expect("config lock poisoned");
@@ -624,10 +834,10 @@ impl SharedConfig {
         });
     }
 
-    /// 原子热加载：持有写锁时读取、校验并提交同一份文件快照。
+    /// 原子热加载:持有写锁时读取、校验并提交同一份文件快照。
     ///
-    /// 远端应用和 Komari 学习也在该锁内落盘，因此不会在本次读取与提交之间
-    /// 插入一个更新；`is_compatible` 检查的正是随后要应用的 `cfg`，连接身份
+    /// 远端应用和 Komari 学习也在该锁内落盘,因此不会在本次读取与提交之间
+    /// 插入一个更新;`is_compatible` 检查的正是随后要应用的 `cfg`,连接身份
     /// 变化不能通过调用方预读另一份快照绕过 restart-only 限制。
     pub fn update_local_from_disk(
         &self,
@@ -664,7 +874,7 @@ impl SharedConfig {
         Ok(LocalReload::Applied)
     }
 
-    /// 记录 Komari 面板下发的 Ping 目标。这里只修改该 Reporter 的本地采集需求；
+    /// 记录 Komari 面板下发的 Ping 目标。这里只修改该 Reporter 的本地采集需求;
     /// 真正探测由全局 Ping worker 在配置通知后异步完成。
     pub fn learn_komari_ping(
         &self,
@@ -689,14 +899,19 @@ impl SharedConfig {
             .iter()
             .position(|reporter| reporter.id == reporter_id)
             .ok_or_else(|| anyhow::anyhow!("Reporter 不存在: {reporter_id}"))?;
-        let reporter = &cfg.reporters[reporter_index];
-        if reporter.protocol != ReporterProtocol::Komari {
+        if cfg.reporters[reporter_index].komari.is_none() {
             bail!("Reporter {reporter_id} 不是 Komari 协议");
         }
-        let default_interval = reporter.intervals.ping;
+        let default_interval = CollectionIntervals::default().ping;
 
-        // 手工 Ping 已经表达同一采集需求时直接复用，不占自动学习的 5 个名额。
-        for configured in &reporter.pings {
+        // 该 Reporter 实体已表达同一采集需求时直接复用,不占自动学习的 5 个名额。
+        let entity_pings = cfg.reporters[reporter_index]
+            .komari
+            .as_ref()
+            .expect("protocol checked")
+            .to_collect_config()
+            .pings;
+        for configured in &entity_pings {
             if ping_task_key(configured)? == task_id {
                 return Ok(KomariPingRegistration {
                     task_id,
@@ -705,15 +920,27 @@ impl SharedConfig {
             }
         }
 
-        let existing = reporter.ext.komari.learned_pings.iter().position(|ping| {
-            ping_task_key(&learned_ping_target(ping)).is_ok_and(|key| key == task_id)
-        });
+        let existing = cfg.reporters[reporter_index]
+            .komari
+            .as_ref()
+            .expect("protocol checked")
+            .ext
+            .learned_pings
+            .iter()
+            .position(|ping| {
+                ping_task_key(&learned_ping_target(ping)).is_ok_and(|key| key == task_id)
+            });
         if let Some(index) = existing {
-            // 内存中始终保留精确 LRU；落盘按分钟合并，避免面板高频任务持续写盘。
-            let previous =
-                cfg.reporters[reporter_index].ext.komari.learned_pings[index].last_seen_at;
+            // 内存中始终保留精确 LRU;落盘按分钟合并,避免面板高频任务持续写盘。
+            let learned = &mut cfg.reporters[reporter_index]
+                .komari
+                .as_mut()
+                .expect("protocol checked")
+                .ext
+                .learned_pings;
+            let previous = learned[index].last_seen_at;
             let current = observed_at.max(previous);
-            cfg.reporters[reporter_index].ext.komari.learned_pings[index].last_seen_at = current;
+            learned[index].last_seen_at = current;
             if previous / KOMARI_PING_TOUCH_PERSIST_MS != current / KOMARI_PING_TOUCH_PERSIST_MS {
                 if let Err(error) = persist(&self.path, &cfg) {
                     tracing::warn!(reporter_id, %error, "Komari Ping 最近使用时间落盘失败");
@@ -726,7 +953,12 @@ impl SharedConfig {
         }
 
         let mut next = cfg.clone();
-        let learned = &mut next.reporters[reporter_index].ext.komari.learned_pings;
+        let learned = &mut next.reporters[reporter_index]
+            .komari
+            .as_mut()
+            .expect("protocol checked")
+            .ext
+            .learned_pings;
         if learned.len() >= KOMARI_LEARNED_PING_LIMIT {
             let oldest = learned
                 .iter()
@@ -747,7 +979,7 @@ impl SharedConfig {
         *cfg = next;
         drop(cfg);
 
-        // 只有目标集合变化才通知，普通 touch 不重建 worker，也不重置 Reporter ticker。
+        // 只有目标集合变化才通知,普通 touch 不重建 worker,也不重置 Reporter ticker。
         self.config_tx.send_replace(full);
         tracing::info!(
             reporter_id,
@@ -766,7 +998,7 @@ impl SharedConfig {
         self.apply_remote_for("primary", remote).map(|_| ())
     }
 
-    /// 远端配置只写入产生它的 Reporter；全局采集配置永不受上报端影响。
+    /// 远端配置只写入产生它的 Reporter;连接身份永不受上报端影响。
     /// Returns true only when a new config_version was successfully persisted
     /// and applied. Callers can use this to trigger one-shot side effects
     /// without reacting to idempotent responses.
@@ -791,76 +1023,24 @@ impl SharedConfig {
         {
             return Ok(false);
         }
-        let RemoteConfig {
-            config_version,
-            intervals,
-            report_interval,
-            reset_day,
-            interfaces,
-            disks,
-            pings,
-            report_gpu,
-            report_errors,
-            report_self,
-            ext,
-        } = remote;
         let mut next = cfg.clone();
         let reporter = next
             .reporters
             .iter_mut()
             .find(|r| r.id == reporter_id)
             .ok_or_else(|| anyhow::anyhow!("Reporter 不存在: {reporter_id}"))?;
-        // 协议守卫:ext.cf 只对 CF 协议 Reporter 有意义,其他线路收到应整体
-        // 拒绝,避免把无意义的协议扩展写进 TOML。
-        if ext.as_ref().is_some_and(|ext| ext.cf.is_some())
-            && reporter.protocol != ReporterProtocol::Cf
-        {
-            bail!(
-                "ext.cf 仅对 CF 协议 Reporter 生效,当前协议: {}",
-                reporter.protocol
-            );
-        }
-        if let Some(value) = intervals {
-            reporter.intervals = value;
-        }
-        if let Some(value) = report_interval {
-            reporter.report_interval = value;
-        }
-        if let Some(value) = reset_day {
-            reporter.reset_day = value;
-        }
-        if let Some(value) = interfaces {
-            reporter.interfaces = value;
-        }
-        if let Some(value) = disks {
-            reporter.disks = value;
-        }
-        if let Some(value) = pings {
-            reporter.pings = value;
-        }
-        if let Some(value) = report_gpu {
-            reporter.report_gpu = Some(value);
-        }
-        if let Some(value) = report_errors {
-            reporter.report_errors = value;
-        }
-        if let Some(value) = report_self {
-            reporter.report_self = value;
-        }
-        if let Some(value) = ext {
-            if let Some(cf) = value.cf {
-                if let Some(value) = cf.correction {
-                    reporter.ext.cf.correction = value;
-                }
-                if let Some(value) = cf.batch {
-                    reporter.ext.cf.batch = value;
-                }
-                if let Some(value) = cf.connection_mode {
-                    reporter.ext.cf.connection_mode = value;
-                }
+        match reporter.protocol() {
+            Some(ReporterProtocol::Cf) => {
+                apply_remote_cf(reporter.cf.as_mut().expect("protocol checked"), &remote)?;
             }
+            Some(ReporterProtocol::Probe) => {
+                apply_remote_probe(reporter.probe.as_mut().expect("protocol checked"), &remote);
+            }
+            Some(ReporterProtocol::Komari) => {
+                bail!("Komari 协议不支持远端配置下发");
+            }
+            None => bail!("Reporter {reporter_id} 缺少协议段"),
         }
-        reporter.config_version = config_version.clone();
         next.validate()
             .context("remote Reporter config is invalid")?;
         persist(&self.path, &next).context("远端配置落盘失败")?;
@@ -877,12 +1057,104 @@ impl SharedConfig {
             }
         });
         self.config_tx.send_replace(full);
-        tracing::info!(reporter_id, config_version, "Reporter 远端配置已应用");
+        tracing::info!(
+            reporter_id,
+            remote.config_version,
+            "Reporter 远端配置已应用"
+        );
         Ok(true)
     }
 }
 
-/// 远端配置整体校验：任何一项非法则整体拒绝
+/// CF 远端配置落点:段形只能表达 collect_interval/interface/ct/cu/cm/bd,
+/// 落不下的字段整体拒绝,不静默丢弃。
+fn apply_remote_cf(section: &mut crate::model::CfSection, remote: &RemoteConfig) -> Result<()> {
+    if let Some(intervals) = remote.intervals {
+        let entity = section.to_collect_config().intervals;
+        if intervals.ping != entity.ping
+            || intervals.slow != entity.slow
+            || intervals.gpu != entity.gpu
+            || intervals.ip != entity.ip
+            || intervals.diskio != entity.diskio
+        {
+            bail!("cf 远端配置仅支持修改 collect_interval");
+        }
+        section.collect_interval = intervals.collect;
+    }
+    if let Some(value) = remote.report_interval {
+        section.interval = value;
+    }
+    if let Some(value) = remote.reset_day {
+        section.reset_day = value;
+    }
+    if let Some(value) = &remote.interfaces {
+        section.interface = value.join(",");
+    }
+    if let Some(value) = &remote.disks {
+        if !value.is_empty() {
+            bail!("cf 段不支持 disks 选择");
+        }
+    }
+    if let Some(pings) = &remote.pings {
+        for ping in pings {
+            if !matches!(ping.name.as_str(), "ct" | "cu" | "cm" | "bd") {
+                bail!("cf 远端 Ping 仅支持 ct/cu/cm/bd,收到: {}", ping.name);
+            }
+        }
+        let take = |name: &str| {
+            pings
+                .iter()
+                .find(|ping| ping.name == name)
+                .map(|ping| ping.target.clone())
+        };
+        section.ct = take("ct");
+        section.cu = take("cu");
+        section.cm = take("cm");
+        section.bd = take("bd");
+    }
+    if let Some(value) = remote.report_gpu {
+        if !value {
+            bail!("cf 线固定启用 GPU,不能远端关闭");
+        }
+    }
+    // report_errors/report_self 对 cf 线固定,远端推送直接忽略。
+    section.ext.config_version = remote.config_version.clone();
+    Ok(())
+}
+
+/// probe 远端配置落点:段即采集配置实体完整形态,逐字段整体替换。
+fn apply_remote_probe(section: &mut crate::model::ProbeSection, remote: &RemoteConfig) {
+    if let Some(value) = remote.intervals {
+        section.intervals = value;
+    }
+    if let Some(value) = remote.report_interval {
+        section.report_interval = value;
+    }
+    if let Some(value) = remote.reset_day {
+        section.reset_day = value;
+    }
+    if let Some(value) = &remote.interfaces {
+        section.interfaces = value.clone();
+    }
+    if let Some(value) = &remote.disks {
+        section.disks = value.clone();
+    }
+    if let Some(value) = &remote.pings {
+        section.pings = value.clone();
+    }
+    if let Some(value) = remote.report_gpu {
+        section.report_gpu = value;
+    }
+    if let Some(value) = remote.report_errors {
+        section.report_errors = value;
+    }
+    if let Some(value) = remote.report_self {
+        section.report_self = value;
+    }
+    section.ext.config_version = remote.config_version.clone();
+}
+
+/// 远端配置整体校验:任何一项非法则整体拒绝
 fn validate_remote(remote: &RemoteConfig) -> Result<()> {
     if let Some(intervals) = remote.intervals {
         intervals.validate().map_err(anyhow::Error::msg)?;
@@ -919,7 +1191,29 @@ fn validate_remote(remote: &RemoteConfig) -> Result<()> {
 pub fn load(path: &Path) -> Result<LocalConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("读取配置失败: {}", path.display()))?;
+    if is_legacy_schema(&raw)? {
+        let (cfg, warnings) = crate::config_legacy::migrate(&raw)?;
+        let backup_path = path.with_extension("toml.bak");
+        persist_bytes(&backup_path, raw.as_bytes())
+            .with_context(|| format!("备份旧配置失败: {}", backup_path.display()))?;
+        persist(path, &cfg).context("迁移后的配置落盘失败")?;
+        for warning in &warnings {
+            tracing::warn!(%warning, "旧配置迁移警告");
+        }
+        tracing::info!(
+            path = %path.display(),
+            backup = %backup_path.display(),
+            "旧版配置已迁移为 schema = 1"
+        );
+        return Ok(cfg);
+    }
     parse_text(&raw)
+}
+
+/// 顶层缺少 schema 键即视为旧版(schema 0)配置。
+fn is_legacy_schema(raw: &str) -> Result<bool> {
+    let value: toml::Value = toml::from_str(raw).context("解析配置 TOML 失败")?;
+    Ok(value.get("schema").is_none())
 }
 
 fn parse_text(raw: &str) -> Result<LocalConfig> {
@@ -930,17 +1224,17 @@ fn parse_text(raw: &str) -> Result<LocalConfig> {
 
 /// 同目录临时文件 + 原子替换。
 ///
-/// SharedConfig 在其写锁内调用这里；唯一临时文件避免与编辑器或上次异常退出
-/// 遗留的固定 `.tmp` 冲突。配置变更路径先同步文件、替换成功后才更新内存，
+/// SharedConfig 在其写锁内调用这里;唯一临时文件避免与编辑器或上次异常退出
+/// 遗留的固定 `.tmp` 冲突。配置变更路径先同步文件、替换成功后才更新内存,
 /// 从而保证磁盘始终是可恢复的事实源。
 pub(crate) fn persist(path: &Path, cfg: &LocalConfig) -> Result<()> {
     let data = toml::to_string_pretty(cfg)?;
     persist_bytes(path, data.as_bytes())
 }
 
-/// 校验托盘编辑器中的原始 TOML，并在正式配置自打开编辑器后未变化时保存。
+/// 校验托盘编辑器中的原始 TOML,并在正式配置自打开编辑器后未变化时保存。
 ///
-/// 编辑内容先通过与启动加载完全相同的解析和业务校验，再备份当前正式配置，
+/// 编辑内容先通过与启动加载完全相同的解析和业务校验,再备份当前正式配置,
 /// 最后执行同目录原子替换。任一步失败都不会以未校验内容覆盖正式配置。
 pub(crate) fn persist_edited_text(
     path: &Path,
@@ -952,7 +1246,7 @@ pub(crate) fn persist_edited_text(
     let current = std::fs::read_to_string(path)
         .with_context(|| format!("重新读取正式配置失败: {}", path.display()))?;
     if current != expected_original {
-        bail!("正式配置在编辑期间已被其他进程修改；请取消并重新打开编辑器");
+        bail!("正式配置在编辑期间已被其他进程修改;请取消并重新打开编辑器");
     }
 
     let backup_path = path.with_extension("toml.bak");
@@ -975,7 +1269,7 @@ fn persist_bytes(path: &Path, data: &[u8]) -> Result<()> {
         .tempfile_in(dir)
         .with_context(|| format!("创建配置临时文件失败: {}", dir.display()))?;
 
-    // 配置含 secret：替换前固定 0600，避免权限随旧文件或 umask 漂移。
+    // 配置含 secret:替换前固定 0600,避免权限随旧文件或 umask 漂移。
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -990,7 +1284,7 @@ fn persist_bytes(path: &Path, data: &[u8]) -> Result<()> {
         .map_err(|error| error.error)
         .with_context(|| format!("原子替换配置失败: {}", path.display()))?;
 
-    // rename 本身持久化到目录项后，掉电恢复不会回到旧文件名状态。
+    // rename 本身持久化到目录项后,掉电恢复不会回到旧文件名状态。
     #[cfg(unix)]
     std::fs::File::open(dir)?.sync_all()?;
     Ok(())
@@ -999,38 +1293,81 @@ fn persist_bytes(path: &Path, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{CfSection, KomariSection, ProbeSection};
 
     fn base_config() -> LocalConfig {
         LocalConfig {
-            net_static_path: "/tmp/x.json".into(),
+            schema: CONFIG_SCHEMA,
+            data_dir: "/tmp/probe-rs-test".into(),
             auto_update: AutoUpdateConfig::default(),
             reporters: vec![ReporterConfig {
                 id: "primary".into(),
-                protocol: ReporterProtocol::Probe,
-                server_id: "s1".into(),
-                secret: "sec".into(),
-                worker_url: "https://example.com/report".into(),
-                config_version: String::new(),
-                intervals: CollectionIntervals {
-                    collect: 10,
-                    ping: 30,
-                    ..Default::default()
-                },
-                report_interval: 60,
-                reset_day: 1,
-                interfaces: vec![],
-                disks: vec![],
-                report_gpu: Some(false),
-                report_errors: true,
-                report_self: false,
-                pings: vec![PingTarget {
-                    name: "ct".into(),
-                    kind: PingKind::Tcp,
-                    target: "example.com:80".into(),
-                    interval: None,
-                }],
-                ext: Default::default(),
+                cf: None,
+                komari: None,
+                probe: Some(ProbeSection {
+                    server_id: "s1".into(),
+                    secret: "sec".into(),
+                    worker_url: "https://example.com/report".into(),
+                    report_interval: 60,
+                    reset_day: 1,
+                    report_errors: true,
+                    report_self: false,
+                    interfaces: vec![],
+                    disks: vec![],
+                    report_gpu: false,
+                    intervals: CollectionIntervals {
+                        collect: 10,
+                        ..Default::default()
+                    },
+                    pings: vec![PingTarget {
+                        name: "ct".into(),
+                        kind: PingKind::Tcp,
+                        target: "example.com:80".into(),
+                        interval: None,
+                    }],
+                    ext: Default::default(),
+                }),
             }],
+        }
+    }
+
+    fn komari_reporter(id: &str) -> ReporterConfig {
+        ReporterConfig {
+            id: id.into(),
+            cf: None,
+            komari: Some(KomariSection {
+                endpoint: "https://komari.example.com".into(),
+                token: "token".into(),
+                interval: 1,
+                month_rotate: 12,
+                enable_gpu: true,
+                include_nics: String::new(),
+                include_mountpoints: String::new(),
+                ext: Default::default(),
+            }),
+            probe: None,
+        }
+    }
+
+    fn cf_reporter(id: &str) -> ReporterConfig {
+        ReporterConfig {
+            id: id.into(),
+            cf: Some(CfSection {
+                server_id: "cf-id".into(),
+                secret: "cf-secret".into(),
+                url: "https://worker.example/update".into(),
+                interval: 60,
+                collect_interval: 1,
+                reset_day: 1,
+                interface: String::new(),
+                ct: Some("gd-ct.example.com:80".into()),
+                cu: None,
+                cm: None,
+                bd: None,
+                ext: Default::default(),
+            }),
+            komari: None,
+            probe: None,
         }
     }
 
@@ -1043,10 +1380,7 @@ mod tests {
                 .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
                 .join("probe-rs");
             assert_eq!(default_config_path(), base.join("config.toml"));
-            assert_eq!(
-                PathBuf::from(default_net_static_path()),
-                base.join("net_static.json")
-            );
+            assert_eq!(PathBuf::from(default_data_dir()), base);
         }
 
         #[cfg(not(windows))]
@@ -1055,17 +1389,48 @@ mod tests {
                 default_config_path(),
                 PathBuf::from("/etc/probe-rs/config.toml")
             );
-            assert_eq!(
-                default_net_static_path(),
-                "/var/lib/probe-rs/net_static.json"
-            );
+            assert_eq!(default_data_dir(), "/var/lib/probe-rs");
         }
+    }
+
+    #[test]
+    fn net_static_lives_under_data_dir() {
+        let cfg = base_config();
+        assert_eq!(
+            cfg.net_static_path(),
+            PathBuf::from("/tmp/probe-rs-test/net_static.json")
+        );
     }
 
     #[test]
     fn rejects_zero_intervals() {
         let mut cfg = base_config();
-        cfg.reporters[0].intervals.collect = 0;
+        cfg.reporters[0].probe.as_mut().unwrap().intervals.collect = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_reporter_without_or_with_multiple_protocol_sections() {
+        let mut cfg = base_config();
+        cfg.reporters[0].komari = Some(komari_reporter("k").komari.unwrap());
+        assert!(cfg.validate().is_err());
+        cfg.reporters[0].probe = None;
+        cfg.reporters[0].komari = None;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_bad_cf_node_targets() {
+        let mut reporter = cf_reporter("cf");
+        reporter.cf.as_mut().unwrap().ct = Some("example.com/path".into());
+        let mut cfg = base_config();
+        cfg.reporters.push(reporter);
+        assert!(cfg.validate().is_err());
+
+        let mut reporter = cf_reporter("cf");
+        reporter.cf.as_mut().unwrap().cu = Some(String::new());
+        let mut cfg = base_config();
+        cfg.reporters.push(reporter);
         assert!(cfg.validate().is_err());
     }
 
@@ -1078,13 +1443,20 @@ mod tests {
         let (shared, intervals_rx, config_rx) = SharedConfig::new(initial.clone(), path.clone());
 
         let mut incompatible = initial.clone();
-        incompatible.reporters[0].worker_url = "https://other.example/report".into();
-        incompatible.reporters[0].intervals.collect = 5;
+        incompatible.reporters[0].probe.as_mut().unwrap().worker_url =
+            "https://other.example/report".into();
+        incompatible.reporters[0]
+            .probe
+            .as_mut()
+            .unwrap()
+            .intervals
+            .collect = 5;
         persist(&path, &incompatible).unwrap();
 
         let result = shared
             .update_local_from_disk(&path, |candidate| {
-                candidate.reporters[0].worker_url == initial.reporters[0].worker_url
+                candidate.reporters[0].probe.as_ref().unwrap().worker_url
+                    == initial.reporters[0].probe.as_ref().unwrap().worker_url
             })
             .unwrap();
         assert_eq!(result, LocalReload::RestartRequired);
@@ -1093,12 +1465,18 @@ mod tests {
         assert!(!config_rx.has_changed().unwrap());
 
         let mut compatible = initial.clone();
-        compatible.reporters[0].intervals.collect = 5;
+        compatible.reporters[0]
+            .probe
+            .as_mut()
+            .unwrap()
+            .intervals
+            .collect = 5;
         persist(&path, &compatible).unwrap();
 
         let result = shared
             .update_local_from_disk(&path, |candidate| {
-                candidate.reporters[0].worker_url == initial.reporters[0].worker_url
+                candidate.reporters[0].probe.as_ref().unwrap().worker_url
+                    == initial.reporters[0].probe.as_ref().unwrap().worker_url
             })
             .unwrap();
         assert_eq!(result, LocalReload::Applied);
@@ -1118,7 +1496,11 @@ mod tests {
         persist(&path, &initial).unwrap();
 
         let mut replacement = initial;
-        replacement.reporters[0].report_interval = 7;
+        replacement.reporters[0]
+            .probe
+            .as_mut()
+            .unwrap()
+            .report_interval = 7;
         persist(&path, &replacement).unwrap();
 
         assert_eq!(load(&path).unwrap(), replacement);
@@ -1167,7 +1549,14 @@ mod tests {
         assert_eq!(backup_path, path.with_extension("toml.bak"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
         assert_eq!(std::fs::read_to_string(backup_path).unwrap(), original);
-        assert_eq!(load(&path).unwrap().reporters[0].report_interval, 7);
+        assert_eq!(
+            load(&path).unwrap().reporters[0]
+                .probe
+                .as_ref()
+                .unwrap()
+                .report_interval,
+            7
+        );
     }
 
     #[test]
@@ -1178,7 +1567,11 @@ mod tests {
         std::fs::write(&path, &original).unwrap();
 
         let mut concurrent = base_config();
-        concurrent.reporters[0].report_interval = 11;
+        concurrent.reporters[0]
+            .probe
+            .as_mut()
+            .unwrap()
+            .report_interval = 11;
         let concurrent = toml::to_string_pretty(&concurrent).unwrap();
         std::fs::write(&path, &concurrent).unwrap();
         let edited = original.replace("report_interval = 60", "report_interval = 7");
@@ -1193,31 +1586,19 @@ mod tests {
     #[test]
     fn auto_update_defaults_to_disabled_stable_channel() {
         let text = r#"
-            net_static_path = "/tmp/x.json"
+            schema = 1
+            data_dir = "/tmp/x"
             [[reporters]]
             id = "primary"
-            protocol = "probe"
+            [reporters.probe]
             server_id = "s1"
             secret = "sec"
             worker_url = "https://example.com/report"
-            config_version = ""
             report_interval = 60
-            reset_day = 1
-            interfaces = []
-            disks = []
-            report_gpu = false
-            report_errors = true
-            report_self = false
-            [reporters.intervals]
-            collect = 10
-            ping = 30
-            slow = 60
-            gpu = 60
-            ip = 600
-            diskio = 10
         "#;
         let cfg: LocalConfig = toml::from_str(text).unwrap();
         assert_eq!(cfg.auto_update, AutoUpdateConfig::default());
+        cfg.validate().unwrap();
     }
 
     #[test]
@@ -1234,123 +1615,126 @@ mod tests {
     }
 
     #[test]
-    fn toml_roundtrip_preserves_ext_and_pings() {
-        // TOML 布局陷阱防回归：[ext.cf] 与 [[pings]] 的表格次序必须往返无损
-        let mut cfg = base_config();
-        cfg.reporters[0].ext.cf.correction = false;
-        let text = toml::to_string_pretty(&cfg).unwrap();
-        let back: LocalConfig = toml::from_str(&text).unwrap();
-        assert_eq!(back, cfg);
-        assert!(!back.reporters[0].ext.cf.correction);
-        assert_eq!(back.reporters[0].pings[0].name, "ct");
+    fn rejects_unknown_fields_loudly() {
+        let bad_toml = r#"
+schema = 1
+data_dir = "/tmp/x"
+
+[[reporters]]
+id = "primary"
+protocol = "probe"
+
+[reporters.probe]
+server_id = "s1"
+secret = "sec"
+worker_url = "https://example.com/report"
+report_interval = 60
+"#;
+        // reporter 级的 protocol 键已不存在,必须报错而不是静默忽略
+        assert!(toml::from_str::<LocalConfig>(bad_toml).is_err());
     }
 
     #[test]
-    fn global_collection_and_reporter_output_are_independent() {
+    fn toml_roundtrip_preserves_sections_and_pings() {
         let mut cfg = base_config();
+        cfg.reporters.push(cf_reporter("cf-a"));
+        cfg.reporters.push(komari_reporter("komari-a"));
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: LocalConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back, cfg);
+        assert!(text.contains("[reporters.cf]"));
+        assert!(text.contains("[reporters.komari]"));
+        assert!(text.contains("[reporters.probe]"));
+    }
+
+    #[test]
+    fn protocol_sections_convert_to_collect_entities_and_merge() {
+        let mut cfg = base_config();
+        // probe: collect=10, ping interval 默认 30,report_gpu=false
         cfg.reporters.push(ReporterConfig {
             id: "komari-a".into(),
-            protocol: ReporterProtocol::Komari,
-            server_id: "node-a".into(),
-            secret: "token".into(),
-            worker_url: "http://panel.example".into(),
-            config_version: String::new(),
-            intervals: CollectionIntervals {
-                collect: 5,
-                ping: 10,
-                ..Default::default()
-            },
-            report_interval: 3,
-            reset_day: 12,
-            interfaces: vec!["Ethernet*".into()],
-            disks: vec!["C:*".into()],
-            report_gpu: Some(true),
-            report_errors: false,
-            report_self: true,
-            pings: vec![PingTarget {
-                name: "same-host".into(),
-                kind: PingKind::Tcp,
-                target: "EXAMPLE.com:80".into(),
-                interval: Some(10),
-            }],
-            ext: Default::default(),
+            cf: None,
+            komari: Some(KomariSection {
+                endpoint: "https://panel.example".into(),
+                token: "token".into(),
+                interval: 5,
+                month_rotate: 12,
+                enable_gpu: true,
+                include_nics: "Ethernet*".into(),
+                include_mountpoints: "C:*".into(),
+                ext: Default::default(),
+            }),
+            probe: None,
         });
-        cfg.reporters.push(ReporterConfig {
-            id: "cf-a".into(),
-            protocol: ReporterProtocol::Cf,
-            server_id: "cf-id".into(),
-            secret: "cf-secret".into(),
-            worker_url: "https://worker.example/update".into(),
-            config_version: String::new(),
-            intervals: CollectionIntervals {
-                collect: 1,
-                ping: 20,
-                ..Default::default()
-            },
-            report_interval: 30,
-            reset_day: 1,
-            interfaces: vec![],
-            disks: vec![],
-            report_gpu: None,
-            report_errors: true,
-            report_self: false,
-            pings: vec![],
-            ext: Default::default(),
-        });
+        cfg.reporters.push(cf_reporter("cf-a"));
 
         cfg.validate().unwrap();
+
         let komari = cfg.reporter("komari-a").unwrap();
+        assert_eq!(komari.protocol, ReporterProtocol::Komari);
         assert_eq!(komari.reset_day, 12);
         assert_eq!(komari.intervals.collect, 5);
-        assert_eq!(komari.intervals.report, 3);
+        assert_eq!(komari.intervals.report, 5); // komari 按采集周期上报
         assert!(komari.report_gpu);
-        assert!(komari.report_self);
-        assert!(!komari.report_errors);
-        assert_eq!(komari.pings.len(), 1);
+        assert!(komari.report_errors);
+        assert!(!komari.report_self);
+        assert_eq!(komari.interfaces, vec!["Ethernet*".to_string()]);
+        assert_eq!(komari.disks, vec!["C:*".to_string()]);
+
         let cf = cfg.reporter("cf-a").unwrap();
-        assert!(cf.report_gpu);
-        assert_eq!(cfg.effective_intervals().collect, 1);
-        assert_eq!(cfg.effective_intervals().report, 1); // 内部占位，不是上报周期
-        assert!(cfg.effective_gpu());
-        assert_eq!(cfg.effective_pings().len(), 1); // type + 规范化 endpoint 去重
-        assert_eq!(cfg.effective_pings()[0].interval, Some(10)); // 各消费者取最小周期
+        assert!(cf.report_gpu); // cf 固定启用 GPU
+        assert_eq!(cf.intervals.collect, 1);
+        assert_eq!(cf.pings.len(), 1);
+        assert_eq!(cf.pings[0].target.name, "ct");
 
-        let serialized = toml::to_string_pretty(&cfg).unwrap();
-        let roundtrip: LocalConfig = toml::from_str(&serialized).unwrap();
-        assert_eq!(roundtrip, cfg);
-
-        let native_receipt = komari.static_config(cfg.global_summary(), cfg.reporter_summaries());
-        assert!(native_receipt.ext.is_none());
-        assert!(!serde_json::to_string(&native_receipt)
-            .unwrap()
-            .contains("\"ext\""));
+        let merged = cfg.merged_collect_config();
+        assert_eq!(merged.intervals.collect, 1); // min(10, 5, 1)
+        assert!(merged.report_gpu); // OR
+                                    // komari 指定了网卡,但 probe/cf 为空(= 全部)→ 全局为全部
+        assert!(merged.interfaces.is_empty());
+        assert!(merged.disks.is_empty());
+        // probe 的 ct(example.com:80)与 cf 的 ct(gd-ct)不同目标,都保留
+        assert_eq!(merged.pings.len(), 2);
+        assert_eq!(cfg.effective_intervals().report, 1); // 内部占位,不是上报周期
 
         let receipt = cf.static_config(cfg.global_summary(), cfg.reporter_summaries());
-        assert!(receipt.ext.is_some());
-        assert_eq!(receipt.global.pings.len(), 1);
-        assert_eq!(receipt.global.pings[0].target, "tcp://example.com:80");
-        assert_eq!(receipt.global.pings[0].interval, 10);
         assert_eq!(receipt.reporters.len(), 3);
-        assert_eq!(receipt.reporters[1].id, "komari-a");
-        assert_eq!(receipt.reporters[1].pings[0].name, "same-host");
-        assert_eq!(receipt.reporters[1].pings[0].target, "EXAMPLE.com:80");
-        assert!(receipt.reporters[2].report_gpu); // CF 缺省值已展开
         let json = serde_json::to_string(&receipt).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(value["global"]["pings"][0].get("name").is_none());
-        assert!(value["global"]["pings"][0].get("type").is_none());
         for private in [
             "sec",
             "token",
             "cf-secret",
             "https://example.com/report",
-            "http://panel.example",
+            "https://panel.example",
             "https://worker.example/update",
-            "node-a",
             "cf-id",
         ] {
             assert!(!json.contains(private), "摘要泄露了私有字段: {private}");
         }
+    }
+
+    #[test]
+    fn duplicate_ping_endpoints_merge_with_min_interval() {
+        let mut cfg = base_config();
+        cfg.reporters[0].probe.as_mut().unwrap().pings = vec![PingTarget {
+            name: "a".into(),
+            kind: PingKind::Tcp,
+            target: "EXAMPLE.com:80".into(),
+            interval: Some(10),
+        }];
+        let mut cf = cf_reporter("cf-a");
+        cf.cf.as_mut().unwrap().ct = Some("example.com.:80".into());
+        cfg.reporters.push(cf);
+        cfg.validate().unwrap();
+
+        let merged = cfg.merged_collect_config();
+        assert_eq!(merged.pings.len(), 1); // type + 规范化 endpoint 去重
+        assert_eq!(merged.pings[0].interval, Some(10)); // 各消费者取最小周期
+
+        let global = cfg.global_summary();
+        assert_eq!(global.pings.len(), 1);
+        assert_eq!(global.pings[0].target, "tcp://example.com:80");
+        assert_eq!(global.pings[0].interval, 10);
     }
 
     #[test]
@@ -1428,63 +1812,13 @@ mod tests {
     }
 
     #[test]
-    fn example_config_parses() {
-        // 防回归：config.example.toml 本身必须能解析（TOML 布局陷阱曾让示例文件失效）
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml"))
-                .unwrap();
-        let cfg: LocalConfig = toml::from_str(&text).unwrap();
-        cfg.validate().unwrap();
-    }
-
-    #[test]
-    fn minimal_canonical_config_parses() {
-        let text = r#"
-net_static_path = "/tmp/net.json"
-
-[[reporters]]
-id = "komari"
-protocol = "komari"
-server_id = "node-a"
-secret = "token"
-worker_url = "http://panel.example"
-config_version = ""
-report_interval = 1
-reset_day = 12
-interfaces = []
-disks = []
-report_gpu = true
-report_errors = true
-report_self = false
-
-[reporters.intervals]
-collect = 1
-ping = 30
-slow = 60
-gpu = 60
-ip = 600
-diskio = 10
-"#;
-        let cfg: LocalConfig = toml::from_str(text).unwrap();
-        cfg.validate().unwrap();
-        let komari = cfg.reporter("komari").unwrap();
-        assert_eq!(komari.protocol, ReporterProtocol::Komari);
-        assert_eq!(komari.reset_day, 12);
-        assert_eq!(komari.intervals.collect, 1);
-        assert!(komari.report_gpu);
-    }
-
-    #[test]
     fn komari_learned_pings_are_persisted_and_lru_bounded() {
         let dir =
             std::env::temp_dir().join(format!("probe-rs-komari-ping-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         let mut cfg = base_config();
-        let reporter = &mut cfg.reporters[0];
-        reporter.protocol = ReporterProtocol::Komari;
-        reporter.worker_url = "https://komari.example.com".into();
-        reporter.pings.clear();
+        cfg.reporters[0] = komari_reporter("primary");
         persist(&path, &cfg).unwrap();
         let (shared, _intervals_rx, config_rx) = SharedConfig::new(cfg, path.clone());
 
@@ -1494,14 +1828,20 @@ diskio = 10
                 .unwrap();
         }
         assert!(config_rx.has_changed().unwrap());
-        let learned = &shared.get().reporters[0].ext.komari.learned_pings;
-        assert_eq!(learned.len(), KOMARI_LEARNED_PING_LIMIT);
+        let learned_len = shared.get().reporters[0]
+            .komari
+            .as_ref()
+            .unwrap()
+            .ext
+            .learned_pings
+            .len();
+        assert_eq!(learned_len, KOMARI_LEARNED_PING_LIMIT);
         assert_eq!(
             shared.get().effective_pings().len(),
             KOMARI_LEARNED_PING_LIMIT
         );
 
-        // 最近再次出现的第一个目标必须保留；加入第六个时淘汰未使用最久的第二个。
+        // 最近再次出现的第一个目标必须保留;加入第六个时淘汰未使用最久的第二个。
         shared
             .learn_komari_ping("primary", PingKind::Icmp, "192.0.2.1", 100)
             .unwrap();
@@ -1509,7 +1849,12 @@ diskio = 10
             .learn_komari_ping("primary", PingKind::Icmp, "192.0.2.6", 101)
             .unwrap();
         let current = shared.get();
-        let learned = &current.reporters[0].ext.komari.learned_pings;
+        let learned = &current.reporters[0]
+            .komari
+            .as_ref()
+            .unwrap()
+            .ext
+            .learned_pings;
         assert_eq!(learned.len(), KOMARI_LEARNED_PING_LIMIT);
         assert!(learned.iter().any(|ping| ping.target == "192.0.2.1"));
         assert!(!learned.iter().any(|ping| ping.target == "192.0.2.2"));
@@ -1517,47 +1862,50 @@ diskio = 10
 
         let on_disk = load(&path).unwrap();
         assert_eq!(
-            on_disk.reporters[0].ext.komari.learned_pings,
-            current.reporters[0].ext.komari.learned_pings
+            on_disk.reporters[0]
+                .komari
+                .as_ref()
+                .unwrap()
+                .ext
+                .learned_pings,
+            current.reporters[0]
+                .komari
+                .as_ref()
+                .unwrap()
+                .ext
+                .learned_pings
         );
         let toml = std::fs::read_to_string(&path).unwrap();
-        assert!(toml.contains("[[reporters.ext.komari.learned_pings]]"));
+        assert!(toml.contains("[[reporters.komari.ext.learned_pings]]"));
         assert!(shared
             .learn_komari_ping("primary", PingKind::Http, "https://example.com/health", 102,)
             .is_err());
         assert_eq!(
-            shared.get().reporters[0].ext.komari.learned_pings.len(),
+            shared.get().reporters[0]
+                .komari
+                .as_ref()
+                .unwrap()
+                .ext
+                .learned_pings
+                .len(),
             KOMARI_LEARNED_PING_LIMIT
         );
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn rejects_unknown_fields_loudly() {
-        // 标量误放在 [intervals] 段之后会被解析进 intervals 表，必须报错而不是静默忽略
-        let bad_toml = r#"
-[intervals]
-collect = 1
-ping = 2
-reset_day = 15
-"#;
-        assert!(toml::from_str::<LocalConfig>(bad_toml).is_err());
-    }
-
-    #[test]
-    fn rejects_legacy_root_connection_shape() {
-        let legacy = r#"
-server_id = "s1"
-secret = "sec"
-worker_url = "https://example.com/report"
-protocol = "probe"
-
-[intervals]
-collect = 1
-report = 10
-ping = 30
-"#;
-        assert!(toml::from_str::<LocalConfig>(legacy).is_err());
+    fn remote(config_version: &str) -> RemoteConfig {
+        RemoteConfig {
+            config_version: config_version.into(),
+            intervals: None,
+            report_interval: None,
+            reset_day: None,
+            interfaces: None,
+            disks: None,
+            pings: None,
+            report_gpu: None,
+            report_errors: None,
+            report_self: None,
+        }
     }
 
     #[test]
@@ -1569,65 +1917,24 @@ ping = 30
         persist(&path, &cfg).unwrap();
         let (shared, rx, _config_rx) = SharedConfig::new(cfg, path.clone());
 
-        // 版本相同或为空：忽略（!= 语义，空版本号视为无版本）
-        assert!(!shared
-            .apply_remote_for(
-                "primary",
-                RemoteConfig {
-                    config_version: String::new(),
-                    intervals: None,
-                    report_interval: Some(1),
-                    reset_day: Some(5),
-                    interfaces: None,
-                    disks: None,
-                    pings: None,
-                    report_gpu: None,
-                    report_errors: None,
-                    report_self: None,
-                    ext: None,
-                }
-            )
-            .unwrap());
+        // 版本相同或为空:忽略(!= 语义,空版本号视为无版本)
+        let mut push = remote("");
+        push.report_interval = Some(1);
+        push.reset_day = Some(5);
+        assert!(!shared.apply_remote_for("primary", push).unwrap());
         assert_eq!(shared.get().reporter("primary").unwrap().reset_day, 1);
 
-        // 零值间隔：整体拒绝
-        assert!(shared
-            .apply_remote(RemoteConfig {
-                config_version: "2026-08-06T15:00:00+08:00".into(),
-                intervals: None,
-                report_interval: Some(0),
-                reset_day: Some(5),
-                interfaces: None,
-                disks: None,
-                pings: None,
-                report_gpu: None,
-                report_errors: None,
-                report_self: None,
-                ext: None,
-            })
-            .is_err());
+        // 零值间隔:整体拒绝
+        let mut push = remote("2026-08-06T15:00:00+08:00");
+        push.report_interval = Some(0);
+        assert!(shared.apply_remote(push).is_err());
         assert_eq!(shared.get().reporter("primary").unwrap().config_version, "");
 
-        // 合法：应用并落盘
-        let applied = shared
-            .apply_remote_for(
-                "primary",
-                RemoteConfig {
-                    config_version: "2026-08-06T15:00:00+08:00".into(),
-                    intervals: None,
-                    report_interval: Some(20),
-                    reset_day: Some(15),
-                    interfaces: None,
-                    disks: None,
-                    pings: None,
-                    report_gpu: None,
-                    report_errors: None,
-                    report_self: None,
-                    ext: None,
-                },
-            )
-            .unwrap();
-        assert!(applied);
+        // 合法:应用并落盘
+        let mut push = remote("2026-08-06T15:00:00+08:00");
+        push.report_interval = Some(20);
+        push.reset_day = Some(15);
+        assert!(shared.apply_remote_for("primary", push).unwrap());
         let after = shared.get();
         let primary = after.reporter("primary").unwrap();
         assert_eq!(primary.config_version, "2026-08-06T15:00:00+08:00");
@@ -1637,31 +1944,23 @@ ping = 30
         assert!(!rx.has_changed().unwrap());
         let on_disk = load(&path).unwrap();
         assert_eq!(
-            on_disk.reporter("primary").unwrap().config_version,
+            on_disk.reporters[0]
+                .probe
+                .as_ref()
+                .unwrap()
+                .ext
+                .config_version,
             "2026-08-06T15:00:00+08:00"
         );
-        assert_eq!(on_disk.reporters[0].report_interval, 20);
+        assert_eq!(
+            on_disk.reporters[0].probe.as_ref().unwrap().report_interval,
+            20
+        );
 
-        // The same CF config version is idempotent and must not trigger
-        // one-shot work such as an update check again.
-        assert!(!shared
-            .apply_remote_for(
-                "primary",
-                RemoteConfig {
-                    config_version: "2026-08-06T15:00:00+08:00".into(),
-                    intervals: None,
-                    report_interval: Some(30),
-                    reset_day: None,
-                    interfaces: None,
-                    disks: None,
-                    pings: None,
-                    report_gpu: None,
-                    report_errors: None,
-                    report_self: None,
-                    ext: None,
-                }
-            )
-            .unwrap());
+        // 相同 config_version 幂等,不重复触发一次性动作。
+        let mut push = remote("2026-08-06T15:00:00+08:00");
+        push.report_interval = Some(30);
+        assert!(!shared.apply_remote_for("primary", push).unwrap());
         assert_eq!(
             shared.get().reporter("primary").unwrap().intervals.report,
             20
@@ -1671,59 +1970,95 @@ ping = 30
     }
 
     #[test]
-    fn cf_connection_mode_remote_update_is_persisted() {
+    fn cf_remote_config_maps_into_section_slots() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut cfg = base_config();
-        cfg.reporters[0].protocol = ReporterProtocol::Cf;
-        cfg.reporters[0].worker_url = "https://worker.example/update".into();
+        cfg.reporters[0] = cf_reporter("primary");
         persist(&path, &cfg).unwrap();
-        let (shared, _intervals_rx, _config_rx) = SharedConfig::new(cfg, path.clone());
+        let (shared, _rx, _config_rx) = SharedConfig::new(cfg, path.clone());
 
-        assert!(shared
-            .apply_remote_for(
-                "primary",
-                RemoteConfig {
-                    config_version: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
-                    intervals: None,
-                    report_interval: None,
-                    reset_day: None,
-                    interfaces: None,
-                    disks: None,
-                    pings: None,
-                    report_gpu: None,
-                    report_errors: None,
-                    report_self: None,
-                    ext: Some(crate::model::RemoteExt {
-                        cf: Some(crate::model::RemoteCfExt {
-                            correction: None,
-                            batch: None,
-                            connection_mode: Some(crate::model::CfConnectionMode::Http),
-                        }),
-                    }),
-                },
-            )
-            .unwrap());
+        let mut push = remote("v1");
+        push.intervals = Some(CollectionIntervals {
+            collect: 2,
+            ..Default::default()
+        });
+        push.report_interval = Some(30);
+        push.interfaces = Some(vec!["eth0".into()]);
+        push.pings = Some(vec![
+            PingTarget {
+                name: "ct".into(),
+                kind: PingKind::Tcp,
+                target: "new-ct.example.com:80".into(),
+                interval: None,
+            },
+            PingTarget {
+                name: "cu".into(),
+                kind: PingKind::Tcp,
+                target: "new-cu.example.com:80".into(),
+                interval: None,
+            },
+        ]);
+        assert!(shared.apply_remote_for("primary", push).unwrap());
 
+        let cf = shared.get().reporters[0].cf.clone().unwrap();
+        assert_eq!(cf.collect_interval, 2);
+        assert_eq!(cf.interval, 30);
+        assert_eq!(cf.interface, "eth0");
+        assert_eq!(cf.ct.as_deref(), Some("new-ct.example.com:80"));
+        assert_eq!(cf.cu.as_deref(), Some("new-cu.example.com:80"));
+        assert_eq!(cf.cm, None); // 缺席 = 清除
+        assert_eq!(cf.ext.config_version, "v1");
+
+        // 非 collect 的 intervals 字段:整体拒绝
+        let mut push = remote("v2");
+        push.intervals = Some(CollectionIntervals {
+            ping: 99,
+            ..Default::default()
+        });
+        assert!(shared.apply_remote_for("primary", push).is_err());
         assert_eq!(
-            shared
-                .get()
-                .reporter("primary")
+            shared.get().reporters[0]
+                .cf
+                .as_ref()
                 .unwrap()
                 .ext
-                .cf
-                .connection_mode,
-            crate::model::CfConnectionMode::Http
+                .config_version,
+            "v1"
         );
-        assert_eq!(
-            load(&path)
-                .unwrap()
-                .reporter("primary")
-                .unwrap()
-                .ext
-                .cf
-                .connection_mode,
-            crate::model::CfConnectionMode::Http
-        );
+
+        // 非四大线路的 Ping 名:整体拒绝
+        let mut push = remote("v2");
+        push.pings = Some(vec![PingTarget {
+            name: "homepage".into(),
+            kind: PingKind::Tcp,
+            target: "example.com:80".into(),
+            interval: None,
+        }]);
+        assert!(shared.apply_remote_for("primary", push).is_err());
+
+        // cf 固定 GPU:远端关闭被拒绝
+        let mut push = remote("v2");
+        push.report_gpu = Some(false);
+        assert!(shared.apply_remote_for("primary", push).is_err());
+
+        // 非空 disks:整体拒绝
+        let mut push = remote("v2");
+        push.disks = Some(vec!["C:*".into()]);
+        assert!(shared.apply_remote_for("primary", push).is_err());
+    }
+
+    #[test]
+    fn komari_reporter_rejects_remote_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = base_config();
+        cfg.reporters[0] = komari_reporter("primary");
+        persist(&path, &cfg).unwrap();
+        let (shared, _rx, _config_rx) = SharedConfig::new(cfg, path.clone());
+
+        let mut push = remote("v1");
+        push.report_interval = Some(5);
+        assert!(shared.apply_remote_for("primary", push).is_err());
     }
 }

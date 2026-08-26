@@ -92,10 +92,10 @@ install_example_config() {
         return
     fi
 
-    net_static=$(toml_escape "$DATA_DIR/net_static.json")
-    replacement=$(printf '%s' "$net_static" | sed 's/[\\&|]/\\&/g')
+    data_dir_esc=$(toml_escape "$DATA_DIR")
+    replacement=$(printf '%s' "$data_dir_esc" | sed 's/[\\&|]/\\&/g')
     tmp_config=$(mktemp "$CONF_DIR/config.toml.XXXXXX")
-    sed "s|^[[:space:]]*net_static_path[[:space:]]*=.*|net_static_path = \"$replacement\"|" \
+    sed "s|^[[:space:]]*data_dir[[:space:]]*=.*|data_dir = \"$replacement\"|" \
         "$EXAMPLE_CONF" > "$tmp_config"
     install -m 0600 "$tmp_config" "$CONFIG_PATH"
     rm -f "$tmp_config"
@@ -116,6 +116,8 @@ do_uninstall() {
 is_placeholder() {
     # 示例配置未被编辑过的特征（身份/地址仍为占位值；secret 不算，可能是真实值）
     grep -Eq '^[[:space:]]*server_id[[:space:]]*=[[:space:]]*"(srv-01|cf-server-uuid)"' "$1" \
+        || grep -Eq '^[[:space:]]*url[[:space:]]*=[[:space:]]*"https://monitor\.example\.com/update"' "$1" \
+        || grep -Eq '^[[:space:]]*endpoint[[:space:]]*=[[:space:]]*"https://komari\.example\.com"' "$1" \
         || grep -Eq '^[[:space:]]*worker_url[[:space:]]*=[[:space:]]*"https://monitor\.example\.com/(report|update)"' "$1" \
         || grep -Eq '^[[:space:]]*worker_url[[:space:]]*=[[:space:]]*"https://komari\.example\.com"' "$1" \
         || grep -Eq '^[[:space:]]*worker_url[[:space:]]*=[[:space:]]*"http://127\.0\.0\.1:8080/report"' "$1"
@@ -158,16 +160,16 @@ do_install() {
             exit 1
         fi
     else
-        # 含 secret，权限 600；示例文件缺失时写最小合法兜底配置。
-        # 注意:必须使用 [[reporters]] 数组格式——旧版顶层 server_id/secret/
-        # worker_url 根级格式已被 agent 拒绝(rejects_legacy_root_connection_shape)。
+        # 含 secret，权限 600；示例文件缺失时写最小合法兜底配置（schema = 1）。
         if [ -f "$EXAMPLE_CONF" ]; then
             install_example_config
         else
-            net_static=$(toml_escape "$DATA_DIR/net_static.json")
+            data_dir_esc=$(toml_escape "$DATA_DIR")
             cat > "$CONFIG_PATH" <<EOF
 # probe-rs minimal fallback config（首次安装后必须编辑）
-net_static_path = "$net_static"
+schema = 1
+
+data_dir = "$data_dir_esc"
 
 [auto_update]
 enabled = false
@@ -176,11 +178,11 @@ check_interval = 21600
 
 [[reporters]]
 id = "primary"
-protocol = "probe"
+
+[reporters.probe]
 server_id = "srv-01"
 secret = "change-me"
 worker_url = "https://monitor.example.com/report"
-config_version = ""
 report_interval = 60
 reset_day = 1
 interfaces = []
@@ -189,7 +191,7 @@ report_gpu = true
 report_errors = true
 report_self = false
 
-[reporters.intervals]
+[reporters.probe.intervals]
 collect = 10
 ping = 30
 slow = 60

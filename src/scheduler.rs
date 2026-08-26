@@ -16,8 +16,8 @@ use crate::buffer::{BufferBatch, Buffers};
 use crate::collector::{self, net, CpuMonitor};
 use crate::config::{ReporterSpec, SharedConfig};
 use crate::model::{
-    AsyncRecord, CfConnectionMode, DynamicRecord, ErrorRecord, GpuRecord, Intervals,
-    NetInterfaceSample, PingRecord, Report, ReporterProtocol, SelfRecord, SlowBlock, StaticInfo,
+    AsyncRecord, DynamicRecord, ErrorRecord, GpuRecord, Intervals, NetInterfaceSample, PingRecord,
+    Report, ReporterProtocol, SelfRecord, SlowBlock, StaticInfo,
 };
 use crate::netstatic::{period_start_ms, NetStatic};
 use crate::reporter::{AgentClock, Reporter};
@@ -421,11 +421,7 @@ impl ReporterRunner {
 
     fn sync_cf_ws(&self, spec: &ReporterSpec) {
         if let Some(ws) = &self.cf_ws {
-            ws.set_config(
-                spec.protocol == ReporterProtocol::Cf
-                    && spec.ext.cf.connection_mode == CfConnectionMode::Auto,
-                &spec.config_version,
-            );
+            ws.set_config(spec.protocol == ReporterProtocol::Cf, &spec.config_version);
         }
     }
 
@@ -461,9 +457,7 @@ impl ReporterRunner {
             }
         }
         let report = Duration::from_secs(spec.intervals.report.max(1));
-        if spec.protocol != ReporterProtocol::Cf
-            || spec.ext.cf.connection_mode == CfConnectionMode::Http
-        {
+        if spec.protocol != ReporterProtocol::Cf {
             return report;
         }
         if let Some(ws) = self.cf_ws.as_ref().filter(|ws| ws.connected()) {
@@ -491,8 +485,7 @@ impl ReporterRunner {
         let Some(spec) = self.cfg.get().reporter(&self.id) else {
             return;
         };
-        let cf_inflight_through = (spec.protocol == ReporterProtocol::Cf
-            && spec.ext.cf.connection_mode == CfConnectionMode::Auto)
+        let cf_inflight_through = (spec.protocol == ReporterProtocol::Cf)
             .then(|| {
                 self.cf_ws
                     .as_ref()
@@ -807,26 +800,22 @@ impl ReporterRunner {
                 outbound_now_ms,
             )
         };
-        let samples = crate::reporter_cf::build_samples(dynamic, spec.ext.cf.batch);
+        let samples = crate::reporter_cf::build_samples(dynamic);
 
         if let Some((rx_gb, tx_gb)) = self.netstatic.confirm_pending(&self.id) {
-            if spec.ext.cf.correction {
-                let confirm = crate::reporter_cf::CfConfirm {
-                    id: spec.server_id.clone(),
-                    secret: spec.secret.clone(),
-                    rx_correction: rx_gb,
-                    tx_correction: tx_gb,
-                };
-                match self.reporter.send_cf_confirm(&confirm).await {
-                    Ok(()) => self.netstatic.clear_confirm_off_runtime(&self.id).await,
-                    Err(error) => tracing::warn!(
-                        reporter_id = %self.id,
-                        %error,
-                        "CF correction confirmation failed"
-                    ),
-                }
-            } else {
-                self.netstatic.clear_confirm_off_runtime(&self.id).await;
+            let confirm = crate::reporter_cf::CfConfirm {
+                id: spec.server_id.clone(),
+                secret: spec.secret.clone(),
+                rx_correction: rx_gb,
+                tx_correction: tx_gb,
+            };
+            match self.reporter.send_cf_confirm(&confirm).await {
+                Ok(()) => self.netstatic.clear_confirm_off_runtime(&self.id).await,
+                Err(error) => tracing::warn!(
+                    reporter_id = %self.id,
+                    %error,
+                    "CF correction confirmation failed"
+                ),
             }
         }
 
@@ -845,39 +834,37 @@ impl ReporterRunner {
             samples,
         };
 
-        if spec.ext.cf.connection_mode == CfConnectionMode::Auto {
-            if let Some(ws) = self.cf_ws.as_ref().filter(|ws| ws.connected()) {
-                match ws.send(&update, through, include_static) {
-                    Ok(()) => {
-                        // The socket actor reports the sequence actually
-                        // written. Subsequent ticks skip those in-flight
-                        // samples while ACK handling independently advances
-                        // the durable journal cursor.
-                        return false;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            reporter_id = %self.id,
-                            %error,
-                            "CF WSS report failed; POST fallback will follow report_interval"
-                        );
-                    }
+        if let Some(ws) = self.cf_ws.as_ref().filter(|ws| ws.connected()) {
+            match ws.send(&update, through, include_static) {
+                Ok(()) => {
+                    // The socket actor reports the sequence actually
+                    // written. Subsequent ticks skip those in-flight
+                    // samples while ACK handling independently advances
+                    // the durable journal cursor.
+                    return false;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        reporter_id = %self.id,
+                        %error,
+                        "CF WSS report failed; POST fallback will follow report_interval"
+                    );
                 }
             }
-            // The batch was built without older records already in flight on
-            // WSS. If that socket disappeared meanwhile, do not let a POST of
-            // this partial batch acknowledge across the gap. The immediate
-            // fallback tick will reread from the durable ACK cursor.
-            if batch_starts_after_inflight {
-                return false;
-            }
-            let post_interval = Duration::from_secs(spec.intervals.report.max(1));
-            if self
-                .last_cf_post_attempt
-                .is_some_and(|last| last.elapsed() < post_interval)
-            {
-                return false;
-            }
+        }
+        // The batch was built without older records already in flight on
+        // WSS. If that socket disappeared meanwhile, do not let a POST of
+        // this partial batch acknowledge across the gap. The immediate
+        // fallback tick will reread from the durable ACK cursor.
+        if batch_starts_after_inflight {
+            return false;
+        }
+        let post_interval = Duration::from_secs(spec.intervals.report.max(1));
+        if self
+            .last_cf_post_attempt
+            .is_some_and(|last| last.elapsed() < post_interval)
+        {
+            return false;
         }
 
         self.last_cf_post_attempt = Some(Instant::now());
@@ -928,7 +915,7 @@ impl ReporterRunner {
             .reporter(&self.id)
             .unwrap_or_else(|| spec.clone());
         match response.correction {
-            Some((rx_gb, tx_gb)) if current.ext.cf.correction => {
+            Some((rx_gb, tx_gb)) => {
                 let filter = net::IfaceFilter::new(&current.interfaces);
                 let report_time = self.reporter.report_time();
                 let now_ms = report_time.accurate_ts.unwrap_or(report_time.local_ts);
@@ -1123,10 +1110,7 @@ impl ReporterRunner {
 }
 
 fn report_schedule_changed(previous: &ReporterSpec, current: &ReporterSpec) -> bool {
-    previous.protocol != current.protocol
-        || previous.intervals.report != current.intervals.report
-        || (current.protocol == ReporterProtocol::Cf
-            && previous.ext.cf.connection_mode != current.ext.cf.connection_mode)
+    previous.protocol != current.protocol || previous.intervals.report != current.intervals.report
 }
 
 fn dynamic_traffic_window(record: &DynamicRecord, reset_day: u8) -> (i64, i64) {
@@ -1351,7 +1335,6 @@ mod tests {
             report_errors: true,
             report_self: false,
             pings: vec![ping("first"), ping("second")],
-            ext: Default::default(),
         }
     }
 
@@ -1390,19 +1373,13 @@ mod tests {
         unrelated.interfaces.push("eth0".into());
         assert!(!report_schedule_changed(&original, &unrelated));
 
-        let mut inactive_cf_extension = original.clone();
-        inactive_cf_extension.ext.cf.connection_mode = CfConnectionMode::Http;
-        assert!(!report_schedule_changed(&original, &inactive_cf_extension));
-
         let mut cadence = original.clone();
         cadence.intervals.report += 1;
         assert!(report_schedule_changed(&original, &cadence));
 
         let mut cf = original.clone();
         cf.protocol = ReporterProtocol::Cf;
-        let mut cf_http = cf.clone();
-        cf_http.ext.cf.connection_mode = CfConnectionMode::Http;
-        assert!(report_schedule_changed(&cf, &cf_http));
+        assert!(report_schedule_changed(&original, &cf));
     }
 
     #[test]

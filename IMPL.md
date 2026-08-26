@@ -199,11 +199,11 @@ cargo build --release
 - 卸载：`.\deploy\install.ps1 uninstall`（保留配置与数据，加 `-Purge` 全清）
 - Release 资产名为 `probe-rs-windows-x86_64.exe`，可用 `-BinaryPath` 指向下载后的文件
 
-## CF 协议模式（protocol = "cf"）
+## CF 协议模式（`[reporters.cf]` 段）
 
 agent 可切换为 CF-Server-Monitor 的 `/update` 协议（HTTP POST 或 WSS，适配官方服务端，零改动对接）。
 
-**配置**：`protocol = "cf"`（🔒 本地，重启生效）；`server_id` 填 CF 后台分配的 UUID，`secret` 填 `API_SECRET`，`worker_url` 填 `https://<worker>/update`。`[reporters.ext.cf] connection_mode = "auto"`（默认）启用 WSS 并在不可用时按原上报周期 POST 兜底；设为 `"http"` 时只使用 POST。`correction` 与 `batch` 开关保持原语义。
+**配置**：`[reporters.cf]` 段（连接身份 🔒 本地，重启生效），命名对齐 cfsm-agent：`server_id` 填 CF 后台分配的 UUID，`secret` 填 `API_SECRET`，`url` 填 `https://<worker>/update`；`interval`（上报周期）、`collect_interval`、`reset_day`、`interface`、`ct/cu/cm/bd` 同原版语义。连接固定 auto（WSS 不可用时按原上报周期 POST 兜底），校正回路固定启用，上报固定 samples[] 批量——旧 `ext.cf.correction/batch/connection_mode` 开关已删除，安装脚本传入 `--connection-mode` 仅兼容解析、不再生效。
 
 Windows 使用同一套 CF 协议逻辑；CF 一键安装默认启用 GPU 采集（无 `nvidia-smi` 时记录诊断但不影响其他指标）。可在管理员 PowerShell 中直接一键安装（`CollectInterval=0` 同样映射为内部 1 秒）：
 
@@ -214,21 +214,21 @@ Windows 使用同一套 CF 协议逻辑；CF 一键安装默认启用 GPU 采集
 
 脚本默认下载 `probe-rs-windows-x86_64.exe`，也可用 `-BinarySource`/`-Bin` 指定本地文件或 URL；卸载使用 `.\deploy\cf-install.ps1 uninstall`，加 `-Purge` 可清除配置与流量数据。也可以通过通用 `deploy/install.ps1` 安装后，手动将 `%ProgramData%\probe-rs\config.toml` 的 `protocol` 改为 `"cf"`。
 
-**上报映射**（reporter_cf.rs）：顶层 `{id, secret, config_schema, config_md5, collect_interval, report_interval, metrics, samples[]}`；ram/swap/disk 字节→MB；load 转空格字符串；GPU → `gpu_info:[{id,name,info}]`（`id` 来自采集端稳定设备标识，显存/温度丢弃，利用率未知的设备不输出）；ping 按组名落 `ping_ct/cu/cm/bd` + `loss_*`（bgp 是 bd 别名，未配置为 `false`，已配置但失败或缓存过期为 `null`）；`ip_v4/v6` 不可达报数值 `0`；`dynamic[]` → `samples[]`（`ext.cf.batch=false` 时只发单条 metrics）。顶层 dynamic/slow/GPU/Ping/disk I/O 快照按各自采集周期与上报周期校验新鲜度，过期字段不再输出；带 `ts` 的 `samples[]` 仍保留历史批量语义，report 不会触发采集。errors/self/virtualization 无落点，CF 模式下不产生。
+**上报映射**（reporter_cf.rs）：顶层 `{id, secret, config_schema, config_md5, collect_interval, report_interval, metrics, samples[]}`；ram/swap/disk 字节→MB；load 转空格字符串；GPU → `gpu_info:[{id,name,info}]`（`id` 来自采集端稳定设备标识，显存/温度丢弃，利用率未知的设备不输出）；ping 按组名落 `ping_ct/cu/cm/bd` + `loss_*`（bgp 是 bd 别名，未配置为 `false`，已配置但失败或缓存过期为 `null`）；`ip_v4/v6` 不可达报数值 `0`；`dynamic[]` → `samples[]`。顶层 dynamic/slow/GPU/Ping/disk I/O 快照按各自采集周期与上报周期校验新鲜度，过期字段不再输出；带 `ts` 的 `samples[]` 仍保留历史批量语义，report 不会触发采集。errors/self/virtualization 无落点，CF 模式下不产生。
 
-**WSS 上报**：`auto` 模式把 `https/http` 的 `worker_url` 映射为 `wss/ws`，保留路径和业务查询参数，并用 query + Header 携带 Schema 5 和配置 MD5。握手必须收到 `type=hello, protocol=update`；连接建立或重连后先用 2 秒默认节奏发布与 POST 相同的最新 JSON 文本，随后接受 ACK 或 `realtimeHint` 的 `nextWssReportAfterMs` 动态调整到 1 秒至 5 分钟。无人查看面板时可按服务端提示降频，前端恢复实时订阅时由 hint 立即缩短间隔；hint 只改节奏，不推进 journal 游标。发送槽使用 `watch` 单值覆盖：socket 暂时变慢时只保留最新帧，不会堆积；被覆盖帧的 journal 游标不会提前推进，其记录会合并进替代帧。写出的帧只保留紧凑的游标元数据，后台收到对应 ACK 后才推进 journal；因此 ACK 决定数据确认，但不阻塞下一次发送。从最老未确认报告起连续 15 秒没有 ACK，或单次 socket 写入超过 5 秒，会主动关闭半开连接，随后停止 WSS 发布、按 `report_interval` POST 兜底并重连。`config` 和 `remote_config` 帧也由后台读循环独立处理，其中配置仍按 MD5 幂等校验和原子落盘。普通网络错误按 60 秒到 5 分钟指数退避；认证或配置类 `type=error` 策略帧会同时暂停 WSS 重连和 POST 至少 120 秒。CF 2.8.4 Beta7+ 的 WSS 时段关闭信号是例外：握手 HTTP `409`、`error code=409` 或 close code `1013` 仅在 reason 为 `wss_schedule_inactive` / `wss_schedule_empty` 时临时关闭运行时 WSS，保持本地 `connection_mode=auto` 并按 `report_interval` POST；后续 POST 响应头 `X-Agent-Wss-Mode: active` 会立即解除临时开关并唤醒 WSS actor。永久 `disabled` 仍由配置 body 的 `connection_mode=http` 正常落盘。
+**WSS 上报**：`auto` 模式把 `https/http` 的 `worker_url` 映射为 `wss/ws`，保留路径和业务查询参数，并用 query + Header 携带 Schema 5 和配置 MD5。握手必须收到 `type=hello, protocol=update`；连接建立或重连后先用 2 秒默认节奏发布与 POST 相同的最新 JSON 文本，随后接受 ACK 或 `realtimeHint` 的 `nextWssReportAfterMs` 动态调整到 1 秒至 5 分钟。无人查看面板时可按服务端提示降频，前端恢复实时订阅时由 hint 立即缩短间隔；hint 只改节奏，不推进 journal 游标。发送槽使用 `watch` 单值覆盖：socket 暂时变慢时只保留最新帧，不会堆积；被覆盖帧的 journal 游标不会提前推进，其记录会合并进替代帧。写出的帧只保留紧凑的游标元数据，后台收到对应 ACK 后才推进 journal；因此 ACK 决定数据确认，但不阻塞下一次发送。从最老未确认报告起连续 15 秒没有 ACK，或单次 socket 写入超过 5 秒，会主动关闭半开连接，随后停止 WSS 发布、按 `report_interval` POST 兜底并重连。`config` 和 `remote_config` 帧也由后台读循环独立处理，其中配置仍按 MD5 幂等校验和原子落盘。普通网络错误按 60 秒到 5 分钟指数退避；认证或配置类 `type=error` 策略帧会同时暂停 WSS 重连和 POST 至少 120 秒。CF 2.8.4 Beta7+ 的 WSS 时段关闭信号是例外：握手 HTTP `409`、`error code=409` 或 close code `1013` 仅在 reason 为 `wss_schedule_inactive` / `wss_schedule_empty` 时临时关闭运行时 WSS，保持本地 `connection_mode=auto` 并按 `report_interval` POST；后续 POST 响应头 `X-Agent-Wss-Mode: active` 会立即解除临时开关并唤醒 WSS actor。配置 body 的 `connection_mode` 字段不再应用（连接固定 auto），仅用于识别配置版本差异。
 
-**配置下发**：请求头升级为 `X-Agent-Config-Schema: 5` + `X-Agent-Config-Md5`（复用 `config_version` 字段存 MD5，空 = `none`）。POST 响应或 WSS ack/config 帧中的 URL-encoded body 会解析 collect_interval/report_interval/wss_report_interval/reset_day/custom_ct/cu/cm/bd/interface/connection_mode，合成 `RemoteConfig`（config_version 取响应/帧 MD5）走 `apply_remote_for`；`wss_report_interval` 参与 Schema 5 配置识别和无 MD5 版本指纹，实际每帧节奏以 `nextWssReportAfterMs` 为准。`collect=0` 兼容映射为当前 CF Reporter 的 1 秒采集需求，随后参与机器级最小值聚合；逗号分隔的 interface 拆成多个过滤项。`custom_*` 字段缺席时保留对应 Ping，出现空值时清除；非空值只替换对应线路并保留原 interval，`bd` 兼容旧名 `bgp`，HTTP(S) URL 推断为 HTTP 探测，其余按 TCP 探测。`connection_mode` 支持 `auto/http`（兼容 `wss/websocket` 为 auto），应用并原子落盘后立即启停长连接。CF 未覆盖的 ping/slow/gpu/ip 子间隔与输出开关保持该 Reporter 现值。
+**配置下发**：请求头升级为 `X-Agent-Config-Schema: 5` + `X-Agent-Config-Md5`（复用 `config_version` 字段存 MD5，空 = `none`）。POST 响应或 WSS ack/config 帧中的 URL-encoded body 会解析 collect_interval/report_interval/wss_report_interval/reset_day/custom_ct/cu/cm/bd/interface/connection_mode，合成 `RemoteConfig`（config_version 取响应/帧 MD5）走 `apply_remote_for`；`wss_report_interval` 参与 Schema 5 配置识别和无 MD5 版本指纹，实际每帧节奏以 `nextWssReportAfterMs` 为准。`collect=0` 兼容映射为当前 CF Reporter 的 1 秒采集需求，随后参与机器级最小值聚合；逗号分隔的 interface 拆成多个过滤项。`custom_*` 字段缺席时保留对应 Ping，出现空值时清除；非空值只替换对应线路并保留原 interval，`bd` 兼容旧名 `bgp`，HTTP(S) URL 推断为 HTTP 探测，其余按 TCP 探测。落点限制：cf 段只能落 `collect_interval`/`interface`/`ct/cu/cm/bd`/`interval`（上报周期）/`reset_day`，远端推送其他可下发项（非 collect 子间隔、非空 disks、`report_gpu=false`、非四大线路 Ping 名）时整体拒绝。
 
-**流量校正**：响应尾部 `rx_correction/tx_correction`（GB，覆盖当月累计）。netstatic 记账期偏移（offset = 校正字节 − 原始月累计，period_start 匹配才生效，翻页自动失效），立即落盘；校正确认用**独立请求**回传（CF 服务端见到 correction 字段会把整个请求当确认、丢弃 metrics），服务端清空后停止。`ext.cf.correction = false` 时整个回路忽略。`update=1`（自升级）永远忽略。
+**流量校正**：响应尾部 `rx_correction/tx_correction`（GB，覆盖当月累计）。netstatic 记账期偏移（offset = 校正字节 − 原始月累计，period_start 匹配才生效，翻页自动失效），立即落盘；校正确认用**独立请求**回传（CF 服务端见到 correction 字段会把整个请求当确认、丢弃 metrics），服务端清空后停止。`update=1`（自升级）永远忽略。
 
-## komari 协议模式（protocol = "komari"）
+## komari 协议模式（`[reporters.komari]` 段）
 
-对接 komari 面板的 WS v2 JSON-RPC（`/api/clients/v2/rpc?token=<secret>`，worker_url 填面板地址）。
+对接 komari 面板的 WS v2 JSON-RPC（`/api/clients/v2/rpc?token=<token>`，`endpoint` 填面板地址）；段内命名对齐 komari-agent：`token`/`interval`（采集周期，komari 按采集周期上报）/`month_rotate`/`enable_gpu`/`include_nics`/`include_mountpoints`。
 
 - **上行**：`agent.report`（最新值快照，字节单位；无 ts/批量语义，断线期间数据不保留）+ `agent.basicInfo`（持久保留最新一份，连接建立及静态信息变化时发送）；errors 事件拼进 report 的 `message` 字段。GPU 未采到的字段不输出，平均利用率只统计有效 usage
 - **下行**：不执行远程控制调用，但**友好回绝**（不干等）：exec → POST task/result "Remote control is disabled."(exit -1)；terminal → 拨终端 WS 发说明即关闭（否则面板空转 30s）。我们从不调 agent.pull 声明远控能力
-- **Ping**：收到 `agent.ping` 后按 `type + target` 写入该 Komari Reporter 的 `ext.komari.learned_pings`；最多 5 个，按 `last_seen_at` LRU 淘汰。下发请求本身不探测，只读取全局 Ping worker 快照；首轮无缓存回 `-1`，配置热重建后后续任务返回新鲜缓存（最大年龄为本地 ping 周期的 2 倍，且至少 10s）。HTTP 裸 host 自动补 `http://`，path/query/fragment 仍拒绝
-- komari 的月流量由面板自算；自动学习目标跟随该 Reporter 的 `intervals.ping`，与其他 Reporter 目标统一去重聚合；无面板配置下发通道（仅 Ping 目标发现会写本地 TOML）
+- **Ping**：收到 `agent.ping` 后按 `type + target` 写入该 Komari Reporter 的 `[reporters.komari.ext]` 下的 `learned_pings`；最多 5 个，按 `last_seen_at` LRU 淘汰。下发请求本身不探测，只读取全局 Ping worker 快照；首轮无缓存回 `-1`，配置热重建后后续任务返回新鲜缓存（最大年龄为本地 ping 周期的 2 倍，且至少 10s）。HTTP 裸 host 自动补 `http://`，path/query/fragment 仍拒绝
+- komari 的月流量由面板自算；自动学习目标跟随全局 ping 周期，与其他 Reporter 目标统一去重聚合；无面板配置下发通道（仅 Ping 目标发现会写本地 TOML）
 - **保活**：komari 服务端读超时 11s 且只有数据帧续期（WebSocket ping 无效）→ 每 5s 发送无参数、无 `id` 的 `agent.heartbeat` notification；不重发旧 report，也不调用 `agent.pull`
 - 映射见 reporter_komari.rs（纯函数）；WS 机械（重连/心跳/下行忽略）在 worker/komari.rs

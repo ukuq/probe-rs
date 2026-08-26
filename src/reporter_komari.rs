@@ -204,7 +204,6 @@ mod tests {
                 report_errors: true,
                 report_self: true,
                 pings: vec![],
-                ext: None,
             },
         }
     }

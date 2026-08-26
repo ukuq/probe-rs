@@ -450,24 +450,17 @@ mod tests {
         let path = dir.join("config.toml");
         let cfg: LocalConfig = toml::from_str(
             r#"
-net_static_path = "C:/tmp/net.json"
+schema = 1
+data_dir = "C:/tmp"
 
 [[reporters]]
 id = "komari"
-protocol = "komari"
-server_id = "node"
-secret = "token"
-worker_url = "https://komari.example.com"
-report_interval = 1
-report_gpu = true
 
-[reporters.intervals]
-collect = 1
-ping = 30
-slow = 60
-gpu = 60
-ip = 600
-diskio = 10
+[reporters.komari]
+endpoint = "https://komari.example.com"
+token = "token"
+interval = 1
+enable_gpu = true
 "#,
         )
         .unwrap();
@@ -500,7 +493,16 @@ diskio = 10
         let first: Value = serde_json::from_str(&first).unwrap();
         assert_eq!(first["method"], "agent.pingResult");
         assert_eq!(first["params"]["value"], -1);
-        assert_eq!(shared.get().reporters[0].ext.komari.learned_pings.len(), 1);
+        assert_eq!(
+            shared.get().reporters[0]
+                .komari
+                .as_ref()
+                .unwrap()
+                .ext
+                .learned_pings
+                .len(),
+            1
+        );
 
         let ts = crate::model::now_millis();
         ping_tx.send_modify(|snapshot| {

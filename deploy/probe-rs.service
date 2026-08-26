@@ -14,7 +14,7 @@ RestartSec=5
 #   /var/lib/probe-rs  netstatic 流量时序落盘
 #   /etc/probe-rs      远端下发配置时回写 config.toml（设计如此）
 # 「-」前缀 = 目录缺失时不影响启动（agent 会自建，install.sh 也会建）
-# 注意：net_static_path 若改到这两个目录之外，需自行加 ReadWritePaths，
+# 注意：data_dir 若改到这两个目录之外，需自行加 ReadWritePaths，
 #       否则 ProtectSystem=strict 下 flush 会一直 EROFS
 NoNewPrivileges=true
 ProtectSystem=strict

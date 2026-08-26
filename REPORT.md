@@ -167,7 +167,6 @@ Agent 不修改系统时间。Agent 启动后会立即运行一次独立的 NTP 
 | `report_errors` | boolean | 是否上报 errors 错误事件 |
 | `report_self` | boolean | 是否上报探针自身占用 kind:"self" |
 | `pings` | array | 当前 Reporter 的探测需求：`[{name, type: http|tcp|icmp, target, interval?}]`；HTTP target 仅允许 `http(s)://host[:port]`，所有类型均不允许 path/query/fragment |
-| `ext` | object | 协议扩展；仅对应协议存在扩展时携带。当前 `{cf: {correction, batch}}` 只出现在 cf Reporter 的回执中，probe 不携带 |
 
 `reporters[]` 每项包含：`id`、`protocol`、`intervals`、`report_interval`、`reset_day`、`interfaces`、`disks`、`report_gpu`、`report_errors`、`report_self`、`pings`。`pings` 保留该 Reporter 自己的原始 `name`、`type`、`target` 和可选 `interval`。
 
@@ -264,17 +263,18 @@ Ping 聚合规则：机器内部按“类型 + 规范化目标”去重，TCP �
 | `disks` | 可选；卷/物理盘白名单（glob 数组，最多 32 项，超限整体拒绝） |
 | `pings` | 可选；整组替换当前 Reporter 的 Ping 需求（最多 64 项，超限整体拒绝）；`type` 必须为 http/tcp/icmp，target 不允许 path/query/fragment |
 | `report_gpu` | 可选；当前 Reporter 是否输出 GPU（布尔），同时参与机器级 GPU worker 的 OR 聚合 |
-| `report_errors` | 可选；是否上报 errors 错误事件（布尔，缺省 true） |
-| `report_self` | 可选；是否上报探针自身资源占用 kind:"self"（布尔，缺省 false） |
-| `ext` | 可选；协议扩展 `{cf: {correction?, batch?, connection_mode?}}`，仅对应协议启用时生效；CF 的 `connection_mode` 为 `auto/http` |
+| `report_errors` | 可选；是否上报 errors 错误事件（布尔，缺省 true；仅 probe 线可配，cf/komari 固定上报） |
+| `report_self` | 可选；是否上报探针自身资源占用 kind:"self"（布尔，缺省 false；仅 probe 线可配，cf/komari 固定不上报） |
 
 `config` 内除 `config_version` 外的字段均可选：出现的才应用，缺席的保持现值。响应只修改产生该响应的 Reporter，不会影响其他上报线路。
+
+落点随本地协议段不同：probe 段全量落地；cf 段只落 `intervals.collect`、`report_interval`、`reset_day`、`interfaces`、`pings`（仅 ct/cu/cm/bd），出现其他项整体拒绝；komari 协议没有下发通道。
 
 `server_time`、`config`、`next` 都位于响应信封一级；`config` 缺席表示无配置变更。
 
 agent 行为：校验 `config_version`、所有周期、glob 与 Ping 目标，全部通过才应用并落盘；任何一项非法则整体拒绝并记录日志。应用后重新聚合全局 worker 配置并立即生效，无需重启。
 
-**🔒 不允许远端修改**：连接身份 `id` / `protocol` / `server_id` / `secret` / `worker_url`，以及机器级 `net_static_path`。远端的 `intervals` / `pings` 等只修改响应所属 Reporter，不能直接写全局实际值，也不能修改其他线路。允许远端下发 Ping 的服务端应限制目标范围，避免 SSRF/内网探测。
+**🔒 不允许远端修改**：连接身份（`id`、各协议段的连接凭据与地址），以及机器级 `data_dir`。远端的 `intervals` / `pings` 等只修改响应所属 Reporter，不能直接写全局实际值，也不能修改其他线路。允许远端下发 Ping 的服务端应限制目标范围，避免 SSRF/内网探测。
 
 ## 服务端判定规则（约定）
 

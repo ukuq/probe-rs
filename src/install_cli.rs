@@ -10,10 +10,8 @@ use anyhow::{bail, Context, Result};
 use chrono::{Local, TimeZone};
 
 use crate::collector::net::IfaceFilter;
-use crate::config::{self, AutoUpdateConfig, LocalConfig, UpdateChannel};
-use crate::model::{
-    CfConnectionMode, CollectionIntervals, PingKind, PingTarget, ReporterConfig, ReporterProtocol,
-};
+use crate::config::{self, AutoUpdateConfig, LocalConfig, UpdateChannel, CONFIG_SCHEMA};
+use crate::model::{CfSection, ReporterConfig, ReporterProtocol};
 use crate::netstatic::{self, NetStatic};
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -52,7 +50,8 @@ struct ConfigureCfOptions {
     reporter_id: Option<String>,
     collect: Option<u64>,
     report_interval: Option<u64>,
-    connection_mode: Option<CfConnectionMode>,
+    /// 已废弃:连接固定为 auto。仅为兼容旧安装脚本保留解析。
+    connection_mode: Option<String>,
     reset_day: Option<u8>,
     interfaces: Option<Vec<String>>,
     pings: Vec<(String, String)>,
@@ -95,11 +94,7 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
                 report_interval = Some(parse_positive_u64(&arg, &value(&mut args)?)?)
             }
             "--connection-mode" => {
-                connection_mode = Some(match value(&mut args)?.to_ascii_lowercase().as_str() {
-                    "auto" => CfConnectionMode::Auto,
-                    "http" => CfConnectionMode::Http,
-                    _ => bail!("--connection-mode must be auto or http"),
-                });
+                connection_mode = Some(value(&mut args)?.to_ascii_lowercase());
             }
             "--reset-day" => {
                 let parsed = value(&mut args)?
@@ -160,6 +155,14 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
 }
 
 fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
+    if let Some(mode) = &options.connection_mode {
+        if mode != "auto" {
+            tracing::warn!(
+                mode,
+                "--connection-mode 已废弃,连接固定为 auto(WSS+POST 回退)"
+            );
+        }
+    }
     let mut config = load_install_config(
         &options.config_path,
         options.default_net_static_path.clone(),
@@ -171,7 +174,7 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
     let cf_ids: Vec<_> = config
         .reporters
         .iter()
-        .filter(|reporter| reporter.protocol == ReporterProtocol::Cf)
+        .filter(|reporter| reporter.cf.is_some())
         .map(|reporter| reporter.id.clone())
         .collect();
     let selected_id = match options.reporter_id {
@@ -187,14 +190,14 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
     if config
         .reporters
         .iter()
-        .any(|reporter| reporter.id == selected_id && reporter.protocol != ReporterProtocol::Cf)
+        .any(|reporter| reporter.id == selected_id && reporter.cf.is_none())
     {
         bail!("Reporter id '{selected_id}' already belongs to a non-CF Reporter");
     }
     if options.replace_cf {
-        config.reporters.retain(|reporter| {
-            reporter.protocol != ReporterProtocol::Cf || reporter.id == selected_id
-        });
+        config
+            .reporters
+            .retain(|reporter| reporter.cf.is_none() || reporter.id == selected_id);
     }
 
     let index = config
@@ -209,36 +212,32 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
         .iter_mut()
         .find(|reporter| reporter.id == selected_id)
         .expect("CF Reporter was inserted");
-    reporter.protocol = ReporterProtocol::Cf;
-    reporter.server_id = options.server_id;
-    reporter.secret = options.secret;
-    reporter.worker_url = options.worker_url;
-    reporter.config_version.clear();
+    let cf = reporter.cf.as_mut().expect("CF section was inserted");
+    cf.server_id = options.server_id;
+    cf.secret = options.secret;
+    cf.url = options.worker_url;
+    cf.ext.config_version.clear();
     if let Some(value) = options.collect {
-        reporter.intervals.collect = value;
+        cf.collect_interval = value;
     }
     if let Some(value) = options.report_interval {
-        reporter.report_interval = value;
-    }
-    if let Some(value) = options.connection_mode {
-        reporter.ext.cf.connection_mode = value;
+        cf.interval = value;
     }
     if let Some(value) = options.reset_day {
-        reporter.reset_day = value;
+        cf.reset_day = value;
     }
     if let Some(value) = options.interfaces {
-        reporter.interfaces = value;
+        cf.interface = value.join(",");
     }
     for (name, target) in options.pings {
-        reporter.pings.retain(|ping| ping.name != name);
-        if !target.trim().is_empty() {
-            reporter.pings.push(PingTarget {
-                name,
-                kind: PingKind::Tcp,
-                target,
-                interval: Some(30),
-            });
-        }
+        let slot = match name.as_str() {
+            "ct" => &mut cf.ct,
+            "cu" => &mut cf.cu,
+            "cm" => &mut cf.cm,
+            "bd" => &mut cf.bd,
+            _ => bail!("unknown CF ping slot: {name}"),
+        };
+        *slot = (!target.trim().is_empty()).then_some(target);
     }
     if let Some(value) = options.auto_update {
         config.auto_update.enabled = value;
@@ -257,31 +256,37 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
 fn new_cf_reporter(id: String) -> ReporterConfig {
     ReporterConfig {
         id,
-        protocol: ReporterProtocol::Cf,
-        server_id: String::new(),
-        secret: String::new(),
-        worker_url: String::new(),
-        config_version: String::new(),
-        intervals: CollectionIntervals {
-            collect: 1,
-            ..Default::default()
-        },
-        report_interval: 60,
-        reset_day: 1,
-        interfaces: Vec::new(),
-        disks: Vec::new(),
-        report_gpu: Some(true),
-        report_errors: true,
-        report_self: false,
-        pings: Vec::new(),
-        ext: Default::default(),
+        cf: Some(CfSection {
+            server_id: String::new(),
+            secret: String::new(),
+            url: String::new(),
+            interval: 60,
+            collect_interval: 1,
+            reset_day: 1,
+            interface: String::new(),
+            ct: None,
+            cu: None,
+            cm: None,
+            bd: None,
+            ext: Default::default(),
+        }),
+        komari: None,
+        probe: None,
     }
 }
 
 fn load_install_config(path: &Path, net_static_path: String) -> Result<LocalConfig> {
+    let default_data_dir = || {
+        Path::new(&net_static_path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.to_string_lossy().into_owned())
+            .unwrap_or_else(config::default_data_dir)
+    };
     if !path.is_file() {
         return Ok(LocalConfig {
-            net_static_path,
+            schema: CONFIG_SCHEMA,
+            data_dir: default_data_dir(),
             auto_update: AutoUpdateConfig::default(),
             reporters: Vec::new(),
         });
@@ -290,14 +295,25 @@ fn load_install_config(path: &Path, net_static_path: String) -> Result<LocalConf
         .with_context(|| format!("failed to read existing config: {}", path.display()))?;
     let document: toml::Value = toml::from_str(&raw).context("existing config is invalid TOML")?;
     if document.get("reporters").is_none() {
-        // 只补空 reporters,保留文件里可保留的字段(net_static_path/auto_update),
-        // 不能整体丢弃用户已有配置。
+        // 只补空 reporters,保留文件里可保留的字段(data_dir/auto_update;
+        // 兼容旧版 net_static_path),不能整体丢弃用户已有配置。
+        let legacy_data_dir = document
+            .get("net_static_path")
+            .and_then(|value| value.as_str())
+            .and_then(|value| {
+                Path::new(value)
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map(|parent| parent.to_string_lossy().into_owned())
+            });
         let preserved = LocalConfig {
-            net_static_path: document
-                .get("net_static_path")
+            schema: CONFIG_SCHEMA,
+            data_dir: document
+                .get("data_dir")
                 .and_then(|value| value.as_str())
                 .map(str::to_string)
-                .unwrap_or(net_static_path),
+                .or(legacy_data_dir)
+                .unwrap_or_else(default_data_dir),
             auto_update: document
                 .get("auto_update")
                 .cloned()
@@ -311,19 +327,30 @@ fn load_install_config(path: &Path, net_static_path: String) -> Result<LocalConf
         );
         return Ok(preserved);
     }
-    toml::from_str(&raw).context("existing canonical config is invalid")
+    // 旧版配置走 schema 迁移(同时回写),新版直接解析。
+    config::load(path).context("existing canonical config is invalid")
 }
 
-/// 只删除"完整示例指纹"的 Reporter:示例 server_id 与示例 worker_url 的
-/// 精确配对命中才算,避免用户真实使用某示例 URL(如本地 demo)时被误删。
+/// 只删除"完整示例指纹"的 Reporter:示例连接参数的精确配对命中才算,
+/// 避免用户真实使用某示例 URL(如本地 demo)时被误删。
 fn is_seeded_sample(reporter: &ReporterConfig) -> bool {
-    matches!(
-        (reporter.server_id.as_str(), reporter.worker_url.as_str()),
-        ("cf-server-uuid", "https://monitor.example.com/update")
-            | ("my-host", "https://komari.example.com")
-            | ("my-host", "http://127.0.0.1:8080/report")
-            | ("srv-01", "https://monitor.example.com/report")
-    )
+    if let Some(cf) = &reporter.cf {
+        return matches!(
+            (cf.server_id.as_str(), cf.url.as_str()),
+            ("cf-server-uuid", "https://monitor.example.com/update")
+                | ("srv-01", "https://monitor.example.com/report")
+        );
+    }
+    if let Some(komari) = &reporter.komari {
+        return komari.endpoint == "https://komari.example.com";
+    }
+    if let Some(probe) = &reporter.probe {
+        return matches!(
+            (probe.server_id.as_str(), probe.worker_url.as_str()),
+            ("my-host", "http://127.0.0.1:8080/report")
+        );
+    }
+    false
 }
 
 #[derive(Debug)]
@@ -382,7 +409,7 @@ fn set_traffic_correction_with_clock(
     if reporter.protocol != ReporterProtocol::Cf {
         bail!("Reporter '{}' is not a CF Reporter", options.reporter_id);
     }
-    let ledger_path = PathBuf::from(&config.net_static_path);
+    let ledger_path = config.net_static_path();
     let ledger = NetStatic::load_with_legacy_reporter(&ledger_path, Some(&options.reporter_id));
     let filter = IfaceFilter::new(&reporter.interfaces);
     let now = calibrated_now.or_else(|| ledger.calibrated_time()).with_context(|| {
@@ -465,10 +492,10 @@ mod tests {
             reporter_id: None,
             collect: Some(2),
             report_interval: Some(60),
-            connection_mode: Some(CfConnectionMode::Auto),
+            connection_mode: Some("auto".into()),
             reset_day: Some(20),
             interfaces: None,
-            pings: vec![("ct".into(), "ct.example.com".into())],
+            pings: vec![("ct".into(), "ct.example.com:80".into())],
             auto_update: Some(true),
             update_channel: Some(UpdateChannel::Prerelease),
             replace_cf: false,
@@ -484,8 +511,10 @@ mod tests {
         let reporter = config.reporter("cf").unwrap();
         assert_eq!(reporter.intervals.collect, 2);
         assert_eq!(reporter.reset_day, 20);
-        assert_eq!(reporter.pings[0].target.target, "ct.example.com");
-        assert_eq!(reporter.ext.cf.connection_mode, CfConnectionMode::Auto);
+        assert_eq!(reporter.pings[0].target.target, "ct.example.com:80");
+        let cf = config.reporters[0].cf.as_ref().unwrap();
+        assert_eq!(cf.interval, 60);
+        assert_eq!(cf.ct.as_deref(), Some("ct.example.com:80"));
         assert!(config.auto_update.enabled);
         assert_eq!(config.auto_update.channel, UpdateChannel::Prerelease);
     }
@@ -568,7 +597,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut config = LocalConfig {
-            net_static_path: path.with_extension("json").display().to_string(),
+            schema: CONFIG_SCHEMA,
+            data_dir: dir.path().display().to_string(),
             auto_update: AutoUpdateConfig::default(),
             reporters: vec![
                 new_cf_reporter("old-a".into()),
@@ -576,16 +606,31 @@ mod tests {
             ],
         };
         for reporter in &mut config.reporters {
-            reporter.server_id = "server".into();
-            reporter.secret = "secret".into();
-            reporter.worker_url = "https://example.com/update".into();
+            let cf = reporter.cf.as_mut().unwrap();
+            cf.server_id = "server".into();
+            cf.secret = "secret".into();
+            cf.url = "https://example.com/update".into();
         }
-        let mut probe = new_cf_reporter("probe".into());
-        probe.protocol = ReporterProtocol::Probe;
-        probe.server_id = "probe-server".into();
-        probe.secret = "probe-secret".into();
-        probe.worker_url = "https://example.com/report".into();
-        config.reporters.push(probe);
+        config.reporters.push(ReporterConfig {
+            id: "probe".into(),
+            cf: None,
+            komari: None,
+            probe: Some(crate::model::ProbeSection {
+                server_id: "probe-server".into(),
+                secret: "probe-secret".into(),
+                worker_url: "https://example.com/report".into(),
+                report_interval: 60,
+                reset_day: 1,
+                report_errors: true,
+                report_self: false,
+                interfaces: Vec::new(),
+                disks: Vec::new(),
+                report_gpu: false,
+                intervals: Default::default(),
+                pings: Vec::new(),
+                ext: Default::default(),
+            }),
+        });
         config::persist(&path, &config).unwrap();
 
         let mut replacement = options(&path);
@@ -621,7 +666,7 @@ mod tests {
         )
         .unwrap();
         let config = config::load(&path).unwrap();
-        let ledger = NetStatic::load(Path::new(&config.net_static_path));
+        let ledger = NetStatic::load(&config.net_static_path());
         assert_eq!(ledger.confirm_pending("cf"), None);
         let reporter = config.reporter("cf").unwrap();
         let at = Local.timestamp_millis_opt(now).single().unwrap();
@@ -641,7 +686,7 @@ mod tests {
             Some(now),
         )
         .unwrap();
-        let reloaded = NetStatic::load(Path::new(&config.net_static_path));
+        let reloaded = NetStatic::load(&config.net_static_path());
         assert_eq!(reloaded.confirm_pending("cf"), None);
         assert_eq!(
             reloaded.query_monthly("cf", &IfaceFilter::new(&[]), period, now),
@@ -671,7 +716,7 @@ mod tests {
 
         let config = config::load(&path).unwrap();
         let reporter = config.reporter("cf").unwrap();
-        let ledger = NetStatic::load(Path::new(&config.net_static_path));
+        let ledger = NetStatic::load(&config.net_static_path());
         let period = netstatic::period_start_ms(reporter.reset_day, calibrated);
         assert_eq!(
             ledger.query_monthly(

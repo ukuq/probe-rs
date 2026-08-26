@@ -23,12 +23,12 @@ usage() {
 直接生效:
   -e, --endpoint        面板地址（必填）
   -t, --token           API token（必填）
-  -i, --interval        上报间隔秒（缺省 3；collect 固定 1s）
+  -i, --interval        采集/上报间隔秒（缺省 3；komari 按采集周期上报）
   --month-rotate <日>   月流量重置日 1-31，0 = 不重置（缺省 1）
   --gpu                 开启 GPU 详细采集（缺省关）
-  --include-nics <列表> 网卡白名单，逗号分隔（映射 interfaces）
+  --include-nics <列表> 网卡白名单，逗号分隔通配符（写入 include_nics）
   --install-version <v> 指定 probe-rs 版本（缺省 latest）
-  --name <名称>         客户端名（缺省主机名）
+  --name <名称>         已忽略（komari 段无 server_id 字段，面板按 token 识别）
   --reporter-id <id>   已有配置中追加/更新的 Reporter id（缺省 komari）
   --disable-auto-update 关闭自动更新（缺省开启）
   --update-channel <c> stable / prerelease（缺省 stable）
@@ -108,11 +108,11 @@ if [ "${1:-}" = "uninstall" ]; then
 fi
 [ $# -gt 0 ] || { usage; exit 1; }
 
-ENDPOINT=""; TOKEN=""; INTERVAL=3; RESET_DAY=1; NAME=""; BIN=""
+ENDPOINT=""; TOKEN=""; INTERVAL=3; RESET_DAY=1; BIN=""
 ENABLE_GPU=false; INTERFACES=""; VERSION=""; REPORTER_ID="komari"
 AUTO_UPDATE=true; UPDATE_CHANNEL=stable
 # 需要吞掉一个值的官方参数（接受但忽略）
-IGNORED_WITH_VALUE="--auto-discovery --max-retries -r --reconnect-interval -c --info-report-interval --exclude-nics --include-mountpoint --custom-dns --custom-ipv4 --custom-ipv6 --config --protocol-version --prefer-ip-version --install-dir --install-service-name --install-ghproxy"
+IGNORED_WITH_VALUE="--auto-discovery --max-retries -r --reconnect-interval -c --info-report-interval --exclude-nics --include-mountpoint --custom-dns --custom-ipv4 --custom-ipv6 --config --protocol-version --prefer-ip-version --install-dir --install-service-name --install-ghproxy --name"
 # 纯标志位官方参数
 IGNORED_FLAGS="--disable-web-ssh -u --ignore-unsafe-cert --memory-include-cache --memory-exclude-bcf --show-warning --get-ip-addr-from-nic --disable-compression"
 
@@ -125,7 +125,6 @@ while [ $# -gt 0 ]; do
         --gpu)               ENABLE_GPU=true; shift ;;
         --include-nics)      INTERFACES="$2"; shift 2 ;;
         --install-version)   VERSION="$2"; shift 2 ;;
-        --name)              NAME="$2"; shift 2 ;;
         --reporter-id)       REPORTER_ID="$2"; shift 2 ;;
         --disable-auto-update) AUTO_UPDATE=false; shift ;;
         --enable-auto-update) AUTO_UPDATE=true; shift ;;
@@ -160,18 +159,12 @@ case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=3 ;; esac
 [ "$INTERVAL" -lt 1 ] && INTERVAL=1
 case "$RESET_DAY" in ''|*[!0-9]*) RESET_DAY=1 ;; esac
 [ "$RESET_DAY" -gt 31 ] && RESET_DAY=1
-[ -n "$NAME" ] || NAME=$(hostname)
 # TOML 字符串转义（\\ 与 " 防止注入/解析失败）
 toml_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 # 前导零（08 不是合法 TOML 整数）
 INTERVAL=$((10#$INTERVAL)); RESET_DAY=$((10#$RESET_DAY))
-NAME=$(toml_escape "$NAME"); TOKEN_ESC=$(toml_escape "$TOKEN"); ENDPOINT_ESC=$(toml_escape "$ENDPOINT")
+TOKEN_ESC=$(toml_escape "$TOKEN"); ENDPOINT_ESC=$(toml_escape "$ENDPOINT"); NICS_ESC=$(toml_escape "$INTERFACES")
 
-# 逗号分隔 → TOML 数组
-INTERFACES_TOML="[]"
-if [ -n "$INTERFACES" ]; then
-    INTERFACES_TOML="[$(printf '%s' "$INTERFACES" | tr ',' '\n' | sed 's/^ *//; s/ *$//; /^$/d; s/.*/"&"/' | paste -sd, -)]"
-fi
 
 # ---- 二进制 ----
 install -d -m 0755 "$BIN_DIR"
@@ -289,6 +282,8 @@ strip_seeded_sample_reporters() {
             if (in_reporter) {
                 block=block $0 ORS
                 if ($0 ~ /^[[:space:]]*server_id[[:space:]]*=[[:space:]]*"cf-server-uuid"/) seeded=1
+                if ($0 ~ /^[[:space:]]*url[[:space:]]*=[[:space:]]*"https:\/\/monitor\.example\.com\/update"/) seeded=1
+                if ($0 ~ /^[[:space:]]*endpoint[[:space:]]*=[[:space:]]*"https:\/\/komari\.example\.com"/) seeded=1
                 if ($0 ~ /^[[:space:]]*worker_url[[:space:]]*=[[:space:]]*"https:\/\/monitor\.example\.com\/update"/) seeded=1
                 if ($0 ~ /^[[:space:]]*worker_url[[:space:]]*=[[:space:]]*"https:\/\/komari\.example\.com"/) seeded=1
                 if ($0 ~ /^[[:space:]]*worker_url[[:space:]]*=[[:space:]]*"http:\/\/127\.0\.0\.1:8080\/report"/) seeded=1
@@ -346,55 +341,35 @@ if [ -s "$CONFIG_PATH" ] &&
 
 [[reporters]]
 id = "$REPORTER_ID"
-protocol = "komari"
-server_id = "$NAME"
-secret = "$TOKEN_ESC"
-worker_url = "$ENDPOINT_ESC"
-config_version = ""
-report_interval = $INTERVAL
-reset_day = $RESET_DAY
-interfaces = $INTERFACES_TOML
-disks = []
-report_gpu = $ENABLE_GPU
-report_errors = true
-report_self = false
 
-[reporters.intervals]
-collect = 1
-ping = 30
-slow = 60
-gpu = 60
-ip = 600
-diskio = 10
+[reporters.komari]
+endpoint = "$ENDPOINT_ESC"
+token = "$TOKEN_ESC"
+interval = $INTERVAL
+month_rotate = $RESET_DAY
+enable_gpu = $ENABLE_GPU
+include_nics = "$NICS_ESC"
+include_mountpoints = ""
 EOF
     log "preserved other Reporters and upserted Komari Reporter '$REPORTER_ID'"
 else
     # 缺失配置或旧的根连接 schema 都直接覆盖为新 canonical 格式，不做兼容迁移。
 cat > "$CONFIG_PATH" <<EOF
-net_static_path = "$DATA_DIR/net_static.json"
+schema = 1
+
+data_dir = "$DATA_DIR"
 
 [[reporters]]
 id = "$REPORTER_ID"
-protocol = "komari"
-server_id = "$NAME"
-secret = "$TOKEN_ESC"
-worker_url = "$ENDPOINT_ESC"
-config_version = ""
-report_interval = $INTERVAL
-reset_day = $RESET_DAY
-interfaces = $INTERFACES_TOML
-disks = []
-report_gpu = $ENABLE_GPU
-report_errors = true
-report_self = false
 
-[reporters.intervals]
-collect = 1
-ping = 30
-slow = 60
-gpu = 60
-ip = 600
-diskio = 10
+[reporters.komari]
+endpoint = "$ENDPOINT_ESC"
+token = "$TOKEN_ESC"
+interval = $INTERVAL
+month_rotate = $RESET_DAY
+enable_gpu = $ENABLE_GPU
+include_nics = "$NICS_ESC"
+include_mountpoints = ""
 EOF
     log "wrote a fresh canonical config with Komari Reporter '$REPORTER_ID'"
 fi

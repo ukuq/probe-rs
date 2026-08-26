@@ -1711,7 +1711,7 @@ function cfgEditForm(s, st) {
   plainRow(gIdentity, '当前接收入口', location.origin + '/report');
   plainRow(gIdentity, '线路权限', '当前接入 · 可下发');
   plainRow(gIdentity, '认证 secret', '••••••（不展示）');
-  plainRow(gIdentity, 'net_static_path', '本地私有，协议不回传');
+  plainRow(gIdentity, 'data_dir', '本地私有，协议不回传');
 
   var gCollect = group(readSection.groups, '全局实际采集');
   [['collect', '采样 collect'], ['ping', '探测 ping'], ['slow', '慢变 slow'],
@@ -2248,49 +2248,57 @@ var EXAMPLE_JSON5 = \`{
 }\`;
 
 var CONFIG_EXAMPLE_JSON5 = \`{
-  // 根级只保留真正的机器级持久化设置；实际 worker 参数由 reporters 聚合计算
-  "net_static_path": "/var/lib/probe-rs/net_static.json",   // netstatic 流量时序落盘路径
+  // schema = 1:文件缺省该键视为旧版配置,启动时自动迁移并回写
+  "schema": 1,
+  // 机器级持久化设置:data_dir 承载 net_static.json 等运行态文件
+  "data_dir": "/var/lib/probe-rs",
 
-  // 所有连接都是独立 Reporter；每路声明采集需求和自己的输出策略
+  // 每条 Reporter 只有 id + 一个协议段(cf/komari/probe),协议由段决定;
+  // 段内命名对齐原版 agent,采集需求各自声明后按路聚合
   "reporters": [
     {
-      "id": "primary", "protocol": "cf",                // id 只需在本文件内唯一
-      "server_id": "cf-panel-uuid", "secret": "cf-api-secret",
-      "worker_url": "https://cf.example.com/update", "config_version": "",
-      "report_interval": 30,        // 此 Reporter 自己的上报周期
-      "reset_day": 1, "interfaces": [], "disks": [], // 空数组 = 全部默认物理网卡/全部磁盘
-      "intervals": {                // 该 Reporter 的采集需求；六项均 >= 1 秒
-        "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10
-      },
-      "report_gpu": true,           // 任一路为 true 即启动全局 GPU worker；本路同时输出 GPU
-      "report_errors": true, "report_self": false,
-      "pings": [                    // type + 规范化目标去重；重复任务的实际周期取最小值
-        { "name": "ct", "type": "tcp", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 },
-        { "name": "cu", "type": "tcp", "target": "gd-cu-dualstack.ip.zstaticcdn.com:80", "interval": 30 }
-      ],
-      "ext": { "cf": { "correction": true, "batch": true } }
+      "id": "primary",                          // id 只需在本文件内唯一
+      "cf": {                                   // 命名对齐 cfsm-agent
+        "server_id": "cf-panel-uuid", "secret": "cf-api-secret",
+        "url": "https://cf.example.com/update",
+        "interval": 30,                         // 上报周期(原版 report_interval)
+        "collect_interval": 1,                  // 采集需求:参与全局最小值聚合
+        "reset_day": 1,
+        "interface": "",                        // 逗号分隔;空 = 全部默认物理网卡
+        "ct": "gd-ct-dualstack.ip.zstaticcdn.com:80",
+        "cu": "gd-cu-dualstack.ip.zstaticcdn.com:80"
+        // cf 线固定:启用 GPU、上报 errors、samples[] 批量、auto(WSS+POST 回退)
+        // config_version 由 Agent 回写至 cf.ext,勿手填
+      }
     },
     {
-      "id": "komari", "protocol": "komari",
-      "server_id": "srv-01", "secret": "komari-token",
-      "worker_url": "https://komari.example.com", "config_version": "",
-      "report_interval": 1, "reset_day": 12, "interfaces": [], "disks": [],
-      "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
-      "report_gpu": true, "report_errors": true, "report_self": false, "pings": []
+      "id": "komari",
+      "komari": {                               // 命名对齐 komari-agent
+        "endpoint": "https://komari.example.com", "token": "komari-token",
+        "interval": 1,                          // 采集周期,komari 按采集周期上报
+        "month_rotate": 12,                     // 流量账期重置日(0 = 禁用)
+        "enable_gpu": true,
+        "include_nics": "", "include_mountpoints": ""
+        // learned_pings 是探针自生成状态,落盘在 komari.ext,勿手填
+      }
     },
     {
-      "id": "local-demo", "protocol": "probe",
-      "server_id": "srv-01", "secret": "change-me",
-      "worker_url": "http://127.0.0.1:8080/report", "config_version": "",
-      "report_interval": 1, "reset_day": 1, "interfaces": ["Ethernet*"], "disks": ["C:*"],
-      "intervals": { "collect": 2, "ping": 60, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
-      "report_gpu": true, "report_errors": true, "report_self": true,
-      "pings": [
-        // 与 primary/ct 相同：只采一次（30s），本路仍用 ct-local 名称接收结果
-        { "name": "ct-local", "type": "tcp", "target": "GD-CT-DUALSTACK.IP.ZSTATICCDN.COM", "interval": 60 },
-        { "name": "health", "type": "http", "target": "https://example.com", "interval": 60 },
-        { "name": "edge", "type": "icmp", "target": "1.1.1.1", "interval": 60 }
-      ]
+      "id": "local-demo",
+      "probe": {                                // probe-rs 原生完整形态
+        "server_id": "srv-01", "secret": "change-me",
+        "worker_url": "http://127.0.0.1:8080/report",
+        "report_interval": 1, "reset_day": 1,
+        "report_errors": true, "report_self": true,   // 仅 probe 线可配这两项
+        "interfaces": ["Ethernet*"], "disks": ["C:*"], // 空数组 = 全部
+        "report_gpu": true,
+        "intervals": { "collect": 2, "ping": 60, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
+        "pings": [                              // type + 规范化目标去重;周期取最小值
+          // 与 primary/cf 的 ct 同目标:只采一次(30s),本路仍用 ct-local 名称接收结果
+          { "name": "ct-local", "type": "tcp", "target": "GD-CT-DUALSTACK.IP.ZSTATICCDN.COM", "interval": 60 },
+          { "name": "health", "type": "http", "target": "https://example.com", "interval": 60 },
+          { "name": "edge", "type": "icmp", "target": "1.1.1.1", "interval": 60 }
+        ]
+      }
     }
   ]
 }\`;
@@ -2349,7 +2357,7 @@ function renderExample() {
     ]),
     annotatedCard(RESPONSE_EXAMPLE_JSON5, '//', [
       'agent 行为：整体校验（版本、周期、glob、Ping），全部通过才应用当前 Reporter 并落盘；随后重新计算全局最小周期、GPU OR、网卡/磁盘/Ping 并集。',
-      '🔒 连接身份与 net_static_path 只接受本地配置；远端只能修改产生该响应的 Reporter。允许下发 Ping 时，服务端应自行限制目标，避免 SSRF/内网探测。',
+      '🔒 连接身份与 data_dir 只接受本地配置；远端只能修改产生该响应的 Reporter。允许下发 Ping 时，服务端应自行限制目标，避免 SSRF/内网探测。',
     ]));
 }
 
