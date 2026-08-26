@@ -1,6 +1,6 @@
 [package]
 name = "probe-rs"
-version = "0.1.4-beta.3"
+version = "0.1.4-beta.4"
 edition = "2021"
 license = "MIT"
 description = "Server monitoring probe agent"
