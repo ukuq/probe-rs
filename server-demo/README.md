@@ -24,6 +24,9 @@ HOST=0.0.0.0 deno run --allow-net --allow-env=HOST server.ts # 显式对外监�
 - **交互**：crosshair + tooltip（悬停查看任意时刻全系列数值，键盘 focus 亦可）
 - **明细表格**：图表的 table 双生，承载全部当前值，并展示
   NTP/服务端校准来源、本地时间、准确时间及快慢偏差（tabular-nums）
+- **配置视图**：按 `config.toml` 层级拆分表单，每个 Reporter 独立 Tab，私密字段
+  统一掩码；采集配置可在全局实际结果和各 Reporter 映射结果之间切换，当前接入的
+  probe Reporter 可编辑并随下一次上报下发
 
 配色与图表规范遵循 dataviz 方法（dark 调色板经 `validate_palette.js`
 六项检查）。

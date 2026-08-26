@@ -926,6 +926,21 @@ const PAGE = `<!doctype html>
     color: var(--text); font: inherit; font-size: 12.5px; padding: 4px 10px; }
   .rpt-detail pre.code { max-height: 480px; overflow: auto; }
   /* 配置分组与逐项编辑 */
+  .cfg-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; padding-bottom: 10px;
+    border-bottom: 0.5px solid var(--sep); }
+  .cfg-tab { appearance: none; border: 0.5px solid transparent; border-radius: 999px;
+    background: var(--fill); color: var(--text2); font: inherit; font-size: 12px; padding: 5px 12px;
+    cursor: pointer; }
+  .cfg-tab:hover { color: var(--text); }
+  .cfg-tab.on { color: #fff; background: var(--blue); border-color: var(--blue); }
+  .cfg-tab .tag { margin-left: 6px; opacity: .75; font-size: 10px; }
+  .cfg-tab-panel { padding-top: 2px; }
+  .cfg-private { font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    letter-spacing: .08em; color: var(--text3); }
+  .cfg-block + .cfg-block { margin-top: 22px; padding-top: 2px; border-top: 0.5px solid var(--sep); }
+  .cfg-block-head { display: flex; align-items: baseline; gap: 10px; margin-top: 14px; }
+  .cfg-block-head h2 { margin: 0; font-size: 14px; font-weight: 650; }
+  .cfg-block-head span { color: var(--text3); font-size: 11.5px; }
   .cfg-section-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; margin: 16px 2px -2px; }
   .cfg-section-title { color: var(--text); font-size: 13px; font-weight: 650; }
   .cfg-section-note { color: var(--text3); font-size: 11.5px; }
@@ -1625,7 +1640,10 @@ function cfgGroup(title, rows) {
   g.append(el('h3', null, title));
   rows.forEach(function (r) {
     var row = el('div', 'cfg-item plain');
-    row.append(el('span', 'lab', r[0]), el('span', 'cur', r[1]));
+    var value = el('span', 'cur', r[1]);
+    if (r[2]) value.classList.add(r[2]);
+    value.title = String(r[1]);
+    row.append(el('span', 'lab', r[0]), value);
     g.append(row);
   });
   return g;
@@ -1652,8 +1670,6 @@ function cfgPingTargetError(kind, target) {
 function cfgEditForm(s, st) {
   var cf = st.config || {};          // static.config.*：当前生效配置
   var iv = cf.intervals || {};
-  var global = cf.global || {};
-  var collectIv = global.intervals || iv;
   var wrap = el('div');
   var items = [];
   function section(title, note) {
@@ -1665,8 +1681,8 @@ function cfgEditForm(s, st) {
     wrap.append(root);
     return { root: root, groups: sectionGroups };
   }
-  var readSection = section('只读信息', '来自 Agent 当前上报，不能在此页面修改');
-  var editSection = section('可修改配置', '仅作用于当前 Reporter，勾选后随上报响应下发');
+  var readSection = section('当前本地配置', '连接身份只读；敏感字段不会由 Agent 上报');
+  var editSection = section('可下发配置', '勾选字段后，仅更新当前 probe Reporter');
   function group(sectionGroups, title) {
     var g = el('div', 'cfg-group');
     g.append(el('h3', null, title));
@@ -1703,42 +1719,18 @@ function cfgEditForm(s, st) {
   }
   function sec(v) { return v != null ? v + ' s' : '–'; }
 
-  var gIdentity = group(readSection.groups, 'Reporter 实例');
-  plainRow(gIdentity, 'Reporter ID', s.reporter_id || 'primary');
-  plainRow(gIdentity, '协议 protocol', s.protocol || 'probe');
-  plainRow(gIdentity, '服务器 server_id', s.server_id);
-  plainRow(gIdentity, '配置版本 config_version', fmtVer(s.config_version));
-  plainRow(gIdentity, '当前接收入口', location.origin + '/report');
-  plainRow(gIdentity, '线路权限', '当前接入 · 可下发');
-  plainRow(gIdentity, '认证 secret', '••••••（不展示）');
-  plainRow(gIdentity, 'data_dir', '本地私有，协议不回传');
+  var gIdentity = group(readSection.groups, '[[reporters]]');
+  plainRow(gIdentity, 'id', s.reporter_id || 'primary');
+  plainRow(gIdentity, 'protocol', s.protocol || 'probe');
+  plainRow(gIdentity, '状态', s.online ? '当前接入 · 在线 · 可下发' : '当前接入 · 离线');
 
-  var gCollect = group(readSection.groups, '全局实际采集');
-  [['collect', '采样 collect'], ['ping', '探测 ping'], ['slow', '慢变 slow'],
-   ['gpu', 'GPU gpu'], ['ip', '公网 IP ip'], ['diskio', '磁盘 IO diskio']]
-    .forEach(function (def) { plainRow(gCollect, def[1], sec(collectIv[def[0]])); });
-  plainRow(gCollect, 'GPU worker enable_gpu', global.enable_gpu == null
-    ? '–' : (global.enable_gpu ? '开' : '关'));
-  var globalPings = Array.isArray(global.pings) ? global.pings : [];
-  var globalPingText = globalPings.map(function (p) {
-    return p.target + ' @ ' + (p.interval ?? collectIv.ping) + 's';
-  }).join('; ');
-  plainRow(gCollect, 'Ping worker', globalPings.length
-    ? globalPings.length + ' 组 · ' + globalPingText : '（无）');
-  plainRow(gCollect, '网卡并集', global.all_interfaces ? '全部默认物理网卡'
-    : ((global.interfaces || []).join(', ') || '–'));
-  plainRow(gCollect, '磁盘并集', global.all_disks ? '全部卷 / 物理盘'
-    : ((global.disks || []).join(', ') || '–'));
+  var gConnection = group(readSection.groups, '[reporters.probe] · 连接');
+  plainRow(gConnection, 'server_id', s.server_id);
+  plainRow(gConnection, 'secret', '******');
+  plainRow(gConnection, 'worker_url', location.origin + '/report');
+  plainRow(gConnection, 'config_version', fmtVer(s.config_version));
 
-  var gStatic = group(readSection.groups, '静态信息');
-  plainRow(gStatic, 'static 刷新周期', '600 s（固定）');
-  plainRow(gStatic, 'static 采集于', st.ts ? new Date(st.ts).toLocaleString('zh-CN') : '–');
-  plainRow(gStatic, 'agent 版本', 'v' + (st.agent_version || s.agent_version || '?'));
-  (st.disks || []).forEach(function (disk) {
-    plainRow(gStatic, '卷 ' + (disk.mount_point || disk.id), fmtB(disk.used) + ' / ' + fmtB(disk.total));
-  });
-
-  var gDemand = group(editSection.groups, '本 Reporter 采集需求（参与全局聚合）');
+  var gDemand = group(editSection.groups, '[reporters.probe.intervals]');
   [['collect', '同步采样 collect'], ['ping', 'Ping 默认 ping'], ['slow', '慢指标 slow'],
    ['gpu', 'GPU gpu'], ['ip', '公网 IP ip'], ['diskio', '磁盘 IO diskio']]
     .forEach(function (def) {
@@ -1752,7 +1744,7 @@ function cfgEditForm(s, st) {
         p.intervals[def[0]] = v;
       });
     });
-  var gReport = group(editSection.groups, 'Reporter 上报策略');
+  var gReport = group(editSection.groups, '[reporters.probe] · 上报策略');
   editRow(gReport, '上报间隔 report_interval', sec(iv.report), numInput(iv.report, 1),
     function (p, inp) {
       var v = Number(inp.value);
@@ -1768,7 +1760,7 @@ function cfgEditForm(s, st) {
       p.reset_day = v;
     });
 
-  var gBool = group(editSection.groups, 'Reporter 输出开关');
+  var gBool = group(editSection.groups, '[reporters.probe] · 输出开关');
   [['report_gpu', 'enable_gpu', 'GPU 输出 report_gpu'],
    ['report_errors', 'report_errors', '错误上报 report_errors'],
    ['report_self', 'report_self', '自身占用 report_self']].forEach(function (def) {
@@ -1796,7 +1788,7 @@ function cfgEditForm(s, st) {
     });
   }
 
-  var gIface = group(editSection.groups, '网卡 interfaces');
+  var gIface = group(editSection.groups, '[reporters.probe] · interfaces');
   var ifInp = el('input'); ifInp.type = 'text'; ifInp.className = 'wide';
   ifInp.placeholder = 'eth*, ens*（留空 = 清空）';
   if (Array.isArray(cf.interfaces) && cf.interfaces.length) ifInp.value = cf.interfaces.join(', ');
@@ -1806,7 +1798,7 @@ function cfgEditForm(s, st) {
     p.interfaces = inp.value.split(',').map(function (x) { return x.trim(); }).filter(Boolean);
   });
 
-  var gDisk = group(editSection.groups, '磁盘 disks');
+  var gDisk = group(editSection.groups, '[reporters.probe] · disks');
   var diskInp = el('input'); diskInp.type = 'text'; diskInp.className = 'wide';
   diskInp.placeholder = 'C:*, 0 C:, nvme*（留空 = 全部）';
   if (Array.isArray(cf.disks) && cf.disks.length) diskInp.value = cf.disks.join(', ');
@@ -1815,7 +1807,7 @@ function cfgEditForm(s, st) {
     p.disks = inp.value.split(',').map(function (x) { return x.trim(); }).filter(Boolean);
   });
 
-  var gPing = group(editSection.groups, '当前 Reporter Ping');
+  var gPing = group(editSection.groups, '[[reporters.probe.pings]]');
   gPing.classList.add('cfg-pings');
   var pingToggle = el('div', 'cfg-item ping-toggle');
   var pingLab = el('label', 'lab');
@@ -1934,53 +1926,255 @@ function cfgEditForm(s, st) {
   return wrap;
 }
 
-/* ---- 配置视图 ---- */
-function reporterTopology(data) {
-  var card = el('div', 'card topology');
-  var head = el('div', 'card-head');
-  head.append(el('span', 'name', '多路上报拓扑'),
-    el('span', 'meta', '当前接入可下发；外部线路只读，不推断在线状态'));
-  card.append(head);
-  var groups = el('div', 'cfg-groups');
-  data.forEach(function (s) {
-    var cf = ((s.static || {}).config) || {};
-    var routes = Array.isArray(cf.reporters) && cf.reporters.length ? cf.reporters : [{
-      id: s.reporter_id || 'primary', protocol: s.protocol || 'probe',
-      report_interval: (cf.intervals || {}).report, report_gpu: cf.enable_gpu,
-      report_errors: cf.report_errors, report_self: cf.report_self,
-      pings: Array.isArray(cf.pings) ? cf.pings : []
-    }];
-    groups.append(cfgGroup(s.server_id + ' · via ' + reporterTag(s), routes.map(function (r) {
-      var current = r.id === (s.reporter_id || 'primary')
-        && (r.protocol || 'probe') === (s.protocol || 'probe');
-      var state = current
-        ? '当前接入 · ' + (s.online ? '在线' : '离线') + ' · 可下发'
-        : '已配置 · 外部线路 · 只读';
-      var routePings = Array.isArray(r.pings) ? r.pings : [];
-      var details = ['report ' + (r.report_interval ?? '–') + 's',
-        'collect ' + (((r.intervals || {}).collect) ?? '–') + 's',
-        'GPU ' + (r.report_gpu == null ? '–' : (r.report_gpu ? '开' : '关')),
-        'Ping ' + routePings.length + ' 组'];
-      return [(r.id || 'primary') + ' / ' + (r.protocol || 'probe'), state + ' · ' + details.join(' · ')];
-    })));
+/* ---- 配置视图：本地配置 / Reporter / 采集映射三层 ---- */
+var cfgReporterSelection = {};
+var cfgCollectionSelection = {};
+
+function cfgRouteKey(route) {
+  return JSON.stringify([route.id || 'primary', route.protocol || 'probe']);
+}
+
+function cfgRoutes(s) {
+  var config = ((s.static || {}).config) || {};
+  if (Array.isArray(config.reporters) && config.reporters.length) return config.reporters;
+  return [{
+    id: s.reporter_id || 'primary',
+    protocol: s.protocol || 'probe',
+    intervals: config.intervals || {},
+    report_interval: (config.intervals || {}).report,
+    reset_day: config.reset_day,
+    interfaces: config.interfaces || [],
+    disks: config.disks || [],
+    report_gpu: config.enable_gpu,
+    report_errors: config.report_errors,
+    report_self: config.report_self,
+    pings: Array.isArray(config.pings) ? config.pings : [],
+  }];
+}
+
+function cfgIsCurrent(s, route) {
+  return (route.id || 'primary') === (s.reporter_id || 'primary') &&
+    (route.protocol || 'probe') === (s.protocol || 'probe');
+}
+
+function cfgTabs(defs, active, onSelect) {
+  var tabs = el('div', 'cfg-tabs');
+  defs.forEach(function (def) {
+    var button = el('button', 'cfg-tab' + (def.key === active ? ' on' : ''));
+    button.type = 'button';
+    button.append(el('span', null, def.label));
+    if (def.tag) button.append(el('span', 'tag', def.tag));
+    button.onclick = function () { onSelect(def.key); };
+    tabs.append(button);
   });
-  card.append(groups, el('div', 'note',
-    'Reporter 清单来自 static.config.reporters，包含 ID、协议、输出策略和完整 Ping 配置；不会回传 secret、worker_url、其他线路的 server_id/config_version。新增、删除线路仍只能改本地 TOML。'));
-  return card;
+  return tabs;
+}
+
+function cfgBlock(title, note) {
+  var root = el('section', 'cfg-block');
+  var head = el('div', 'cfg-block-head');
+  head.append(el('h2', null, title));
+  if (note) head.append(el('span', null, note));
+  root.append(head);
+  return root;
+}
+
+function cfgBool(value) {
+  return value == null ? '–' : (value ? 'true' : 'false');
+}
+
+function cfgList(value, emptyText) {
+  return Array.isArray(value) && value.length ? value.join(', ') : emptyText;
+}
+
+function cfgMachineForm(s, st) {
+  var block = cfgBlock('本地配置', '按 config.toml 顶层结构展示');
+  var groups = el('div', 'cfg-groups');
+  groups.append(
+    cfgGroup('[root]', [
+      ['schema', '1'],
+      ['data_dir', '******', 'cfg-private'],
+    ]),
+    cfgGroup('[auto_update]', [
+      ['enabled', '未在上报摘要中公开'],
+      ['channel', '未在上报摘要中公开'],
+      ['check_interval', '未在上报摘要中公开'],
+    ]),
+    cfgGroup('运行回执', [
+      ['agent_version', st.agent_version || s.agent_version || '–'],
+      ['static.ts', st.ts ? new Date(st.ts).toLocaleString('zh-CN') : '–'],
+      ['当前接入', (s.reporter_id || 'primary') + ' / ' + (s.protocol || 'probe')],
+    ]),
+  );
+  block.append(groups, el('div', 'note',
+    '页面使用 Agent 上报的脱敏配置摘要；本地路径、连接凭据及其他线路的连接身份不会离开 Agent。'));
+  return block;
+}
+
+function cfgReadonlyReporterForm(route) {
+  var protocol = route.protocol || 'probe';
+  var intervals = route.intervals || {};
+  var pings = Array.isArray(route.pings) ? route.pings : [];
+  var wrap = el('div', 'cfg-tab-panel');
+  var groups = el('div', 'cfg-groups');
+  groups.append(cfgGroup('[[reporters]]', [
+    ['id', route.id || 'primary'],
+    ['protocol', protocol],
+    ['权限', '外部线路 · 只读'],
+  ]));
+
+  if (protocol === 'cf') {
+    var pingByName = {};
+    pings.forEach(function (ping) { pingByName[ping.name] = ping.target; });
+    groups.append(
+      cfgGroup('[reporters.cf] · 连接', [
+        ['server_id', '******', 'cfg-private'],
+        ['secret', '******', 'cfg-private'],
+        ['url', '******', 'cfg-private'],
+      ]),
+      cfgGroup('[reporters.cf] · 采集与上报', [
+        ['interval', route.report_interval != null ? route.report_interval + ' s' : '–'],
+        ['collect_interval', intervals.collect != null ? intervals.collect + ' s' : '–'],
+        ['reset_day', route.reset_day != null ? String(route.reset_day) : '–'],
+        ['interface', cfgList(route.interfaces, '""（全部）')],
+        ['report_gpu', cfgBool(route.report_gpu) + '（固定）'],
+      ]),
+      cfgGroup('[reporters.cf] · Ping', [
+        ['ct', pingByName.ct || '–'],
+        ['cu', pingByName.cu || '–'],
+        ['cm', pingByName.cm || '–'],
+        ['bd', pingByName.bd || pingByName.bgp || '–'],
+      ]),
+    );
+  } else if (protocol === 'komari') {
+    groups.append(
+      cfgGroup('[reporters.komari] · 连接', [
+        ['endpoint', '******', 'cfg-private'],
+        ['token', '******', 'cfg-private'],
+      ]),
+      cfgGroup('[reporters.komari] · 采集与上报', [
+        ['interval', route.report_interval != null ? route.report_interval + ' s' : '–'],
+        ['month_rotate', route.reset_day != null ? String(route.reset_day) : '–'],
+        ['enable_gpu', cfgBool(route.report_gpu)],
+        ['include_nics', cfgList(route.interfaces, '""（全部）')],
+        ['include_mountpoints', cfgList(route.disks, '""（全部）')],
+      ]),
+    );
+  } else {
+    groups.append(
+      cfgGroup('[reporters.probe] · 连接', [
+        ['server_id', '******', 'cfg-private'],
+        ['secret', '******', 'cfg-private'],
+        ['worker_url', '******', 'cfg-private'],
+      ]),
+      cfgGroup('[reporters.probe]', [
+        ['report_interval', route.report_interval != null ? route.report_interval + ' s' : '–'],
+        ['reset_day', route.reset_day != null ? String(route.reset_day) : '–'],
+        ['report_gpu', cfgBool(route.report_gpu)],
+        ['report_errors', cfgBool(route.report_errors)],
+        ['report_self', cfgBool(route.report_self)],
+        ['interfaces', cfgList(route.interfaces, '[]（全部）')],
+        ['disks', cfgList(route.disks, '[]（全部）')],
+      ]),
+      cfgGroup('[reporters.probe.intervals]', [
+        ['collect', intervals.collect != null ? intervals.collect + ' s' : '–'],
+        ['ping', intervals.ping != null ? intervals.ping + ' s' : '–'],
+        ['slow', intervals.slow != null ? intervals.slow + ' s' : '–'],
+        ['gpu', intervals.gpu != null ? intervals.gpu + ' s' : '–'],
+        ['ip', intervals.ip != null ? intervals.ip + ' s' : '–'],
+        ['diskio', intervals.diskio != null ? intervals.diskio + ' s' : '–'],
+      ]),
+    );
+  }
+  var pingRows = pings.map(function (ping, index) {
+    return [
+      (ping.name || 'ping-' + (index + 1)) + ' · ' + (ping.type || '–'),
+      ping.target + ' @ ' + (ping.interval ?? intervals.ping ?? '–') + ' s',
+    ];
+  });
+  if (protocol !== 'cf') {
+    groups.append(cfgGroup(
+      protocol === 'komari'
+        ? '[[reporters.komari.ext.learned_pings]]'
+        : '[[reporters.probe.pings]]',
+      pingRows.length ? pingRows : [['pings', '[]']],
+    ));
+  }
+  wrap.append(groups, el('div', 'note',
+    '该 Reporter 未连接到本 demo；可查看脱敏映射，但连接信息与配置下发均不可用。'));
+  return wrap;
+}
+
+function cfgPendingView(s) {
+  if (!s.pending_config) return null;
+  var pending = s.pending_config;
+  var rows = [['config_version', fmtVer(s.config_version) + ' → ' + fmtVer(pending.config_version)]];
+  if (pending.intervals) rows.push(['intervals', Object.keys(pending.intervals).map(function (key) {
+    return key + '=' + pending.intervals[key] + 's';
+  }).join(', ')]);
+  if (pending.report_interval != null) rows.push(['report_interval', pending.report_interval + 's']);
+  if (pending.reset_day != null) rows.push(['reset_day', String(pending.reset_day)]);
+  if (pending.interfaces) rows.push(['interfaces', pending.interfaces.join(', ') || '(空)']);
+  if (pending.disks) rows.push(['disks', pending.disks.join(', ') || '(全部)']);
+  if (pending.pings) rows.push(['pings', pending.pings.length + ' 项']);
+  if (pending.report_gpu != null) rows.push(['report_gpu', String(pending.report_gpu)]);
+  if (pending.report_errors != null) rows.push(['report_errors', String(pending.report_errors)]);
+  if (pending.report_self != null) rows.push(['report_self', String(pending.report_self)]);
+  var groups = el('div', 'cfg-groups');
+  groups.append(cfgGroup('⚠ 待下发（下次上报生效）', rows));
+  return groups;
+}
+
+function cfgCollectionPanel(config, route) {
+  var panel = el('div', 'cfg-tab-panel');
+  var groups = el('div', 'cfg-groups');
+  var isGlobal = !route;
+  var source = isGlobal ? (config.global || {}) : route;
+  var intervals = source.intervals || {};
+  groups.append(cfgGroup(isGlobal ? '实际采集周期' : '映射后采集周期', [
+    ['collect', intervals.collect != null ? intervals.collect + ' s' : '–'],
+    ['ping', intervals.ping != null ? intervals.ping + ' s' : '–'],
+    ['slow', intervals.slow != null ? intervals.slow + ' s' : '–'],
+    ['gpu', intervals.gpu != null ? intervals.gpu + ' s' : '–'],
+    ['ip', intervals.ip != null ? intervals.ip + ' s' : '–'],
+    ['diskio', intervals.diskio != null ? intervals.diskio + ' s' : '–'],
+  ]));
+  var interfaces = isGlobal && source.all_interfaces
+    ? '全部默认物理网卡'
+    : cfgList(source.interfaces, isGlobal ? '–' : '全部默认物理网卡');
+  var disks = isGlobal && source.all_disks
+    ? '全部卷 / 物理盘'
+    : cfgList(source.disks, isGlobal ? '–' : '全部卷 / 物理盘');
+  groups.append(cfgGroup(isGlobal ? '实际采集范围' : 'Reporter 采集范围', [
+    ['interfaces', interfaces],
+    ['disks', disks],
+    ['enable_gpu', cfgBool(isGlobal ? source.enable_gpu : source.report_gpu)],
+  ]));
+  var pings = Array.isArray(source.pings) ? source.pings : [];
+  var pingRows = pings.map(function (ping, index) {
+    var label = isGlobal ? 'worker ' + (index + 1) : (ping.name || 'ping-' + (index + 1));
+    var type = ping.type ? ' · ' + ping.type : '';
+    return [label + type, ping.target + ' @ ' + (ping.interval ?? intervals.ping ?? '–') + ' s'];
+  });
+  groups.append(cfgGroup(isGlobal ? '实际 Ping workers' : 'Reporter Ping 映射',
+    pingRows.length ? pingRows : [['pings', '[]']]));
+  panel.append(groups);
+  return panel;
 }
 
 function renderConfig(data) {
   var app = document.getElementById('app');
   app.textContent = '';
-  var configured = data.reduce(function (n, s) {
-    var rs = ((((s.static || {}).config) || {}).reporters);
-    return n + (Array.isArray(rs) && rs.length ? rs.length : 1);
+  var configured = data.reduce(function (count, server) {
+    return count + cfgRoutes(server).length;
   }, 0);
-  document.getElementById('summary').textContent = data.length + ' 路接入 · ' + configured + ' 路已配置';
+  document.getElementById('summary').textContent = data.length + ' 路接入 · ' + configured + ' 个 Reporter';
   if (!data.length) { app.append(el('div', 'empty', '暂无服务器数据')); return; }
-  app.append(reporterTopology(data));
+
   data.forEach(function (s) {
     var st = s.static || {};
+    var config = st.config || {};
+    var routes = cfgRoutes(s);
     var card = el('div', 'card' + (s.online ? '' : ' offline'));
     var head = el('div', 'card-head');
     head.append(
@@ -1998,30 +2192,58 @@ function renderConfig(data) {
       setTimeout(function () { refreshBtn.textContent = '↻ 刷新 static'; }, 3000);
     };
     head.append(spacer, refreshBtn);
-    card.append(head);
-    if (s.pending_config) {
-      var p = s.pending_config;
-      var rows = [['config_version', fmtVer(s.config_version) + ' → ' + fmtVer(p.config_version)]];
-      if (p.intervals) rows.push(['intervals', Object.keys(p.intervals).map(function (k) {
-        return k + '=' + p.intervals[k] + 's';
-      }).join(', ')]);
-      if (p.report_interval != null) rows.push(['report_interval', p.report_interval + 's']);
-      if (p.reset_day != null) rows.push(['reset_day', String(p.reset_day)]);
-      if (p.interfaces) rows.push(['interfaces', p.interfaces.join(', ') || '(空)']);
-      if (p.disks) rows.push(['disks', p.disks.join(', ') || '(全部)']);
-      if (p.pings) rows.push(['pings', p.pings.length + ' 项']);
-      if (p.report_gpu != null) rows.push(['report_gpu', String(p.report_gpu)]);
-      if (p.report_errors != null) rows.push(['report_errors', String(p.report_errors)]);
-      if (p.report_self != null) rows.push(['report_self', String(p.report_self)]);
-      if (p.ext && p.ext.cf) {
-        if (p.ext.cf.correction != null) rows.push(['ext.cf.correction', String(p.ext.cf.correction)]);
-        if (p.ext.cf.batch != null) rows.push(['ext.cf.batch', String(p.ext.cf.batch)]);
-      }
-      var pendWrap = el('div', 'cfg-groups');
-      pendWrap.append(cfgGroup('⚠ 待下发（下次上报生效）', rows));
-      card.append(pendWrap);
+    card.append(head, cfgMachineForm(s, st));
+
+    var stateKey = instanceKey(s);
+    var reporterBlock = cfgBlock('Reporter 配置', '每个 [[reporters]] 对应一个 Tab');
+    var reporterDefs = routes.map(function (route) {
+      var current = cfgIsCurrent(s, route);
+      return {
+        key: cfgRouteKey(route),
+        label: route.id || 'primary',
+        tag: (route.protocol || 'probe') + (current ? ' · 当前' : ' · 只读'),
+      };
+    });
+    var currentRoute = routes.find(function (route) { return cfgIsCurrent(s, route); });
+    var reporterActive = cfgReporterSelection[stateKey];
+    if (!reporterDefs.some(function (def) { return def.key === reporterActive; })) {
+      reporterActive = cfgRouteKey(currentRoute || routes[0]);
+      cfgReporterSelection[stateKey] = reporterActive;
     }
-    card.append(cfgEditForm(s, st));
+    reporterBlock.append(cfgTabs(reporterDefs, reporterActive, function (key) {
+      cfgReporterSelection[stateKey] = key;
+      cfgFormActive = false;
+      renderConfig(data);
+    }));
+    var selectedRoute = routes.find(function (route) { return cfgRouteKey(route) === reporterActive; });
+    if (selectedRoute && cfgIsCurrent(s, selectedRoute) && (selectedRoute.protocol || 'probe') === 'probe') {
+      var pending = cfgPendingView(s);
+      if (pending) reporterBlock.append(pending);
+      reporterBlock.append(cfgEditForm(s, st));
+    } else if (selectedRoute) {
+      reporterBlock.append(cfgReadonlyReporterForm(selectedRoute));
+    }
+    card.append(reporterBlock);
+
+    var collectionBlock = cfgBlock('采集配置', '全局实际采集与各 Reporter 映射结果');
+    var collectionDefs = [{ key: 'global', label: '全局实际采集', tag: 'effective' }].concat(
+      routes.map(function (route) {
+        return { key: cfgRouteKey(route), label: route.id || 'primary', tag: route.protocol || 'probe' };
+      }),
+    );
+    var collectionActive = cfgCollectionSelection[stateKey] || 'global';
+    if (!collectionDefs.some(function (def) { return def.key === collectionActive; })) collectionActive = 'global';
+    cfgCollectionSelection[stateKey] = collectionActive;
+    collectionBlock.append(cfgTabs(collectionDefs, collectionActive, function (key) {
+      cfgCollectionSelection[stateKey] = key;
+      cfgFormActive = false;
+      renderConfig(data);
+    }));
+    var collectionRoute = collectionActive === 'global'
+      ? null
+      : routes.find(function (route) { return cfgRouteKey(route) === collectionActive; });
+    collectionBlock.append(cfgCollectionPanel(config, collectionRoute));
+    card.append(collectionBlock);
     app.append(card);
   });
 }
