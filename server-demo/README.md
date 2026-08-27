@@ -69,8 +69,8 @@ curl -X POST localhost:8080/api/config/URL编码后的instance_id \
 服务端校验周期、glob 与 Ping 基本格式 → 下次上报随响应下发 → agent 原子应用该
 Reporter 配置并落盘，面板上的 `cfg v` 版本号随之更新。Agent
 随后自动重算实际机器级配置：collect 取所有 Reporter 需求的最大公约数，其他
-worker 周期取最小值，GPU 取 OR，网卡/磁盘/Ping 取并集。生产服务端允许下发 Ping 时应额外限制目标，避免
-SSRF/内网探测。
+worker 周期取最小值，GPU 取 OR，网卡/磁盘/Ping 取并集。生产服务端允许下发 Ping
+时应额外限制目标，避免 SSRF/内网探测。
 
 ## 注意
 
