@@ -44,11 +44,12 @@ pub async fn run_if_requested() -> Result<bool> {
 struct ConfigureCfOptions {
     config_path: PathBuf,
     default_net_static_path: String,
-    server_id: String,
-    secret: String,
-    worker_url: String,
-    reporter_id: Option<String>,
+    server_id: Option<String>,
+    secret: Option<String>,
+    worker_url: Option<String>,
+    reporter_id: String,
     collect: Option<u64>,
+    wss_report_interval: Option<u64>,
     report_interval: Option<u64>,
     connection_mode: Option<CfConnectionMode>,
     reset_day: Option<u8>,
@@ -56,7 +57,7 @@ struct ConfigureCfOptions {
     pings: Vec<(String, String)>,
     auto_update: Option<bool>,
     update_channel: Option<UpdateChannel>,
-    replace_cf: bool,
+    update_proxys: Vec<String>,
 }
 
 fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureCfOptions> {
@@ -65,8 +66,9 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
     let mut server_id = None;
     let mut secret = None;
     let mut worker_url = None;
-    let mut reporter_id = None;
+    let mut reporter_id = "cf".to_owned();
     let mut collect = None;
+    let mut wss_report_interval = None;
     let mut report_interval = None;
     let mut connection_mode = None;
     let mut reset_day = None;
@@ -74,7 +76,7 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
     let mut pings = Vec::new();
     let mut auto_update = None;
     let mut update_channel = None;
-    let mut replace_cf = false;
+    let mut update_proxys = Vec::new();
     let mut args = args;
     while let Some(arg) = args.next() {
         let value = |args: &mut dyn Iterator<Item = String>| {
@@ -87,8 +89,15 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
             "--server-id" => server_id = Some(value(&mut args)?),
             "--secret" => secret = Some(value(&mut args)?),
             "--url" => worker_url = Some(value(&mut args)?),
-            "--reporter-id" => reporter_id = Some(value(&mut args)?),
-            "--collect" => collect = Some(parse_positive_u64(&arg, &value(&mut args)?)?),
+            "--reporter-id" => reporter_id = value(&mut args)?,
+            "--collect" => collect = Some(parse_u64(&arg, &value(&mut args)?)?),
+            "--wss-report-interval" => {
+                let parsed = parse_positive_u64(&arg, &value(&mut args)?)?;
+                if parsed > 5 {
+                    bail!("--wss-report-interval must be between 1 and 5");
+                }
+                wss_report_interval = Some(parsed);
+            }
             "--report-interval" => {
                 report_interval = Some(parse_positive_u64(&arg, &value(&mut args)?)?)
             }
@@ -130,22 +139,21 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
                     _ => bail!("--update-channel must be stable or prerelease"),
                 });
             }
-            "--replace-cf" => replace_cf = true,
+            "--update-proxy" => update_proxys.push(value(&mut args)?),
             _ => bail!("unknown configure-cf option: {arg}"),
         }
     }
-    let reporter_id = reporter_id
-        .map(|id| validate_reporter_id(&id).map(|_| id))
-        .transpose()?;
+    validate_reporter_id(&reporter_id)?;
     Ok(ConfigureCfOptions {
         config_path: config_path.context("configure-cf requires --config")?,
         default_net_static_path: default_net_static_path
             .context("configure-cf requires --net-static-path")?,
-        server_id: required_nonempty(server_id, "--server-id")?,
-        secret: required_nonempty(secret, "--secret")?,
-        worker_url: required_nonempty(worker_url, "--url")?,
+        server_id: optional_nonempty(server_id, "--server-id")?,
+        secret: optional_nonempty(secret, "--secret")?,
+        worker_url: optional_nonempty(worker_url, "--url")?,
         reporter_id,
         collect,
+        wss_report_interval,
         report_interval,
         connection_mode,
         reset_day,
@@ -153,7 +161,7 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
         pings,
         auto_update,
         update_channel,
-        replace_cf,
+        update_proxys,
     })
 }
 
@@ -166,21 +174,7 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
         .reporters
         .retain(|reporter| !is_seeded_sample(reporter));
 
-    let cf_ids: Vec<_> = config
-        .reporters
-        .iter()
-        .filter(|reporter| reporter.cf.is_some())
-        .map(|reporter| reporter.id.clone())
-        .collect();
-    let selected_id = match options.reporter_id {
-        Some(id) => id,
-        None if options.replace_cf || cf_ids.is_empty() => "cf".to_owned(),
-        None if cf_ids.len() == 1 => cf_ids[0].clone(),
-        None => bail!(
-            "multiple CF Reporters exist ({}); pass -reporter_id=<id>",
-            cf_ids.join(", ")
-        ),
-    };
+    let selected_id = options.reporter_id.clone();
 
     if config
         .reporters
@@ -189,16 +183,15 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
     {
         bail!("Reporter id '{selected_id}' already belongs to a non-CF Reporter");
     }
-    if options.replace_cf {
-        config
-            .reporters
-            .retain(|reporter| reporter.cf.is_none() || reporter.id == selected_id);
-    }
-
     let index = config
         .reporters
         .iter()
         .position(|reporter| reporter.id == selected_id);
+    if index.is_none() {
+        if options.server_id.is_none() || options.secret.is_none() || options.worker_url.is_none() {
+            bail!("new CF Reporter '{selected_id}' requires --server-id, --secret and --url");
+        }
+    }
     if index.is_none() {
         config.reporters.push(new_cf_reporter(selected_id.clone()));
     }
@@ -208,24 +201,43 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
         .find(|reporter| reporter.id == selected_id)
         .expect("CF Reporter was inserted");
     let cf = reporter.cf.as_mut().expect("CF section was inserted");
-    cf.server_id = options.server_id;
-    cf.secret = options.secret;
-    cf.url = options.worker_url;
-    cf.ext.config_version.clear();
+    let mut cf_changed = false;
+    if let Some(value) = options.server_id {
+        cf_changed |= cf.server_id != value;
+        cf.server_id = value;
+    }
+    if let Some(value) = options.secret {
+        cf_changed |= cf.secret != value;
+        cf.secret = value;
+    }
+    if let Some(value) = options.worker_url {
+        cf_changed |= cf.url != value;
+        cf.url = value;
+    }
     if let Some(value) = options.collect {
+        cf_changed |= cf.collect_interval != value;
         cf.collect_interval = value;
     }
+    if let Some(value) = options.wss_report_interval {
+        cf_changed |= cf.wss_report_interval != value;
+        cf.wss_report_interval = value;
+    }
     if let Some(value) = options.report_interval {
+        cf_changed |= cf.interval != value;
         cf.interval = value;
     }
     if let Some(value) = options.connection_mode {
+        cf_changed |= cf.connection_mode != value;
         cf.connection_mode = value;
     }
     if let Some(value) = options.reset_day {
+        cf_changed |= cf.reset_day != value;
         cf.reset_day = value;
     }
     if let Some(value) = options.interfaces {
-        cf.interface = value.join(",");
+        let value = value.join(",");
+        cf_changed |= cf.interface != value;
+        cf.interface = value;
     }
     for (name, target) in options.pings {
         let slot = match name.as_str() {
@@ -235,13 +247,24 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
             "bd" => &mut cf.bd,
             _ => bail!("unknown CF ping slot: {name}"),
         };
-        *slot = (!target.trim().is_empty()).then_some(target);
+        let value = (!target.trim().is_empty()).then_some(target);
+        cf_changed |= *slot != value;
+        *slot = value;
+    }
+    if cf_changed {
+        cf.ext.config_version.clear();
     }
     if let Some(value) = options.auto_update {
         config.auto_update.enabled = value;
     }
     if let Some(value) = options.update_channel {
         config.auto_update.channel = value;
+    }
+    for proxy in options.update_proxys {
+        let proxy = proxy.trim_end_matches('/').to_owned();
+        if !config.auto_update.proxys.contains(&proxy) {
+            config.auto_update.proxys.push(proxy);
+        }
     }
 
     config
@@ -261,6 +284,7 @@ fn new_cf_reporter(id: String) -> ReporterConfig {
             connection_mode: CfConnectionMode::Auto,
             interval: 60,
             collect_interval: 1,
+            wss_report_interval: 2,
             reset_day: 1,
             interface: String::new(),
             ct: None,
@@ -411,9 +435,16 @@ fn set_traffic_correction_with_clock(
     let ledger_path = config.net_static_path();
     let ledger = NetStatic::load_with_legacy_reporter(&ledger_path, Some(&options.reporter_id));
     let filter = IfaceFilter::new(&reporter.interfaces);
-    let now = calibrated_now.or_else(|| ledger.calibrated_time()).with_context(|| {
-        "cannot determine calibrated time for traffic correction; retry with NTP available or after the agent has persisted a calibrated sample"
-    })?;
+    let now = calibrated_now
+        .or_else(|| ledger.calibrated_time())
+        .unwrap_or_else(|| {
+            let local_now = crate::model::now_millis();
+            tracing::warn!(
+                local_now,
+                "no calibrated time is available for traffic correction; using the local system clock"
+            );
+            local_now
+        });
     let at = Local
         .timestamp_millis_opt(now)
         .single()
@@ -440,6 +471,11 @@ fn parse_positive_u64(flag: &str, raw: &str) -> Result<u64> {
     Ok(value)
 }
 
+fn parse_u64(flag: &str, raw: &str) -> Result<u64> {
+    raw.parse::<u64>()
+        .with_context(|| format!("invalid {flag}"))
+}
+
 fn parse_gib(flag: &str, raw: &str) -> Result<f64> {
     let value = raw
         .parse::<f64>()
@@ -458,12 +494,19 @@ fn parse_bool(flag: &str, raw: &str) -> Result<bool> {
     }
 }
 
+fn optional_nonempty(value: Option<String>, flag: &str) -> Result<Option<String>> {
+    value
+        .map(|value| {
+            if value.trim().is_empty() {
+                bail!("{flag} must not be empty");
+            }
+            Ok(value)
+        })
+        .transpose()
+}
+
 fn required_nonempty(value: Option<String>, flag: &str) -> Result<String> {
-    let value = value.with_context(|| format!("configure-cf requires {flag}"))?;
-    if value.trim().is_empty() {
-        bail!("{flag} must not be empty");
-    }
-    Ok(value)
+    optional_nonempty(value, flag)?.with_context(|| format!("configure command requires {flag}"))
 }
 
 fn validate_reporter_id(id: &str) -> Result<()> {
@@ -485,11 +528,12 @@ mod tests {
         ConfigureCfOptions {
             config_path: path.to_path_buf(),
             default_net_static_path: path.with_extension("json").display().to_string(),
-            server_id: "server".into(),
-            secret: "secret".into(),
-            worker_url: "https://example.com/update".into(),
-            reporter_id: None,
+            server_id: Some("server".into()),
+            secret: Some("secret".into()),
+            worker_url: Some("https://example.com/update".into()),
+            reporter_id: "cf".into(),
             collect: Some(2),
+            wss_report_interval: None,
             report_interval: Some(60),
             connection_mode: Some(CfConnectionMode::Http),
             reset_day: Some(20),
@@ -497,7 +541,7 @@ mod tests {
             pings: vec![("ct".into(), "ct.example.com:80".into())],
             auto_update: Some(true),
             update_channel: Some(UpdateChannel::Prerelease),
-            replace_cf: false,
+            update_proxys: Vec::new(),
         }
     }
 
@@ -527,10 +571,36 @@ mod tests {
     }
 
     #[test]
+    fn configure_parser_accepts_zero_collect_and_optional_credentials() {
+        let args = vec![
+            "--config".into(),
+            "config.toml".into(),
+            "--net-static-path".into(),
+            "net-static.json".into(),
+            "--collect".into(),
+            "0".into(),
+            "--wss-report-interval".into(),
+            "4".into(),
+        ];
+        let options = parse_configure_args(args.into_iter()).unwrap();
+        assert_eq!(options.reporter_id, "cf");
+        assert_eq!(options.collect, Some(0));
+        assert_eq!(options.wss_report_interval, Some(4));
+        assert!(options.server_id.is_none());
+        assert!(options.secret.is_none());
+        assert!(options.worker_url.is_none());
+    }
+
+    #[test]
     fn fresh_config_uses_cf_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        assert_eq!(configure_cf(options(&path)).unwrap(), "cf");
+        let mut install = options(&path);
+        install.update_proxys = vec![
+            "https://proxy.example/".into(),
+            "https://proxy.example".into(),
+        ];
+        assert_eq!(configure_cf(install).unwrap(), "cf");
         let config = config::load(&path).unwrap();
         let reporter = config.reporter("cf").unwrap();
         assert_eq!(reporter.intervals.collect, 2);
@@ -542,6 +612,18 @@ mod tests {
         assert_eq!(cf.ct.as_deref(), Some("ct.example.com:80"));
         assert!(config.auto_update.enabled);
         assert_eq!(config.auto_update.channel, UpdateChannel::Prerelease);
+        assert_eq!(config.auto_update.proxys, ["https://proxy.example"]);
+    }
+
+    #[test]
+    fn new_cf_reporter_still_requires_complete_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut install = options(&path);
+        install.secret = None;
+        let error = configure_cf(install).unwrap_err().to_string();
+        assert!(error.contains("requires --server-id, --secret and --url"));
+        assert!(!path.exists());
     }
 
     #[test]
@@ -563,7 +645,23 @@ mod tests {
         assert!(generator.starts_with("<!doctype html>"));
         assert!(generator.contains(r#"def: "user""#));
         assert!(generator.contains("https://monitor.example.com/update"));
-        assert!(generator.contains("安装器不会自动补路径"));
+        assert!(generator.contains("首次安装填写完整的 /update 地址"));
+    }
+
+    #[test]
+    fn cf_installer_keeps_supported_cli_compatibility_surface() {
+        let script = include_str!("../deploy/cf-install.sh");
+        for expected in [
+            "REPORTER_ID=cf",
+            "-no_start|-no-start) NO_START=true",
+            "-install-version|--install-version)",
+            "-install-ghproxy|--install-ghproxy)",
+            "--update-proxy \"$GH_PROXY\"",
+        ] {
+            assert!(script.contains(expected), "missing {expected}");
+        }
+        assert!(!script.contains("replace_cf"));
+        assert!(!script.contains("replace-cf"));
     }
 
     #[test]
@@ -571,6 +669,12 @@ mod tests {
         let script = include_str!("../deploy/komari-install.sh");
         assert!(script.contains(r#"[ -z "$VERSION" ] || [ "$VERSION" = latest ]"#));
         assert!(script.contains(r#"$RELEASE_BASE/latest/download/probe-rs-linux-$arch"#));
+        assert!(script.contains("--install-ghproxy)   GH_PROXY="));
+        assert!(!script
+            .lines()
+            .find(|line| line.starts_with("IGNORED_WITH_VALUE="))
+            .unwrap()
+            .contains("--install-ghproxy"));
     }
 
     #[test]
@@ -637,21 +741,23 @@ mod tests {
     }
 
     #[test]
-    fn implicit_id_updates_the_only_existing_cf_and_preserves_unspecified_fields() {
+    fn default_id_updates_cf_and_preserves_unspecified_fields() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut first = options(&path);
-        first.reporter_id = Some("primary".into());
         first.interfaces = Some(vec!["eth0".into()]);
         configure_cf(first).unwrap();
 
         let mut second = options(&path);
+        second.server_id = None;
+        second.secret = None;
+        second.worker_url = None;
         second.collect = None;
         second.reset_day = None;
         second.interfaces = None;
         second.pings.clear();
-        assert_eq!(configure_cf(second).unwrap(), "primary");
-        let reporter = config::load(&path).unwrap().reporter("primary").unwrap();
+        assert_eq!(configure_cf(second).unwrap(), "cf");
+        let reporter = config::load(&path).unwrap().reporter("cf").unwrap();
         assert_eq!(reporter.intervals.collect, 2);
         assert_eq!(reporter.reset_day, 20);
         assert_eq!(reporter.interfaces, vec!["eth0"]);
@@ -659,73 +765,26 @@ mod tests {
     }
 
     #[test]
-    fn multiple_cf_reporters_require_an_explicit_id() {
+    fn reporter_id_adds_or_updates_only_the_named_cf_reporter() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         for id in ["cf-a", "cf-b"] {
             let mut item = options(&path);
-            item.reporter_id = Some(id.into());
+            item.reporter_id = id.into();
             configure_cf(item).unwrap();
         }
-        let error = configure_cf(options(&path)).unwrap_err().to_string();
-        assert!(error.contains("multiple CF Reporters"));
-    }
+        let mut update = options(&path);
+        update.reporter_id = "cf-b".into();
+        update.server_id = None;
+        update.secret = None;
+        update.worker_url = None;
+        update.report_interval = Some(30);
+        assert_eq!(configure_cf(update).unwrap(), "cf-b");
 
-    #[test]
-    fn replace_cf_does_not_remove_other_protocols() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let mut config = LocalConfig {
-            schema: CONFIG_SCHEMA,
-            data_dir: dir.path().display().to_string(),
-            auto_update: AutoUpdateConfig::default(),
-            reporters: vec![
-                new_cf_reporter("old-a".into()),
-                new_cf_reporter("old-b".into()),
-            ],
-        };
-        for reporter in &mut config.reporters {
-            let cf = reporter.cf.as_mut().unwrap();
-            cf.server_id = "server".into();
-            cf.secret = "secret".into();
-            cf.url = "https://example.com/update".into();
-        }
-        config.reporters.push(ReporterConfig {
-            id: "probe".into(),
-            cf: None,
-            komari: None,
-            probe: Some(crate::model::ProbeSection {
-                server_id: "probe-server".into(),
-                secret: "probe-secret".into(),
-                worker_url: "https://example.com/report".into(),
-                report_interval: 60,
-                reset_day: 1,
-                report_errors: true,
-                report_self: false,
-                interfaces: Vec::new(),
-                disks: Vec::new(),
-                report_gpu: false,
-                intervals: Default::default(),
-                pings: Vec::new(),
-                ext: Default::default(),
-            }),
-        });
-        config::persist(&path, &config).unwrap();
-
-        let mut replacement = options(&path);
-        replacement.replace_cf = true;
-        assert_eq!(configure_cf(replacement).unwrap(), "cf");
         let config = config::load(&path).unwrap();
-        assert!(config.reporter("probe").is_some());
-        assert!(config.reporter("cf").is_some());
-        assert_eq!(
-            config
-                .reporter_specs()
-                .iter()
-                .filter(|reporter| reporter.protocol == ReporterProtocol::Cf)
-                .count(),
-            1
-        );
+        assert_eq!(config.reporter("cf-a").unwrap().intervals.report, 60);
+        assert_eq!(config.reporter("cf-b").unwrap().intervals.report, 30);
+        assert!(config.reporter("cf").is_none());
     }
 
     #[test]
@@ -823,6 +882,33 @@ mod tests {
                 calibrated.timestamp_millis(),
             ),
             (0, 0)
+        );
+    }
+
+    #[test]
+    fn first_install_correction_falls_back_to_local_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        configure_cf(options(&path)).unwrap();
+        set_traffic_correction_with_clock(
+            CorrectionOptions {
+                config_path: path.clone(),
+                reporter_id: "cf".into(),
+                rx_gib: Some(1.0),
+                tx_gib: Some(2.0),
+            },
+            None,
+        )
+        .unwrap();
+
+        let config = config::load(&path).unwrap();
+        let reporter = config.reporter("cf").unwrap();
+        let now = Local::now();
+        let period = netstatic::period_start_ms(reporter.reset_day, now);
+        let ledger = NetStatic::load(&config.net_static_path());
+        assert_eq!(
+            ledger.query_monthly("cf", &IfaceFilter::new(&[]), period, now.timestamp_millis(),),
+            (1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024)
         );
     }
 }

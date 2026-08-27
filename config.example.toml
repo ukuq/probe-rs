@@ -12,11 +12,13 @@ data_dir = "/var/lib/probe-rs"
 enabled = false
 channel = "stable" # stable | prerelease
 check_interval = 21600 # seconds; minimum 300
+proxys = [] # direct GitHub download first, then try these proxy prefixes in order
 
 # ----------------------------------------------------------------------
 # CF 上报线(命名对齐 cfsm-agent)
 #
-# 采集行为说明:collect_interval 参与全局采集周期合并(各路取最小);
+# 采集行为说明:collect_interval=0 时，auto 映射为 wss_report_interval，
+# http 映射为 interval；这里只定义当前 Reporter 的采集需求。
 # interface 参与全局网卡并集(任一路为空 = 全部);ct/cu/cm/bd 非空时
 # 各生成一个 TCP Ping 任务,按目标去重、周期取最小;CF 线固定启用 GPU。
 [[reporters]]
@@ -28,7 +30,8 @@ secret = "cf-api-secret"
 url = "https://monitor.example.com/update"
 connection_mode = "auto" # auto = WSS + POST fallback; http = POST only
 interval = 60          # 上报周期(原版 report_interval)
-collect_interval = 1   # 采集周期
+collect_interval = 0   # 0 = 不额外高频采集
+wss_report_interval = 2 # auto + collect_interval=0 时的实际采集周期
 reset_day = 1          # 流量统计月份重置日
 interface = ""         # 逗号分隔;空 = 全部默认物理网卡
 ct = "gd-ct-dualstack.ip.zstaticcdn.com:80"

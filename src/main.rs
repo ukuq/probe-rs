@@ -316,6 +316,7 @@ async fn main() -> Result<()> {
                 AGENT_VERSION.to_string(),
                 enabled,
                 spec.config_version.clone(),
+                spec.wss_report_interval.unwrap_or(2),
             );
             watch_task("cf-wss", handle);
             (Some(sender), Some(events))

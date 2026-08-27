@@ -425,6 +425,7 @@ impl ReporterRunner {
                 spec.protocol == ReporterProtocol::Cf
                     && spec.connection_mode == Some(CfConnectionMode::Auto),
                 &spec.config_version,
+                spec.wss_report_interval.unwrap_or(2),
             );
         }
     }
@@ -835,7 +836,7 @@ impl ReporterRunner {
             } else {
                 spec.config_version.clone()
             },
-            collect_interval: spec.intervals.collect,
+            collect_interval: spec.source_collect_interval,
             report_interval: spec.intervals.report,
             metrics,
             samples,
@@ -1122,7 +1123,8 @@ fn report_schedule_changed(previous: &ReporterSpec, current: &ReporterSpec) -> b
     previous.protocol != current.protocol
         || previous.intervals.report != current.intervals.report
         || (current.protocol == ReporterProtocol::Cf
-            && previous.connection_mode != current.connection_mode)
+            && (previous.connection_mode != current.connection_mode
+                || previous.wss_report_interval != current.wss_report_interval))
 }
 
 fn dynamic_traffic_window(record: &DynamicRecord, reset_day: u8) -> (i64, i64) {
@@ -1340,6 +1342,8 @@ mod tests {
             worker_url: "https://example.com/report".into(),
             config_version: String::new(),
             connection_mode: None,
+            wss_report_interval: None,
+            source_collect_interval: Intervals::default().collect,
             intervals: Intervals::default(),
             reset_day: 1,
             interfaces: vec![],
@@ -1398,6 +1402,10 @@ mod tests {
         let mut cf_http = cf.clone();
         cf_http.connection_mode = Some(CfConnectionMode::Http);
         assert!(report_schedule_changed(&cf, &cf_http));
+
+        let mut cf_wss_cadence = cf.clone();
+        cf_wss_cadence.wss_report_interval = Some(4);
+        assert!(report_schedule_changed(&cf, &cf_wss_cadence));
     }
 
     #[test]

@@ -175,6 +175,7 @@ data_dir = "$data_dir_esc"
 enabled = false
 channel = "stable"
 check_interval = 21600
+proxys = []
 
 [[reporters]]
 id = "primary"

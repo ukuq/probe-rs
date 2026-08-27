@@ -350,20 +350,13 @@ pub fn synthesize_remote(
 ) -> crate::model::RemoteConfig {
     crate::model::RemoteConfig {
         config_version: push.version.clone(),
-        intervals: push.collect.filter(|value| *value >= 1).map(|collect| {
-            crate::model::CollectionIntervals {
-                collect,
-                ping: current.ping,
-                slow: current.slow,
-                gpu: current.gpu,
-                ip: current.ip,
-                diskio: current.diskio,
-            }
-        }),
+        intervals: None,
+        cf_collect_interval: push.collect,
         report_interval: push
             .report
             .map(|value| value.max(1))
             .or_else(|| push.collect.is_some().then_some(current.report)),
+        wss_report_interval: push.wss_report_interval,
         connection_mode: push.connection_mode,
         reset_day: push.reset_day,
         interfaces: push.interface.as_ref().map(|s| {
@@ -506,7 +499,7 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
     for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
         match k.as_ref() {
             "collect_interval" => {
-                push.collect = v.parse::<u64>().ok().map(|n| n.max(1));
+                push.collect = v.parse::<u64>().ok();
                 has_config = true;
             }
             "report_interval" => {
@@ -785,7 +778,7 @@ mod tests {
         let r = parse_response_body(body, Some("5f4dcc3b"));
         let p = r.push.unwrap();
         assert_eq!(p.version, "5f4dcc3b");
-        assert_eq!(p.collect, Some(1)); // CF 的 0 输入兼容映射为内部 1 秒
+        assert_eq!(p.collect, Some(0));
         assert_eq!(p.report, Some(60));
         assert_eq!(p.wss_report_interval, Some(2));
         assert_eq!(p.reset_day, Some(15));
@@ -812,7 +805,9 @@ mod tests {
             connection_mode: Some(CfConnectionMode::Auto),
         };
         let remote = synthesize_remote(&push, &crate::model::Intervals::default(), &[]);
+        assert_eq!(remote.cf_collect_interval, Some(0));
         assert_eq!(remote.report_interval, Some(60));
+        assert_eq!(remote.wss_report_interval, Some(2));
         assert_eq!(remote.interfaces.unwrap(), vec!["eth0", "eth1", "bond*"]);
         assert!(remote.pings.is_none());
         assert_eq!(remote.connection_mode, Some(CfConnectionMode::Auto));

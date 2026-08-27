@@ -58,7 +58,7 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
         "pings": [ { "target": "tcp://gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 } ]
       },
       "reporters": [
-        { "id": "primary", "protocol": "probe", "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 }, "report_interval": 60, "reset_day": 1, "interfaces": ["eth*"], "disks": [], "report_gpu": true, "report_errors": true, "report_self": false, "pings": [ { "name": "ct", "type": "tcp", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 } ] }
+        { "id": "primary", "protocol": "probe", "source_collect_interval": 1, "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 }, "report_interval": 60, "reset_day": 1, "interfaces": ["eth*"], "disks": [], "report_gpu": true, "report_errors": true, "report_self": false, "pings": [ { "name": "ct", "type": "tcp", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 } ] }
       ],
       "reset_day": 1,
       "intervals": { "collect": 1, "report": 60, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
@@ -157,7 +157,7 @@ Agent 不修改系统时间。Agent 启动后会立即运行一次独立的 NTP 
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `global` | object | Agent 全局实际采集摘要：`{intervals, enable_gpu, interfaces, all_interfaces, disks, all_disks, pings}`；周期为各 Reporter 最小值，GPU 为 OR，选择项为并集；Ping 是无 name/type 的 `{target,interval}`，类型编码在规范化 URI target（如 `tcp://host:80`、`https://host:443`、`icmp://host`）中，并取各路最小 interval |
+| `global` | object | Agent 全局实际采集摘要：`{intervals, enable_gpu, interfaces, all_interfaces, disks, all_disks, pings}`；collect 为各 Reporter 映射周期的最大公约数，其他周期取最小值，GPU 为 OR，选择项为并集；Ping 是无 name/type 的 `{target,interval}`，类型编码在规范化 URI target（如 `tcp://host:80`、`https://host:443`、`icmp://host`）中，并取各路最小 interval |
 | `reporters` | array | 本机全部 Reporter 的脱敏摘要，字段见下；不含连接凭据、上报地址及其他线路身份，但会包含 Ping target |
 | `reset_day` | number | 0-31 |
 | `intervals` | object | {collect, report, ping, slow, gpu, ip, diskio}（秒） |
@@ -168,7 +168,7 @@ Agent 不修改系统时间。Agent 启动后会立即运行一次独立的 NTP 
 | `report_self` | boolean | 是否上报探针自身占用 kind:"self" |
 | `pings` | array | 当前 Reporter 的探测需求：`[{name, type: http|tcp|icmp, target, interval?}]`；HTTP target 仅允许 `http(s)://host[:port]`，所有类型均不允许 path/query/fragment |
 
-`reporters[]` 每项包含：`id`、`protocol`、`intervals`、`report_interval`、`reset_day`、`interfaces`、`disks`、`report_gpu`、`report_errors`、`report_self`、`pings`。`pings` 保留该 Reporter 自己的原始 `name`、`type`、`target` 和可选 `interval`。
+`reporters[]` 每项包含：`id`、`protocol`、`source_collect_interval`、可选的 `connection_mode` / `wss_report_interval`（仅 CF）、`intervals`、`report_interval`、`reset_day`、`interfaces`、`disks`、`report_gpu`、`report_errors`、`report_self`、`pings`。`source_collect_interval` 保留协议原值（CF 可为 0），`intervals.collect` 是映射后的实际需求；`pings` 保留该 Reporter 自己的原始 `name`、`type`、`target` 和可选 `interval`。
 
 安全边界：摘要不会回传 `secret`、`worker_url`，也不会回传其他线路的 `server_id` / `config_version`；Ping 的 `target` 属于配置核对信息，会按原值回传。当前上报线路仍由请求头 `X-Reporter-Id` / `X-Reporter-Protocol` 标识，同级旧字段仍表示当前 Reporter 的完整有效配置。
 
@@ -256,7 +256,7 @@ Ping 聚合规则：机器内部按“类型 + 规范化目标”去重，TCP �
 | 字段 | 约束 |
 |---|---|
 | `config_version` | 与 agent 当前版本**不等**才应用（幂等；人类可读时间戳无可靠大小语义，故用不等判断） |
-| `intervals` | 当前 Reporter 的六项采集需求（秒，均 >= 1）；应用后重新计算机器级最小周期 |
+| `intervals` | 当前 Reporter 的六项采集需求（秒，均 >= 1）；应用后 collect 参与机器级最大公约数聚合，其他周期取最小值 |
 | `report_interval` | 当前 Reporter 的上报间隔（秒），>= 1；与全局 collect 无任何关系约束 |
 | `reset_day` | 账期重置日 1-31；0 = 不重置 |
 | `interfaces` | 可选；网卡白名单（glob 数组，最多 32 项，超限整体拒绝） |
@@ -268,7 +268,7 @@ Ping 聚合规则：机器内部按“类型 + 规范化目标”去重，TCP �
 
 `config` 内除 `config_version` 外的字段均可选：出现的才应用，缺席的保持现值。响应只修改产生该响应的 Reporter，不会影响其他上报线路。
 
-落点随本地协议段不同：probe 段全量落地；cf 段只落 `intervals.collect`、`report_interval`、`reset_day`、`interfaces`、`pings`（仅 ct/cu/cm/bd），出现其他项整体拒绝；komari 协议没有下发通道。
+落点随本地协议段不同：probe 段全量落地；CF 原生响应可落 `collect_interval`（允许 0）、`report_interval`、`wss_report_interval`、`connection_mode`、`reset_day`、`interfaces`、`pings`（仅 ct/cu/cm/bd），出现其他项整体拒绝；komari 协议没有下发通道。
 
 `server_time`、`config`、`next` 都位于响应信封一级；`config` 缺席表示无配置变更。
 

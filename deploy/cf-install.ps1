@@ -28,6 +28,10 @@ param(
     [ValidateRange(0, 2147483647)]
     [int]$CollectInterval = 0,
 
+    [Alias("wss_report_interval", "wss-report-interval")]
+    [ValidateRange(1, 5)]
+    [int]$WssReportInterval = 2,
+
     [Alias("interval")]
     [ValidateRange(1, 2147483647)]
     [int]$ReportInterval = 60,
@@ -63,13 +67,10 @@ param(
 
     [Alias("reporter_id", "reporter-id")]
     [ValidatePattern('^[A-Za-z0-9_.-]+$')]
-    [string]$ReporterId,
-
-    [Alias("replace_cf", "replace-cf")]
-    [string]$ReplaceCf = "0",
+    [string]$ReporterId = "cf",
 
     [Alias("no_start", "no-start")]
-    [string]$NoStart = "0",
+    [switch]$NoStart,
 
     [Alias("install_version", "install-version")]
     [string]$InstallVersion = "v0.1.4-beta.4",
@@ -114,17 +115,36 @@ if ($Action -eq "uninstall") {
     exit
 }
 
-if ([string]::IsNullOrWhiteSpace($ServerId)) { throw "-Id is required." }
-if ([string]::IsNullOrWhiteSpace($Secret)) { throw "-Secret is required." }
-if ([string]::IsNullOrWhiteSpace($WorkerUrl)) { throw "-Url is required." }
-$parsedWorkerUrl = $null
-if (-not [Uri]::TryCreate($WorkerUrl, [UriKind]::Absolute, [ref]$parsedWorkerUrl) -or
-    $parsedWorkerUrl.Scheme -notin @("http", "https")) {
-    throw "-Url must be an absolute HTTP(S) URL."
+foreach ($requiredWhenPresent in @(
+        @{ Parameter = "ServerId"; Flag = "-Id"; Value = $ServerId },
+        @{ Parameter = "Secret"; Flag = "-Secret"; Value = $Secret },
+        @{ Parameter = "WorkerUrl"; Flag = "-Url"; Value = $WorkerUrl }
+    )) {
+    if ($PSBoundParameters.ContainsKey($requiredWhenPresent.Parameter) -and
+        [string]::IsNullOrWhiteSpace($requiredWhenPresent.Value)) {
+        throw "$($requiredWhenPresent.Flag) must not be empty."
+    }
+}
+if ($PSBoundParameters.ContainsKey("WorkerUrl")) {
+    $parsedWorkerUrl = $null
+    if (-not [Uri]::TryCreate($WorkerUrl, [UriKind]::Absolute, [ref]$parsedWorkerUrl) -or
+        $parsedWorkerUrl.Scheme -notin @("http", "https")) {
+        throw "-Url must be an absolute HTTP(S) URL."
+    }
+}
+if ($PSBoundParameters.ContainsKey("InstallGhProxy")) {
+    $parsedProxy = $null
+    if ([string]::IsNullOrWhiteSpace($InstallGhProxy) -or
+        -not [Uri]::TryCreate($InstallGhProxy, [UriKind]::Absolute, [ref]$parsedProxy) -or
+        $parsedProxy.Scheme -notin @("http", "https") -or
+        -not [string]::IsNullOrEmpty($parsedProxy.UserInfo) -or
+        -not [string]::IsNullOrEmpty($parsedProxy.Query) -or
+        -not [string]::IsNullOrEmpty($parsedProxy.Fragment)) {
+        throw "-InstallGhProxy must be an absolute HTTP(S) URL without credentials, query, or fragment."
+    }
 }
 
-$replaceCfEnabled = ConvertTo-Boolean $ReplaceCf "-ReplaceCf"
-$noStartEnabled = ConvertTo-Boolean $NoStart "-NoStart"
+$noStartEnabled = [bool]$NoStart
 $autoUpdateEnabled = $null
 if ($PSBoundParameters.ContainsKey("AutoUpdate")) {
     $autoUpdateEnabled = ConvertTo-Boolean $AutoUpdate "-AutoUpdate"
@@ -149,6 +169,8 @@ $temporaryBinary = $null
 $temporaryChecksums = $null
 try {
     $verifyReleaseAsset = $false
+    $proxyBinarySource = $null
+    $proxyChecksumSource = $null
     if ([string]::IsNullOrWhiteSpace($BinarySource)) {
         if ([string]::IsNullOrWhiteSpace($InstallVersion)) {
             throw "-InstallVersion must not be empty."
@@ -172,8 +194,8 @@ try {
         $checksumSource = "$releaseBase/SHA256SUMS"
         if (-not [string]::IsNullOrWhiteSpace($InstallGhProxy)) {
             $prefix = $InstallGhProxy.TrimEnd('/')
-            $BinarySource = "$prefix/$BinarySource"
-            $checksumSource = "$prefix/$checksumSource"
+            $proxyBinarySource = "$prefix/$BinarySource"
+            $proxyChecksumSource = "$prefix/$checksumSource"
         }
         $verifyReleaseAsset = $true
     }
@@ -191,28 +213,33 @@ try {
             "probe-rs-{0}.exe" -f [Guid]::NewGuid().ToString("N")
         )
         Write-Host "Downloading binary: $BinarySource"
-        Invoke-WebRequest -Uri $binaryUri -OutFile $temporaryBinary -UseBasicParsing
+        try {
+            Invoke-WebRequest -Uri $binaryUri -OutFile $temporaryBinary -UseBasicParsing
+        }
+        catch {
+            if ([string]::IsNullOrWhiteSpace($proxyBinarySource)) { throw }
+            Write-Warning "Direct binary download failed; trying proxy $InstallGhProxy"
+            Invoke-WebRequest -Uri $proxyBinarySource -OutFile $temporaryBinary -UseBasicParsing
+        }
         $resolvedBinary = $temporaryBinary
 
         if ($verifyReleaseAsset) {
             $temporaryChecksums = Join-Path ([IO.Path]::GetTempPath()) (
                 "probe-rs-sha-{0}.txt" -f [Guid]::NewGuid().ToString("N")
             )
-            if (-not [string]::IsNullOrWhiteSpace($InstallGhProxy)) {
+            if (-not [string]::IsNullOrWhiteSpace($proxyChecksumSource)) {
                 # Fetch the checksum directly from GitHub when possible: if the
                 # proxy delivers both binary and checksum, a compromised proxy
                 # can replace both and the check only catches transfer damage.
-                $directChecksum = "$releaseBase/SHA256SUMS"
                 try {
-                    Invoke-WebRequest -Uri $directChecksum -OutFile $temporaryChecksums -UseBasicParsing
-                    Write-Host "Checksum fetched directly from GitHub (binary via proxy)."
+                    Invoke-WebRequest -Uri $checksumSource -OutFile $temporaryChecksums -UseBasicParsing
                 }
                 catch {
                     Write-Warning (
                         "Direct SHA256SUMS download failed; falling back to proxy " +
                         "(checksum then only detects transfer corruption, not origin)."
                     )
-                    Invoke-WebRequest -Uri $checksumSource -OutFile $temporaryChecksums -UseBasicParsing
+                    Invoke-WebRequest -Uri $proxyChecksumSource -OutFile $temporaryChecksums -UseBasicParsing
                 }
             }
             else {
@@ -253,12 +280,22 @@ try {
         "configure-cf",
         "--config", $ConfigPath,
         "--net-static-path", $NetStaticPath,
-        "--server-id", $ServerId,
-        "--secret", $Secret,
-        "--url", $WorkerUrl
+        "--reporter-id", $ReporterId
     )
+    if ($PSBoundParameters.ContainsKey("ServerId")) {
+        $configureArgs += @("--server-id", $ServerId)
+    }
+    if ($PSBoundParameters.ContainsKey("Secret")) {
+        $configureArgs += @("--secret", $Secret)
+    }
+    if ($PSBoundParameters.ContainsKey("WorkerUrl")) {
+        $configureArgs += @("--url", $WorkerUrl)
+    }
     if ($PSBoundParameters.ContainsKey("CollectInterval")) {
-        $configureArgs += @("--collect", [Math]::Max(1, $CollectInterval).ToString())
+        $configureArgs += @("--collect", $CollectInterval.ToString())
+    }
+    if ($PSBoundParameters.ContainsKey("WssReportInterval")) {
+        $configureArgs += @("--wss-report-interval", $WssReportInterval.ToString())
     }
     if ($PSBoundParameters.ContainsKey("ReportInterval")) {
         $configureArgs += @("--report-interval", $ReportInterval.ToString())
@@ -288,11 +325,8 @@ try {
     if ($PSBoundParameters.ContainsKey("UpdateChannel")) {
         $configureArgs += @("--update-channel", $UpdateChannel)
     }
-    if ($PSBoundParameters.ContainsKey("ReporterId")) {
-        $configureArgs += @("--reporter-id", $ReporterId)
-    }
-    if ($replaceCfEnabled) {
-        $configureArgs += "--replace-cf"
+    if ($PSBoundParameters.ContainsKey("InstallGhProxy")) {
+        $configureArgs += @("--update-proxy", $InstallGhProxy)
     }
 
     $selectedOutput = @(& $InstalledBinary @configureArgs)

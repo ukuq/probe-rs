@@ -168,13 +168,23 @@ async fn check_and_apply(settings: &AutoUpdateConfig) -> Result<CheckOutcome> {
         "new release available"
     );
 
-    let checksum_data = download_limited(&client, &candidate.checksum_url, MAX_CHECKSUM_BYTES)
-        .await
-        .context("failed to download SHA256SUMS")?;
+    let checksum_data = download_with_proxys(
+        &client,
+        &candidate.checksum_url,
+        &settings.proxys,
+        MAX_CHECKSUM_BYTES,
+    )
+    .await
+    .context("failed to download SHA256SUMS")?;
     let expected = checksum_for_asset(&checksum_data, asset_name)?;
-    let binary = download_limited(&client, &candidate.binary_url, MAX_BINARY_BYTES)
-        .await
-        .with_context(|| format!("failed to download {asset_name}"))?;
+    let binary = download_with_proxys(
+        &client,
+        &candidate.binary_url,
+        &settings.proxys,
+        MAX_BINARY_BYTES,
+    )
+    .await
+    .with_context(|| format!("failed to download {asset_name}"))?;
     verify_sha256(&binary, &expected, asset_name)?;
 
     let suffix = if asset_name.ends_with(".exe") {
@@ -349,6 +359,46 @@ async fn download_limited(
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+/// Release assets always try the authenticated GitHub URL first. Configured
+/// proxy prefixes are fallbacks only, in declaration order.
+async fn download_with_proxys(
+    client: &reqwest::Client,
+    direct_url: &str,
+    proxys: &[String],
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let candidates = download_candidates(direct_url, proxys);
+    let mut failures = Vec::new();
+    for (index, url) in candidates.iter().enumerate() {
+        match download_limited(client, url, max_bytes).await {
+            Ok(bytes) => {
+                if index > 0 {
+                    tracing::info!(proxy = %proxys[index - 1], "release asset downloaded through fallback proxy");
+                }
+                return Ok(bytes);
+            }
+            Err(error) => {
+                tracing::warn!(url, %error, "release asset download attempt failed");
+                failures.push(format!("{url}: {error:#}"));
+            }
+        }
+    }
+    bail!(
+        "all release asset download attempts failed: {}",
+        failures.join("; ")
+    )
+}
+
+fn download_candidates(direct_url: &str, proxys: &[String]) -> Vec<String> {
+    std::iter::once(direct_url.to_owned())
+        .chain(
+            proxys
+                .iter()
+                .map(|proxy| format!("{}/{}", proxy.trim_end_matches('/'), direct_url)),
+        )
+        .collect()
 }
 
 fn validate_release_download_url(url: &str, tag: &str) -> Result<()> {
@@ -902,6 +952,25 @@ mod tests {
         let parsed = checksum_for_asset(sums.as_bytes(), "probe-rs-linux-x86_64").unwrap();
         verify_sha256(data, &parsed, "probe-rs-linux-x86_64").unwrap();
         assert!(verify_sha256(b"tampered", &parsed, "probe-rs-linux-x86_64").is_err());
+    }
+
+    #[test]
+    fn release_downloads_try_direct_then_configured_proxys_in_order() {
+        let direct = "https://github.com/ukuq/probe-rs/releases/download/v1.0.0/asset";
+        assert_eq!(
+            download_candidates(
+                direct,
+                &[
+                    "https://proxy-a.example/".into(),
+                    "https://proxy-b.example/prefix".into(),
+                ],
+            ),
+            vec![
+                direct.to_owned(),
+                format!("https://proxy-a.example/{direct}"),
+                format!("https://proxy-b.example/prefix/{direct}"),
+            ]
+        );
     }
 
     #[test]

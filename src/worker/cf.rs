@@ -39,6 +39,7 @@ struct Control {
     configured_enabled: bool,
     runtime_enabled: bool,
     config_md5: String,
+    configured_report_interval: Duration,
 }
 
 impl Control {
@@ -109,6 +110,7 @@ pub struct CfWsSender {
     control_tx: watch::Sender<Control>,
     connected_rx: watch::Receiver<bool>,
     in_flight_rx: watch::Receiver<Option<u64>>,
+    report_interval_tx: watch::Sender<Duration>,
     report_interval_rx: watch::Receiver<Duration>,
 }
 
@@ -136,17 +138,26 @@ impl CfWsSender {
         *self.report_interval_rx.borrow()
     }
 
-    pub fn set_config(&self, enabled: bool, config_md5: &str) {
+    pub fn set_config(&self, enabled: bool, config_md5: &str, report_interval_secs: u64) {
         let config_md5 = normalized_md5(config_md5);
-        self.control_tx.send_if_modified(|current| {
-            if current.configured_enabled == enabled && current.config_md5 == config_md5 {
+        let report_interval =
+            Duration::from_secs(report_interval_secs.max(1)).min(MAX_REPORT_INTERVAL);
+        let changed = self.control_tx.send_if_modified(|current| {
+            if current.configured_enabled == enabled
+                && current.config_md5 == config_md5
+                && current.configured_report_interval == report_interval
+            {
                 false
             } else {
                 current.configured_enabled = enabled;
                 current.config_md5.clone_from(&config_md5);
+                current.configured_report_interval = report_interval;
                 true
             }
         });
+        if changed {
+            self.report_interval_tx.send_replace(report_interval);
+        }
     }
 
     /// Temporarily gate WSS without changing the persisted connection mode.
@@ -186,6 +197,7 @@ pub fn spawn(
     agent_version: String,
     enabled: bool,
     config_md5: String,
+    report_interval_secs: u64,
 ) -> (
     CfWsSender,
     mpsc::Receiver<CfWsEvent>,
@@ -193,19 +205,23 @@ pub fn spawn(
 ) {
     let (payload_tx, payload_rx) = watch::channel(None);
     let (event_tx, event_rx) = mpsc::channel(32);
+    let configured_report_interval =
+        Duration::from_secs(report_interval_secs.max(1)).min(MAX_REPORT_INTERVAL);
     let (control_tx, control_rx) = watch::channel(Control {
         configured_enabled: enabled,
         runtime_enabled: true,
         config_md5: normalized_md5(&config_md5),
+        configured_report_interval,
     });
     let (connected_tx, connected_rx) = watch::channel(false);
     let (in_flight_tx, in_flight_rx) = watch::channel(None);
-    let (report_interval_tx, report_interval_rx) = watch::channel(DEFAULT_REPORT_INTERVAL);
+    let (report_interval_tx, report_interval_rx) = watch::channel(configured_report_interval);
     let sender = CfWsSender {
         payload_tx,
         control_tx,
         connected_rx,
         in_flight_rx,
+        report_interval_tx: report_interval_tx.clone(),
         report_interval_rx,
     };
     let task = tokio::spawn(run_actor(
@@ -263,7 +279,7 @@ async fn run_actor(
                 // connected flag allows the Reporter to publish a fresh one.
                 payload_rx.borrow_and_update();
                 in_flight_tx.send_replace(None);
-                report_interval_tx.send_replace(DEFAULT_REPORT_INTERVAL);
+                report_interval_tx.send_replace(control_rx.borrow().configured_report_interval);
                 connected_tx.send_replace(true);
                 let _ = event_tx.send(CfWsEvent::Connected).await;
                 tracing::info!(reporter_id, "CF WSS connected");
@@ -784,15 +800,17 @@ mod tests {
             configured_enabled: true,
             runtime_enabled: true,
             config_md5: "none".into(),
+            configured_report_interval: DEFAULT_REPORT_INTERVAL,
         });
         let (_connected_tx, connected_rx) = watch::channel(true);
         let (_in_flight_tx, in_flight_rx) = watch::channel(None);
-        let (_report_interval_tx, report_interval_rx) = watch::channel(DEFAULT_REPORT_INTERVAL);
+        let (report_interval_tx, report_interval_rx) = watch::channel(DEFAULT_REPORT_INTERVAL);
         let sender = CfWsSender {
             payload_tx,
             control_tx,
             connected_rx,
             in_flight_rx,
+            report_interval_tx,
             report_interval_rx,
         };
 
@@ -821,15 +839,17 @@ mod tests {
             configured_enabled: true,
             runtime_enabled: true,
             config_md5: "none".into(),
+            configured_report_interval: DEFAULT_REPORT_INTERVAL,
         });
         let (_connected_tx, connected_rx) = watch::channel(false);
         let (_in_flight_tx, in_flight_rx) = watch::channel(None);
-        let (_report_interval_tx, report_interval_rx) = watch::channel(DEFAULT_REPORT_INTERVAL);
+        let (report_interval_tx, report_interval_rx) = watch::channel(DEFAULT_REPORT_INTERVAL);
         let sender = CfWsSender {
             payload_tx,
             control_tx,
             connected_rx,
             in_flight_rx,
+            report_interval_tx,
             report_interval_rx,
         };
 
@@ -838,10 +858,11 @@ mod tests {
         assert!(!control_rx.borrow().enabled());
         assert!(control_rx.borrow().configured_enabled);
 
-        sender.set_config(false, "abc");
+        sender.set_config(false, "abc", 4);
+        assert_eq!(sender.report_interval(), Duration::from_secs(4));
         assert!(sender.set_runtime_enabled(true));
         assert!(!control_rx.borrow().enabled());
-        sender.set_config(true, "abc");
+        sender.set_config(true, "abc", 4);
         assert!(control_rx.borrow().enabled());
     }
 
@@ -851,6 +872,7 @@ mod tests {
             configured_enabled: true,
             runtime_enabled: true,
             config_md5: "none".into(),
+            configured_report_interval: DEFAULT_REPORT_INTERVAL,
         });
         let (_payload_tx, payload_rx) = watch::channel(None);
         let retry_wait = tokio::spawn(async move {
@@ -869,6 +891,7 @@ mod tests {
             configured_enabled: true,
             runtime_enabled: false,
             config_md5: "none".into(),
+            configured_report_interval: DEFAULT_REPORT_INTERVAL,
         });
         let (_payload_tx, payload_rx) = watch::channel(None);
         let disabled_wait = tokio::spawn(async move {

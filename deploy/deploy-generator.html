@@ -340,15 +340,17 @@ const SCRIPT_VERSION = "v0.1.4-beta.4";
 const FIELDS = {
   cf: [
     { sec: "连接信息", items: [
-      { k: "id",     label: "服务器 ID", arg: "-id",     ph: "cf-server-uuid", req: true, mono: true },
-      { k: "secret", label: "密钥 Secret", arg: "-secret", ph: "API secret",   req: true, mono: true },
-      { k: "url",    label: "上报地址 URL", arg: "-url",  ph: "https://monitor.example.com/update", req: true, mono: true,
-        hint: "填写完整的 /update 地址；安装器不会自动补路径" },
+      { k: "id",     label: "服务器 ID", arg: "-id",     ph: "首次安装必填；重装留空保持", mono: true },
+      { k: "secret", label: "密钥 Secret", arg: "-secret", ph: "首次安装必填；重装留空保持", mono: true },
+      { k: "url",    label: "上报地址 URL", arg: "-url",  ph: "https://monitor.example.com/update", mono: true,
+        hint: "首次安装填写完整的 /update 地址；重装留空保持现值" },
       { k: "connection_mode", label: "连接模式", arg: "-connection_mode", type: "select",
         opts: [["", "缺省（保持现状）"], ["auto", "auto（WSS + HTTP 回退）"], ["http", "http（仅 HTTP）"]] },
     ]},
     { sec: "采集与上报", items: [
-      { k: "collect",  label: "采样间隔（秒）", arg: "-collect_interval", num: true, ph: "缺省沿用默认", hint: "传 0 会被映射为 1" },
+      { k: "collect",  label: "采样间隔（秒）", arg: "-collect_interval", num: true, ph: "缺省保持现状", hint: "0 = 不额外高频采样；内部按连接模式映射实际周期" },
+      { k: "wss_interval", label: "WSS 上报间隔（秒）", arg: "-wss_report_interval", num: true, min: 1, max: 5, ph: "缺省 2",
+        hint: "1-5；auto + collect_interval=0 时映射为当前 Reporter 的实际采集周期" },
       { k: "interval", label: "上报间隔（秒）", arg: "-interval", num: true, ph: "缺省 60" },
       { k: "reset_day", label: "流量重置日", arg: "-reset_day", num: true, ph: "0-31，0 = 不重置" },
     ]},
@@ -370,13 +372,13 @@ const FIELDS = {
         opts: [["", "缺省（保持现状）"], ["1", "开启"], ["0", "关闭"]] },
       { k: "update_channel", label: "更新通道", arg: "-update_channel", type: "select",
         opts: [["", "缺省 stable"], ["stable", "stable"], ["prerelease", "prerelease"]] },
-      { k: "reporter_id", label: "Reporter ID", arg: "-reporter_id", ph: "缺省自动选择", mono: true,
+      { k: "reporter_id", label: "Reporter ID", arg: "-reporter_id", def: "cf", ph: "cf", mono: true,
         hint: "在已有配置中追加/更新指定 Reporter" },
       { k: "install_version", label: "安装版本", arg: "-install-version", ph: "缺省脚本内置 " + SCRIPT_VERSION, mono: true },
-      { k: "ghproxy", label: "GitHub 代理前缀", arg: "-install-ghproxy", ph: "https://mirror.example.com/", mono: true },
+      { k: "ghproxy", label: "GitHub 代理前缀", arg: "-install-ghproxy", ph: "https://mirror.example.com/", mono: true,
+        hint: "安装与自动更新均先直连，失败后再尝试代理" },
       { k: "bin", label: "自定义二进制来源", arg: "-bin", ph: "本地路径或 HTTP(S) URL", mono: true },
     ], flags: [
-      { k: "replace_cf", label: "替换全部 CF Reporter", arg: "-replace_cf=1", hint: "清除其他 CF Reporter 只留本次" },
       { k: "debug",      label: "调试日志", arg: "-debug=0/1", hint: "开启时添加 --debug；关闭时明确移除" },
       { k: "no_start",   label: "只装不启动", arg: "-no_start=1" },
     ]},
@@ -405,6 +407,8 @@ const FIELDS = {
       { k: "update_channel", label: "更新通道", arg: "--update-channel", type: "select", def: "stable",
         opts: [["stable", "stable（缺省）"], ["prerelease", "prerelease"]] },
       { k: "install_version", label: "安装版本", arg: "--install-version", ph: "缺省 latest", mono: true },
+      { k: "ghproxy", label: "GitHub 代理前缀", arg: "--install-ghproxy", ph: "https://mirror.example.com/", mono: true,
+        hint: "安装与自动更新均先直连，失败后再尝试代理" },
       { k: "bin", label: "自定义二进制来源", arg: "-bin=", ph: "本地路径或 HTTP(S) URL", mono: true },
     ]},
   ],
@@ -436,6 +440,8 @@ const FIELDS = {
         opts: [["0", "关闭（缺省）"], ["1", "开启"]] },
       { k: "update_channel", label: "更新通道", type: "select", def: "stable",
         opts: [["stable", "stable（缺省）"], ["prerelease", "prerelease"]] },
+      { k: "update_proxys", label: "更新代理", ph: "https://proxy-a.example,https://proxy-b.example", mono: true,
+        hint: "自动更新先直连 GitHub，失败后按顺序尝试这些代理前缀" },
       { k: "bin_path", label: "二进制路径", ph: "缺省 ../target/release/probe-rs", mono: true,
         hint: "install.sh 的第一个参数；原生模式用本地构建的二进制" },
     ]},
@@ -468,8 +474,11 @@ function renderForm(m) {
         ctrl = `<select data-k="${it.k}">${it.opts.map(([v, t]) =>
           `<option value="${esc(v)}"${String(vals[m][it.k]) === v ? " selected" : ""}>${esc(t)}</option>`).join("")}</select>`;
       } else {
+        const numericAttrs = it.num
+          ? ` min="${it.min !== undefined ? it.min : 0}"${it.max !== undefined ? ` max="${it.max}"` : ""} inputmode="numeric"`
+          : "";
         ctrl = `<input type="${it.num ? "number" : "text"}" data-k="${it.k}" value="${esc(vals[m][it.k])}"
-          placeholder="${esc(it.ph || "")}"${it.num ? ' min="0" inputmode="numeric"' : ""} spellcheck="false">`;
+          placeholder="${esc(it.ph || "")}"${numericAttrs} spellcheck="false">`;
       }
       const argName = it.arg || it.toml;
       return `<div class="row">
@@ -529,21 +538,17 @@ function tomlArr(csv) {
 function buildCF() {
   const v = vals.cf;
   const missing = [];
-  if (!v.id) missing.push("服务器 ID");
-  if (!v.secret) missing.push("密钥");
-  if (!v.url) missing.push("上报地址");
   const args = [];
   const push = (flag, val) => { if (val !== "" && val !== undefined && val !== null) args.push(`${flag}=${shq(val)}`); };
   push("-id", v.id); push("-secret", v.secret); push("-url", v.url);
   push("-connection_mode", v.connection_mode);
-  push("-collect_interval", v.collect); push("-interval", v.interval);
+  push("-collect_interval", v.collect); push("-wss_report_interval", v.wss_interval); push("-interval", v.interval);
   push("-reset_day", v.reset_day);
   push("-ct", v.ct); push("-cu", v.cu); push("-cm", v.cm); push("-bd", v.bd);
   push("-interface", v.interfaces);
   push("-auto_update", v.auto_update); push("-update_channel", v.update_channel);
   push("-rx_correction", v.rx_correction); push("-tx_correction", v.tx_correction);
   push("-reporter_id", v.reporter_id);
-  if (v.replace_cf) args.push("-replace_cf=1");
   args.push(`-debug=${v.debug ? "1" : "0"}`);
   if (v.no_start) args.push("-no_start=1");
   push("-install-version", v.install_version); push("-install-ghproxy", v.ghproxy); push("-bin", v.bin);
@@ -566,6 +571,7 @@ function buildKomari() {
   if (v.auto_update === "0") t.push("--disable-auto-update");
   if (v.update_channel && v.update_channel !== "stable") t.push("--update-channel", shq(v.update_channel));
   if (v.install_version) t.push("--install-version", shq(v.install_version));
+  if (v.ghproxy) t.push("--install-ghproxy", shq(v.ghproxy));
   if (v.bin) t.push("-bin=" + shq(v.bin));
   return { missing, args: t };
 }
@@ -592,6 +598,7 @@ data_dir = ${tomlStr(dataDir)}
 enabled = ${v.auto_update === "1"}
 channel = ${tomlStr(v.update_channel || "stable")}
 check_interval = 21600
+proxys = ${tomlArr(v.update_proxys)}
 
 [[reporters]]
 id = ${tomlStr(v.reporter_id || "primary")}
@@ -733,6 +740,7 @@ function parseCF(rawText) {
   const alias = {
     id: "id", secret: "secret", url: "url",
     collect_interval: "collect", collect: "collect",
+    wss_report_interval: "wss_interval", "wss-report-interval": "wss_interval",
     interval: "interval",
     connection_mode: "connection_mode", "connection-mode": "connection_mode",
     reset_day: "reset_day",
@@ -742,30 +750,36 @@ function parseCF(rawText) {
     update_channel: "update_channel", "update-channel": "update_channel",
     rx_correction: "rx_correction", tx_correction: "tx_correction",
     reporter_id: "reporter_id", "reporter-id": "reporter_id",
-    replace_cf: "replace_cf", "replace-cf": "replace_cf",
     debug: "debug", no_start: "no_start", "no-start": "no_start",
     "install-version": "install_version", "install-ghproxy": "ghproxy", bin: "bin",
   };
-  const re = /-{1,2}([A-Za-z0-9_-]+)=("[^"]*"|'[^']*'|\S*)/g;
-  let m;
-  while ((m = re.exec(rawText)) !== null) {
+  const tokens = tokenize(rawText);
+  for (let i = 0; i < tokens.length; i++) {
+    const m = tokens[i].match(/^-{1,2}([A-Za-z0-9_-]+)(?:=(.*))?$/);
+    if (!m) continue;
     const key = alias[m[1]];
     if (!key) continue;
     let val = m[2];
+    if (val === undefined) {
+      if (key === "no_start") val = "1";
+      else if (i + 1 < tokens.length && !tokens[i + 1].startsWith("-")) val = tokens[++i];
+      else continue;
+    }
     if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
     map[key] = val;
   }
-  if (!map.id && !map.secret && !map.url) return null;
+  const cfCommand = /(?:cf-install\.sh|huilang-me\/cfsm-agent)/i.test(rawText);
+  const cfSpecific = ["id","secret","url","collect","wss_interval","connection_mode","reset_day","ct","cu","cm","bd","rx_correction","tx_correction"].some(k => map[k] !== undefined);
+  if (!cfCommand && !cfSpecific) return null;
   const v = modeDefaults("cf");
   v.scope = /\|\s*sudo\s+(?:sh|bash)\b/.test(rawText) ? "system" : "user";
-  for (const k of ["id","secret","url","collect","interval","connection_mode","reset_day","ct","cu","cm","bd",
+  for (const k of ["id","secret","url","collect","wss_interval","interval","connection_mode","reset_day","ct","cu","cm","bd",
                    "interfaces","auto_update","update_channel","rx_correction","tx_correction","reporter_id",
                    "install_version","ghproxy","bin"]) {
     if (map[k] !== undefined) v[k] = map[k];
   }
   if (map.debug !== undefined) v.debug = map.debug === "1" || map.debug === "true";
   if (map.no_start !== undefined) v.no_start = map.no_start === "1" || map.no_start === "true";
-  if (map.replace_cf !== undefined) v.replace_cf = map.replace_cf === "1" || map.replace_cf === "true";
   vals.cf = v;
   return Object.keys(map);
 }
@@ -779,6 +793,7 @@ function parseKomari(tokens) {
     "--month-rotate": "month_rotate",
     "--include-nics": "include_nics",
     "--install-version": "install_version",
+    "--install-ghproxy": "ghproxy",
     "--reporter-id": "reporter_id",
     "--update-channel": "update_channel",
   };

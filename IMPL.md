@@ -112,7 +112,7 @@ probe-rs/
 ### 3.8 配置热加载
 
 - main 里 3s 轮询配置文件 mtime；变更后由 `SharedConfig::update_local_from_disk` 持写锁读取、校验并提交同一文件快照，失败保持原配置。远端落盘和本地热加载因此不会发生“旧文件快照覆盖新内存配置”的竞态。
-- 每个 Reporter 的 `intervals/interfaces/disks/pings/report_gpu` 经热加载即时生效；实际周期取最小值、GPU 取 OR，选择项取并集。
+- 每个 Reporter 的 `intervals/interfaces/disks/pings/report_gpu` 经热加载即时生效；基础 collect 取最大公约数，其他 worker 周期取最小值，GPU 取 OR，选择项取并集。
 - 聚合后的 `pings` / GPU 开关变更时重建对应 worker：channel 在 main 创建一次，任务可中止重建，scheduler 无感。
 
 ### 3.9 优雅退出
@@ -125,6 +125,7 @@ probe-rs/
 - `[auto_update] enabled=false` 默认关闭；`stable` 只读取正式 Release，`prerelease` 同时接受预发布版及之后更高的正式版。
 - 仅当远端版本按 SemVer precedence 严格大于编译版本时更新；draft、缺少当前平台资产或缺少 `SHA256SUMS` 的 Release 均跳过。
 - GitHub 仓库、下载路径和平台资产名编译期固定；二进制下载后必须通过 Release 附带的 SHA-256 校验。
+- `[auto_update].proxys` 是代理前缀数组；Release 资产始终先直连，失败后才按数组顺序尝试代理。GitHub Releases API 仍保持直连。CF/Komari 安装器的 `install-ghproxy` 同样只作安装下载兜底，并追加到该数组供后续自动更新使用。
 - Linux 原子替换后由 systemd `Restart=always` 拉起；Windows 使用新版 helper 等旧 Agent 退出后重新运行计划任务（等待超时会安全失败、不会双 Agent 并存），托盘 companion 单独替换、会话内替换需下次登录生效。
 - GitHub/API/下载/校验失败只记日志，不中断采集和上报；检查周期最低 300 秒，默认 6 小时。
 
@@ -210,9 +211,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\deploy\install.ps1 ins
 
 agent 可切换为 CF-Server-Monitor 的 `/update` 协议（HTTP POST 或 WSS，适配官方服务端，零改动对接）。
 
-**配置**：`[reporters.cf]` 段，命名对齐 cfsm-agent：`server_id` 填 CF 后台分配的 UUID，`secret` 填 `API_SECRET`，`url` 填 `https://<worker>/update`；`interval`（上报周期）、`collect_interval`、`reset_day`、`interface`、`ct/cu/cm/bd` 同原版语义。`connection_mode=auto` 使用 WSS，并在 WSS 不可用时按原上报周期 POST 兜底；`connection_mode=http` 只使用 HTTP POST。连接模式支持本地配置和远端下发热切换。校正回路固定启用，上报固定 samples[] 批量；旧 `ext.cf.connection_mode` 会迁移到直属字段，旧 `ext.cf.correction/batch` 开关已删除。
+**配置**：`[reporters.cf]` 段，命名对齐 cfsm-agent：`server_id` 填 CF 后台分配的 UUID，`secret` 填 `API_SECRET`，`url` 填 `https://<worker>/update`；`interval`（HTTP 上报周期）、`collect_interval`、`wss_report_interval`、`reset_day`、`interface`、`ct/cu/cm/bd` 同原版语义。`connection_mode=auto` 使用 WSS，并在 WSS 不可用时按原上报周期 POST 兜底；`connection_mode=http` 只使用 HTTP POST。`collect_interval=0` 原值保留，对外仍上报 0；映射当前 CF Reporter 的采集需求时，auto 映射为 `wss_report_interval`，http 映射为 `interval`。连接模式支持本地配置和远端下发热切换。校正回路固定启用，上报固定 samples[] 批量；旧 `ext.cf.connection_mode` 会迁移到直属字段，旧 `ext.cf.correction/batch` 开关已删除。
 
-Windows 使用同一套 CF 协议逻辑；CF 一键安装默认启用 GPU 采集（无 `nvidia-smi` 时记录诊断但不影响其他指标）。可在管理员 PowerShell 中直接一键安装（`CollectInterval=0` 同样映射为内部 1 秒）：
+Windows 使用同一套 CF 协议逻辑；CF 一键安装默认启用 GPU 采集（无 `nvidia-smi` 时记录诊断但不影响其他指标）。可在管理员 PowerShell 中直接一键安装；首次安装必须提供连接三项，重装同一 `ReporterId` 时可省略并保留旧值：
 
 ```powershell
 .\deploy\cf-install.ps1 install -Id <UUID> -Secret <API_SECRET> `
@@ -223,11 +224,11 @@ Windows 使用同一套 CF 协议逻辑；CF 一键安装默认启用 GPU 采集
 
 **上报映射**（reporter_cf.rs）：顶层 `{id, secret, config_schema, config_md5, collect_interval, report_interval, metrics, samples[]}`；ram/swap/disk 字节→MB；load 转空格字符串；GPU → `gpu_info:[{id,name,info}]`（`id` 来自采集端稳定设备标识，显存/温度丢弃，利用率未知的设备不输出）；ping 按组名落 `ping_ct/cu/cm/bd` + `loss_*`（bgp 是 bd 别名，未配置为 `false`，已配置但失败或缓存过期为 `null`）；`ip_v4/v6` 不可达报数值 `0`；`dynamic[]` → `samples[]`。顶层 dynamic/slow/GPU/Ping/disk I/O 快照按各自采集周期与上报周期校验新鲜度，过期字段不再输出；带 `ts` 的 `samples[]` 仍保留历史批量语义，report 不会触发采集。errors/self/virtualization 无落点，CF 模式下不产生。
 
-**WSS 上报**：`auto` 模式把 `https/http` 的 `worker_url` 映射为 `wss/ws`，保留路径和业务查询参数，并用 query + Header 携带 Schema 5 和配置 MD5。握手必须收到 `type=hello, protocol=update`；连接建立或重连后先用 2 秒默认节奏发布与 POST 相同的最新 JSON 文本，随后接受 ACK 或 `realtimeHint` 的 `nextWssReportAfterMs` 动态调整到 1 秒至 5 分钟。无人查看面板时可按服务端提示降频，前端恢复实时订阅时由 hint 立即缩短间隔；hint 只改节奏，不推进 journal 游标。发送槽使用 `watch` 单值覆盖：socket 暂时变慢时只保留最新帧，不会堆积；被覆盖帧的 journal 游标不会提前推进，其记录会合并进替代帧。写出的帧只保留紧凑的游标元数据，后台收到对应 ACK 后才推进 journal；因此 ACK 决定数据确认，但不阻塞下一次发送。从最老未确认报告起连续 15 秒没有 ACK，或单次 socket 写入超过 5 秒，会主动关闭半开连接，随后停止 WSS 发布、按 `report_interval` POST 兜底并重连。`config` 和 `remote_config` 帧也由后台读循环独立处理，其中配置仍按 MD5 幂等校验和原子落盘。普通网络错误按 60 秒到 5 分钟指数退避；认证或配置类 `type=error` 策略帧会同时暂停 WSS 重连和 POST 至少 120 秒。CF 2.8.4 Beta7+ 的 WSS 时段关闭信号是例外：握手 HTTP `409`、`error code=409` 或 close code `1013` 仅在 reason 为 `wss_schedule_inactive` / `wss_schedule_empty` 时临时关闭运行时 WSS，保持本地 `connection_mode=auto` 并按 `report_interval` POST；后续 POST 响应头 `X-Agent-Wss-Mode: active` 会立即解除临时开关并唤醒 WSS actor。配置 body 的 `connection_mode` 字段会应用并持久化到对应 CF Reporter；切换到 `http` 会停用 WSS actor，切回 `auto` 会重新唤醒。
+**WSS 上报**：`auto` 模式把 `https/http` 的 `worker_url` 映射为 `wss/ws`，保留路径和业务查询参数，并用 query + Header 携带 Schema 5 和配置 MD5。握手必须收到 `type=hello, protocol=update`；连接建立或重连后先用持久化的 `wss_report_interval`（缺省 2 秒）发布与 POST 相同的最新 JSON 文本，随后接受 ACK 或 `realtimeHint` 的 `nextWssReportAfterMs` 动态调整到 1 秒至 5 分钟。无人查看面板时可按服务端提示降频，前端恢复实时订阅时由 hint 立即缩短间隔；hint 只改节奏，不推进 journal 游标。发送槽使用 `watch` 单值覆盖：socket 暂时变慢时只保留最新帧，不会堆积；被覆盖帧的 journal 游标不会提前推进，其记录会合并进替代帧。写出的帧只保留紧凑的游标元数据，后台收到对应 ACK 后才推进 journal；因此 ACK 决定数据确认，但不阻塞下一次发送。从最老未确认报告起连续 15 秒没有 ACK，或单次 socket 写入超过 5 秒，会主动关闭半开连接，随后停止 WSS 发布、按 `report_interval` POST 兜底并重连。`config` 和 `remote_config` 帧也由后台读循环独立处理，其中配置仍按 MD5 幂等校验和原子落盘。普通网络错误按 60 秒到 5 分钟指数退避；认证或配置类 `type=error` 策略帧会同时暂停 WSS 重连和 POST 至少 120 秒。CF 2.8.4 Beta7+ 的 WSS 时段关闭信号是例外：握手 HTTP `409`、`error code=409` 或 close code `1013` 仅在 reason 为 `wss_schedule_inactive` / `wss_schedule_empty` 时临时关闭运行时 WSS，保持本地 `connection_mode=auto` 并按 `report_interval` POST；后续 POST 响应头 `X-Agent-Wss-Mode: active` 会立即解除临时开关并唤醒 WSS actor。配置 body 的 `connection_mode` 字段会应用并持久化到对应 CF Reporter；切换到 `http` 会停用 WSS actor，切回 `auto` 会重新唤醒。
 
-**配置下发**：请求头升级为 `X-Agent-Config-Schema: 5` + `X-Agent-Config-Md5`（复用 `config_version` 字段存 MD5，空 = `none`）。POST 响应或 WSS ack/config 帧中的 URL-encoded body 会解析 collect_interval/report_interval/wss_report_interval/reset_day/custom_ct/cu/cm/bd/interface/connection_mode，合成 `RemoteConfig`（config_version 取响应/帧 MD5）走 `apply_remote_for`；`wss_report_interval` 参与 Schema 5 配置识别和无 MD5 版本指纹，实际每帧节奏以 `nextWssReportAfterMs` 为准。`collect=0` 兼容映射为当前 CF Reporter 的 1 秒采集需求，随后参与机器级最小值聚合；逗号分隔的 interface 拆成多个过滤项。`custom_*` 字段缺席时保留对应 Ping，出现空值时清除；非空值只替换对应线路并保留原 interval，`bd` 兼容旧名 `bgp`，HTTP(S) URL 推断为 HTTP 探测，其余按 TCP 探测。落点限制：cf 段只能落 `collect_interval`/`interface`/`ct/cu/cm/bd`/`interval`（上报周期）/`reset_day`/`connection_mode`，远端推送其他可下发项（非 collect 子间隔、非空 disks、`report_gpu=false`、非四大线路 Ping 名）时整体拒绝。
+**配置下发**：请求头升级为 `X-Agent-Config-Schema: 5` + `X-Agent-Config-Md5`（复用 `config_version` 字段存 MD5，空 = `none`）。POST 响应或 WSS ack/config 帧中的 URL-encoded body 会解析 collect_interval/report_interval/wss_report_interval/reset_day/custom_ct/cu/cm/bd/interface/connection_mode，合成 `RemoteConfig`（config_version 取响应/帧 MD5）走 `apply_remote_for`；`collect_interval=0` 与 `wss_report_interval` 都会原值持久化，实际每帧节奏仍可由 `nextWssReportAfterMs` 临时覆盖。当前 CF Reporter 的采集需求按连接模式映射：auto 使用 WSS 周期，http 使用 HTTP 上报周期；逗号分隔的 interface 拆成多个过滤项。`custom_*` 字段缺席时保留对应 Ping，出现空值时清除；非空值只替换对应线路并保留原 interval，`bd` 兼容旧名 `bgp`，HTTP(S) URL 推断为 HTTP 探测，其余按 TCP 探测。落点限制：cf 段只能落 `collect_interval`/`interface`/`ct/cu/cm/bd`/`interval`（上报周期）/`wss_report_interval`/`reset_day`/`connection_mode`，远端推送其他可下发项（非 collect 子间隔、非空 disks、`report_gpu=false`、非四大线路 Ping 名）时整体拒绝。
 
-**流量校正**：响应尾部 `rx_correction/tx_correction`（GB，覆盖当月累计）。netstatic 记账期偏移（offset = 校正字节 − 原始月累计，period_start 匹配才生效，翻页自动失效），立即落盘；校正确认用**独立请求**回传（CF 服务端见到 correction 字段会把整个请求当确认、丢弃 metrics），服务端清空后停止。`update=1`（自升级）永远忽略。
+**流量校正**：响应尾部 `rx_correction/tx_correction`（GB，覆盖当月累计）。netstatic 记账期偏移（offset = 校正字节 − 原始月累计，period_start 匹配才生效，翻页自动失效），立即落盘；本地安装校正优先使用新 NTP 或账本已有校准时间，两者都不可用时记录告警并回退本机墙钟，避免首次离线安装失败。校正确认用**独立请求**回传（CF 服务端见到 correction 字段会把整个请求当确认、丢弃 metrics），服务端清空后停止。`update=1`（自升级）永远忽略。
 
 ## komari 协议模式（`[reporters.komari]` 段）
 

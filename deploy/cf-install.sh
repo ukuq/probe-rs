@@ -63,7 +63,8 @@ usage() {
         '       sh cf-install.sh uninstall [--purge]' \
         '' \
         'CF-compatible options:' \
-        '  -collect_interval= / -collect=       collection seconds (0 maps to 1)' \
+        '  -collect_interval= / -collect=       collection seconds (0 keeps CF compatibility)' \
+        '  -wss_report_interval=                WSS report seconds (1-5; default/preserved: 2)' \
         '  -interval=                           report seconds' \
         '  -connection_mode=                    auto (WSS + fallback) / http' \
         '  -reset_day=                          0-31' \
@@ -72,13 +73,12 @@ usage() {
         '  -auto_update= / -auto-update=        0/1' \
         '  -rx_correction= -tx_correction=      current billing-period totals in GiB' \
         '  -debug=                              0/1' \
-        '  -install-version=                    release tag (default: script version)' \
-        '  -install-ghproxy=                    GitHub proxy URL prefix' \
-        '  -no_start= / -no-start=              0/1' \
+        '  -install-version[=]                   release tag (default: script version)' \
+        '  -install-ghproxy[=]                   GitHub proxy URL prefix; persisted as update fallback' \
+        '  -no_start / -no-start[=0|1]          install without starting' \
         '' \
         'probe-rs options:' \
-        '  -reporter_id= / --reporter-id=       upsert one CF Reporter' \
-        '  -replace_cf=                         replace all CF Reporters only' \
+        '  -reporter_id= / --reporter-id=       upsert one CF Reporter (default: cf)' \
         '  -update_channel=                     stable/prerelease' \
         '  -bin=                                local path or HTTP(S) binary URL'
 }
@@ -123,22 +123,26 @@ case "$COMMAND" in
 esac
 
 ID= SECRET= URL= BIN=
-COLLECT= REPORT= RESET_DAY= INTERFACES= CONNECTION_MODE=
+COLLECT= WSS_REPORT= REPORT= RESET_DAY= INTERFACES= CONNECTION_MODE=
 CT= CU= CM= BD=
 AUTO_UPDATE= UPDATE_CHANNEL= RX_CORRECTION= TX_CORRECTION=
-REPORTER_ID= INSTALL_VERSION=$SCRIPT_VERSION GH_PROXY=
-DEBUG=false NO_START=false REPLACE_CF=false
-COLLECT_SET=false REPORT_SET=false RESET_SET=false INTERFACES_SET=false CONNECTION_MODE_SET=false
+REPORTER_ID=cf INSTALL_VERSION=$SCRIPT_VERSION GH_PROXY=
+DEBUG=false NO_START=false
+ID_SET=false SECRET_SET=false URL_SET=false
+COLLECT_SET=false WSS_REPORT_SET=false REPORT_SET=false RESET_SET=false INTERFACES_SET=false CONNECTION_MODE_SET=false
 CT_SET=false CU_SET=false CM_SET=false BD_SET=false
-AUTO_UPDATE_SET=false UPDATE_CHANNEL_SET=false REPORTER_ID_SET=false
+AUTO_UPDATE_SET=false UPDATE_CHANNEL_SET=false
 RX_SET=false TX_SET=false DEBUG_SET=false
 
-for arg in "$@"; do
+while [ "$#" -gt 0 ]; do
+    arg=$1
+    shift
     case "$arg" in
-        -id=*) ID=${arg#*=} ;;
-        -secret=*) SECRET=${arg#*=} ;;
-        -url=*) URL=${arg#*=} ;;
+        -id=*) ID=${arg#*=}; ID_SET=true ;;
+        -secret=*) SECRET=${arg#*=}; SECRET_SET=true ;;
+        -url=*) URL=${arg#*=}; URL_SET=true ;;
         -collect_interval=*|-collect=*) COLLECT=${arg#*=}; COLLECT_SET=true ;;
+        -wss_report_interval=*|-wss-report-interval=*) WSS_REPORT=${arg#*=}; WSS_REPORT_SET=true ;;
         -interval=*) REPORT=${arg#*=}; REPORT_SET=true ;;
         -connection_mode=*|-connection-mode=*) CONNECTION_MODE=${arg#*=}; CONNECTION_MODE_SET=true ;;
         -reset_day=*) RESET_DAY=${arg#*=}; RESET_SET=true ;;
@@ -157,11 +161,7 @@ for arg in "$@"; do
         -rx_correction=*) RX_CORRECTION=${arg#*=}; RX_SET=true ;;
         -tx_correction=*) TX_CORRECTION=${arg#*=}; TX_SET=true ;;
         -reporter_id=*|--reporter-id=*)
-            REPORTER_ID=${arg#*=}; REPORTER_ID_SET=true
-            ;;
-        -replace_cf=*|--replace-cf=*)
-            REPLACE_CF=${arg#*=}
-            parse_bool REPLACE_CF "$REPLACE_CF" "replace_cf"
+            REPORTER_ID=${arg#*=}
             ;;
         -debug=*)
             DEBUG=${arg#*=}; DEBUG_SET=true
@@ -171,21 +171,35 @@ for arg in "$@"; do
             NO_START=${arg#*=}
             parse_bool NO_START "$NO_START" "no_start"
             ;;
+        -no_start|-no-start) NO_START=true ;;
         -install-version=*|--install-version=*) INSTALL_VERSION=${arg#*=} ;;
+        -install-version|--install-version)
+            [ "$#" -gt 0 ] || die "$arg requires a value"
+            INSTALL_VERSION=$1
+            shift
+            ;;
         -install-ghproxy=*|--install-ghproxy=*) GH_PROXY=${arg#*=} ;;
+        -install-ghproxy|--install-ghproxy)
+            [ "$#" -gt 0 ] || die "$arg requires a value"
+            GH_PROXY=$1
+            shift
+            ;;
         -bin=*|--bin=*) BIN=${arg#*=} ;;
         *) die "unknown option: $arg" ;;
     esac
 done
 
-[ -n "$ID" ] || die "missing -id="
-[ -n "$SECRET" ] || die "missing -secret="
-[ -n "$URL" ] || die "missing -url="
+[ "$ID_SET" = false ] || [ -n "$ID" ] || die "id must not be empty"
+[ "$SECRET_SET" = false ] || [ -n "$SECRET" ] || die "secret must not be empty"
+[ "$URL_SET" = false ] || [ -n "$URL" ] || die "url must not be empty"
 require_service_manager
 
 if [ "$COLLECT_SET" = true ]; then
     COLLECT=$(normalize_uint collect_interval "$COLLECT")
-    [ "$COLLECT" -gt 0 ] || COLLECT=1
+fi
+if [ "$WSS_REPORT_SET" = true ]; then
+    WSS_REPORT=$(normalize_uint wss_report_interval "$WSS_REPORT")
+    [ "$WSS_REPORT" -ge 1 ] && [ "$WSS_REPORT" -le 5 ] || die "wss_report_interval must be between 1 and 5"
 fi
 if [ "$REPORT_SET" = true ]; then
     REPORT=$(normalize_uint interval "$REPORT")
@@ -198,11 +212,16 @@ if [ "$RESET_SET" = true ]; then
     RESET_DAY=$(normalize_uint reset_day "$RESET_DAY")
     [ "$RESET_DAY" -le 31 ] || die "reset_day must be between 0 and 31"
 fi
-if [ "$REPORTER_ID_SET" = true ]; then
-    case "$REPORTER_ID" in ''|*[!A-Za-z0-9_.-]*) die "invalid reporter_id" ;; esac
-fi
+case "$REPORTER_ID" in ''|*[!A-Za-z0-9_.-]*) die "invalid reporter_id" ;; esac
 if [ "$UPDATE_CHANNEL_SET" = true ]; then
     case "$UPDATE_CHANNEL" in stable|prerelease) ;; *) die "invalid update_channel" ;; esac
+fi
+if [ -n "$GH_PROXY" ]; then
+    case "$GH_PROXY" in http://*|https://*) ;; *) die "install-ghproxy must be an absolute HTTP(S) URL" ;; esac
+    case "$GH_PROXY" in *'?'*|*'#'*|http://*@*|https://*@*)
+        die "install-ghproxy must not contain credentials, a query string, or a fragment"
+        ;;
+    esac
 fi
 if [ "$DEBUG_SET" = false ] && [ -f "$UNIT_DST" ] && grep -q ' --debug' "$UNIT_DST"; then
     DEBUG=true
@@ -251,8 +270,8 @@ if [ -z "$BIN" ]; then
     BIN=$release_base/$asset
     SUM_URL=$release_base/SHA256SUMS
     if [ -n "$GH_PROXY" ]; then
-        BIN=${GH_PROXY%/}/$BIN
-        SUM_URL=${GH_PROXY%/}/$SUM_URL
+        PROXY_BIN=${GH_PROXY%/}/$BIN
+        PROXY_SUM_URL=${GH_PROXY%/}/$SUM_URL
     fi
 fi
 
@@ -261,23 +280,25 @@ if [ -f "$BIN" ]; then
 else
     command -v curl >/dev/null 2>&1 || die "curl is required"
     log "downloading $BIN"
-    curl -fSL --connect-timeout 10 -o "$TMP_BIN" "$BIN" || die "binary download failed"
+    if curl -fSL --connect-timeout 10 -o "$TMP_BIN" "$BIN"; then
+        :
+    elif [ -n "${PROXY_BIN:-}" ]; then
+        log "direct binary download failed; trying proxy $GH_PROXY"
+        curl -fSL --connect-timeout 10 -o "$TMP_BIN" "$PROXY_BIN" || die "binary download failed through direct and proxy URLs"
+    else
+        die "binary download failed"
+    fi
     if [ -n "${SUM_URL:-}" ]; then
         command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
         TMP_SUM=$(mktemp /tmp/probe-rs-sha.XXXXXX)
-        SUM_FETCHED=false
-        if [ -n "$GH_PROXY" ]; then
-            # 校验和优先直连 GitHub：二进制走代理时，校验和若同样经代理投递，
-            # 被攻陷的代理可以同时替换两者，校验就退化为传输完整性检查。
-            if curl -fsSL --connect-timeout 10 -o "$TMP_SUM" "$release_base/SHA256SUMS"; then
-                SUM_FETCHED=true
-                log "checksum fetched directly from GitHub (binary via proxy)"
-            else
-                log "warning: direct SHA256SUMS download failed; falling back to proxy (checksum then only detects transfer corruption, not origin)"
-            fi
+        if curl -fsSL --connect-timeout 10 -o "$TMP_SUM" "$SUM_URL"; then
+            :
+        elif [ -n "${PROXY_SUM_URL:-}" ]; then
+            log "warning: direct SHA256SUMS download failed; falling back to proxy (checksum then only detects transfer corruption, not origin)"
+            curl -fSL --connect-timeout 10 -o "$TMP_SUM" "$PROXY_SUM_URL" || die "checksum download failed through direct and proxy URLs"
+        else
+            die "checksum download failed"
         fi
-        [ "$SUM_FETCHED" = true ] ||
-            curl -fSL --connect-timeout 10 -o "$TMP_SUM" "$SUM_URL" || die "checksum download failed"
         expected=$(awk -v name="$asset" '$2 == name || $2 == "*" name { print $1; exit }' "$TMP_SUM")
         [ -n "$expected" ] || die "checksum for $asset is missing"
         actual=$(sha256sum "$TMP_BIN" | awk '{print $1}')
@@ -297,8 +318,12 @@ fi
 install -m 0755 "$TMP_BIN" "$BIN_DST"
 
 set -- configure-cf --config "$CONFIG_PATH" --net-static-path "$DATA_DIR/net_static.json" \
-    --server-id "$ID" --secret "$SECRET" --url "$URL"
+    --reporter-id "$REPORTER_ID"
+[ "$ID_SET" = false ] || set -- "$@" --server-id "$ID"
+[ "$SECRET_SET" = false ] || set -- "$@" --secret "$SECRET"
+[ "$URL_SET" = false ] || set -- "$@" --url "$URL"
 [ "$COLLECT_SET" = false ] || set -- "$@" --collect "$COLLECT"
+[ "$WSS_REPORT_SET" = false ] || set -- "$@" --wss-report-interval "$WSS_REPORT"
 [ "$REPORT_SET" = false ] || set -- "$@" --report-interval "$REPORT"
 [ "$CONNECTION_MODE_SET" = false ] || set -- "$@" --connection-mode "$CONNECTION_MODE"
 [ "$RESET_SET" = false ] || set -- "$@" --reset-day "$RESET_DAY"
@@ -309,8 +334,7 @@ set -- configure-cf --config "$CONFIG_PATH" --net-static-path "$DATA_DIR/net_sta
 [ "$BD_SET" = false ] || set -- "$@" --bd "$BD"
 [ "$AUTO_UPDATE_SET" = false ] || set -- "$@" --auto-update "$AUTO_UPDATE"
 [ "$UPDATE_CHANNEL_SET" = false ] || set -- "$@" --update-channel "$UPDATE_CHANNEL"
-[ "$REPORTER_ID_SET" = false ] || set -- "$@" --reporter-id "$REPORTER_ID"
-[ "$REPLACE_CF" = false ] || set -- "$@" --replace-cf
+[ -z "$GH_PROXY" ] || set -- "$@" --update-proxy "$GH_PROXY"
 SELECTED_REPORTER=$($BIN_DST "$@")
 [ -n "$SELECTED_REPORTER" ] || die "CF Reporter selection failed"
 chmod 600 "$CONFIG_PATH"

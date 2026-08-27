@@ -206,6 +206,7 @@ fn convert_reporter(legacy: LegacyReporterConfig, warnings: &mut Vec<String>) ->
                     connection_mode: legacy.ext.cf.connection_mode,
                     interval: legacy.report_interval.max(1),
                     collect_interval: legacy.intervals.collect.max(1),
+                    wss_report_interval: 2,
                     reset_day: legacy.reset_day,
                     interface: legacy.interfaces.join(","),
                     ct,

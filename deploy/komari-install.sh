@@ -28,6 +28,7 @@ usage() {
   --gpu                 开启 GPU 详细采集（缺省关）
   --include-nics <列表> 网卡白名单，逗号分隔通配符（写入 include_nics）
   --install-version <v> 指定 probe-rs 版本（缺省 latest）
+  --install-ghproxy <URL> GitHub 代理前缀；直连失败后使用并持久化为更新兜底
   --name <名称>         已忽略（komari 段无 server_id 字段，面板按 token 识别）
   --reporter-id <id>   已有配置中追加/更新的 Reporter id（缺省 komari）
   --disable-auto-update 关闭自动更新（缺省开启）
@@ -108,11 +109,11 @@ if [ "${1:-}" = "uninstall" ]; then
 fi
 [ $# -gt 0 ] || { usage; exit 1; }
 
-ENDPOINT=""; TOKEN=""; INTERVAL=3; RESET_DAY=1; BIN=""
+ENDPOINT=""; TOKEN=""; INTERVAL=3; RESET_DAY=1; BIN=""; GH_PROXY=""
 ENABLE_GPU=false; INTERFACES=""; VERSION=""; REPORTER_ID="komari"
 AUTO_UPDATE=true; UPDATE_CHANNEL=stable
 # 需要吞掉一个值的官方参数（接受但忽略）
-IGNORED_WITH_VALUE="--auto-discovery --max-retries -r --reconnect-interval -c --info-report-interval --exclude-nics --include-mountpoint --custom-dns --custom-ipv4 --custom-ipv6 --config --protocol-version --prefer-ip-version --install-dir --install-service-name --install-ghproxy --name"
+IGNORED_WITH_VALUE="--auto-discovery --max-retries -r --reconnect-interval -c --info-report-interval --exclude-nics --include-mountpoint --custom-dns --custom-ipv4 --custom-ipv6 --config --protocol-version --prefer-ip-version --install-dir --install-service-name --name"
 # 纯标志位官方参数
 IGNORED_FLAGS="--disable-web-ssh -u --ignore-unsafe-cert --memory-include-cache --memory-exclude-bcf --show-warning --get-ip-addr-from-nic --disable-compression"
 
@@ -125,6 +126,7 @@ while [ $# -gt 0 ]; do
         --gpu)               ENABLE_GPU=true; shift ;;
         --include-nics)      INTERFACES="$2"; shift 2 ;;
         --install-version)   VERSION="$2"; shift 2 ;;
+        --install-ghproxy)   GH_PROXY="$2"; shift 2 ;;
         --reporter-id)       REPORTER_ID="$2"; shift 2 ;;
         --disable-auto-update) AUTO_UPDATE=false; shift ;;
         --enable-auto-update) AUTO_UPDATE=true; shift ;;
@@ -149,6 +151,14 @@ case "$UPDATE_CHANNEL" in
     stable|prerelease) ;;
     *) die "--update-channel must be stable or prerelease" ;;
 esac
+if [ -n "$GH_PROXY" ]; then
+    case "$GH_PROXY" in http://*|https://*) ;; *) die "--install-ghproxy must be an absolute HTTP(S) URL" ;; esac
+    case "$GH_PROXY" in *'?'*|*'#'*|*'"'*|*'\'*|http://*@*|https://*@*)
+        die "--install-ghproxy must not contain credentials, quotes, backslashes, a query string, or a fragment"
+        ;;
+    esac
+    GH_PROXY=${GH_PROXY%/}
+fi
 
 [ -n "$ENDPOINT" ] || die "缺少 -e <面板地址>"
 [ -n "$TOKEN" ] || die "缺少 -t <token>"
@@ -164,6 +174,7 @@ toml_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 # 前导零（08 不是合法 TOML 整数）
 INTERVAL=$((10#$INTERVAL)); RESET_DAY=$((10#$RESET_DAY))
 TOKEN_ESC=$(toml_escape "$TOKEN"); ENDPOINT_ESC=$(toml_escape "$ENDPOINT"); NICS_ESC=$(toml_escape "$INTERFACES")
+GH_PROXY_ESC=$(toml_escape "$GH_PROXY")
 
 
 # ---- 二进制 ----
@@ -192,6 +203,10 @@ if [ -z "$BIN" ]; then
         BIN="$RELEASE_BASE/download/$tag/probe-rs-linux-$arch"
         SUM_URL="$RELEASE_BASE/download/$tag/SHA256SUMS"
     fi
+    if [ -n "$GH_PROXY" ]; then
+        PROXY_BIN=$GH_PROXY/$BIN
+        PROXY_SUM_URL=$GH_PROXY/$SUM_URL
+    fi
     # 脚本自动推导的 Release 源必须校验;用户显式 -bin=<路径或URL> 视为信任输入
     VERIFY_SUMS=1
 fi
@@ -199,11 +214,24 @@ if [ -f "$BIN" ]; then
     cp -f "$BIN" "$TMP_BIN"
 else
     log "下载二进制: $BIN"
-    curl -fSL --connect-timeout 10 -o "$TMP_BIN" "$BIN" || die "二进制下载失败（可用 -bin= 指定本地路径）"
+    if curl -fSL --connect-timeout 10 -o "$TMP_BIN" "$BIN"; then
+        :
+    elif [ -n "${PROXY_BIN:-}" ]; then
+        log "直连下载失败，尝试代理 $GH_PROXY"
+        curl -fSL --connect-timeout 10 -o "$TMP_BIN" "$PROXY_BIN" || die "直连和代理下载均失败（可用 -bin= 指定本地路径）"
+    else
+        die "二进制下载失败（可用 -bin= 指定本地路径）"
+    fi
     if [ "$VERIFY_SUMS" = 1 ]; then
         TMP_SUMS=$(mktemp /tmp/probe-rs-sums.XXXXXX)
         if ! curl -fSL --connect-timeout 10 -o "$TMP_SUMS" "$SUM_URL"; then
-            die "SHA256SUMS 下载失败，拒绝安装未校验的二进制；可用 -bin= 指定本地路径"
+            if [ -n "${PROXY_SUM_URL:-}" ]; then
+                log "直连 SHA256SUMS 失败，尝试代理（此时校验只能保证传输完整性）"
+                curl -fSL --connect-timeout 10 -o "$TMP_SUMS" "$PROXY_SUM_URL" ||
+                    die "直连和代理 SHA256SUMS 下载均失败，拒绝安装未校验的二进制"
+            else
+                die "SHA256SUMS 下载失败，拒绝安装未校验的二进制；可用 -bin= 指定本地路径"
+            fi
         fi
         asset=$(basename "$BIN")
         expected=$(awk -v asset="$asset" '$2 == asset { print $1; exit }' "$TMP_SUMS")
@@ -296,28 +324,72 @@ strip_seeded_sample_reporters() {
 
 upsert_auto_update_config() {
     cfg="$1"; tmp=$(mktemp "$CONF_DIR/config.toml.XXXXXX")
-    awk -v enabled="$AUTO_UPDATE" -v channel="$UPDATE_CHANNEL" '
-        BEGIN { in_auto=0; inserted=0 }
-        /^[[:space:]]*\[auto_update\][[:space:]]*$/ { in_auto=1; next }
-        in_auto && /^[[:space:]]*\[/ { in_auto=0 }
-        in_auto { next }
-        !inserted && /^[[:space:]]*\[\[reporters\]\][[:space:]]*$/ {
+    awk -v enabled="$AUTO_UPDATE" -v channel="$UPDATE_CHANNEL" -v proxy="$GH_PROXY_ESC" '
+        function proxy_array() {
+            return proxy == "" ? "[]" : "[\"" proxy "\"]"
+        }
+        function append_proxy(line,    bare, comment, hash) {
+            if (proxy == "" || index(line, "\"" proxy "\"") > 0) return line
+            bare=line; comment=""; hash=index(bare, "#")
+            if (hash > 0) {
+                comment=substr(bare, hash)
+                bare=substr(bare, 1, hash - 1)
+            }
+            sub(/[[:space:]]+$/, "", bare)
+            if (bare ~ /\[[[:space:]]*\]$/) sub(/\[[[:space:]]*\]$/, proxy_array(), bare)
+            else if (bare ~ /\]$/) sub(/\]$/, ", \"" proxy "\"]", bare)
+            else return line
+            return bare (comment == "" ? "" : " " comment)
+        }
+        function finish_auto() {
+            if (!seen_enabled) print "enabled = " enabled
+            if (!seen_channel) print "channel = \"" channel "\""
+            if (!seen_interval) print "check_interval = 21600"
+            if (!seen_proxys) print "proxys = " proxy_array()
+        }
+        function print_auto() {
             print "[auto_update]"
             print "enabled = " enabled
             print "channel = \"" channel "\""
             print "check_interval = 21600"
+            print "proxys = " proxy_array()
             print ""
+        }
+        BEGIN { in_auto=0; inserted=0 }
+        /^[[:space:]]*\[auto_update\][[:space:]]*$/ {
+            in_auto=1; inserted=1
+            seen_enabled=seen_channel=seen_interval=seen_proxys=0
+            print
+            next
+        }
+        in_auto && /^[[:space:]]*\[/ {
+            finish_auto()
+            in_auto=0
+        }
+        in_auto {
+            if ($0 ~ /^[[:space:]]*enabled[[:space:]]*=/) {
+                if (!seen_enabled) print "enabled = " enabled
+                seen_enabled=1
+            } else if ($0 ~ /^[[:space:]]*channel[[:space:]]*=/) {
+                if (!seen_channel) print "channel = \"" channel "\""
+                seen_channel=1
+            } else {
+                if ($0 ~ /^[[:space:]]*check_interval[[:space:]]*=/) seen_interval=1
+                if ($0 ~ /^[[:space:]]*proxys[[:space:]]*=/) {
+                    seen_proxys=1
+                    print append_proxy($0)
+                } else print
+            }
+            next
+        }
+        !inserted && /^[[:space:]]*\[\[reporters\]\][[:space:]]*$/ {
+            print_auto()
             inserted=1
         }
         { print }
         END {
-            if (!inserted) {
-                print ""
-                print "[auto_update]"
-                print "enabled = " enabled
-                print "channel = \"" channel "\""
-                print "check_interval = 21600"
-            }
+            if (in_auto) finish_auto()
+            else if (!inserted) { print ""; print_auto() }
         }
     ' "$cfg" > "$tmp"
     mv -f "$tmp" "$cfg"

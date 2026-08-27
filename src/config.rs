@@ -46,6 +46,8 @@ pub struct AutoUpdateConfig {
     pub enabled: bool,
     pub channel: UpdateChannel,
     pub check_interval: u64,
+    /// Release 资产直连失败后依次尝试的 GitHub 代理前缀。
+    pub proxys: Vec<String>,
 }
 
 impl Default for AutoUpdateConfig {
@@ -54,6 +56,7 @@ impl Default for AutoUpdateConfig {
             enabled: false,
             channel: UpdateChannel::Stable,
             check_interval: 21_600,
+            proxys: Vec::new(),
         }
     }
 }
@@ -86,6 +89,10 @@ pub struct ReporterSpec {
     pub worker_url: String,
     pub config_version: String,
     pub connection_mode: Option<CfConnectionMode>,
+    pub wss_report_interval: Option<u64>,
+    /// 协议原始采集周期。CF 保留 0 用于线上协议；内部采集使用
+    /// intervals.collect 中的非零映射值。
+    pub source_collect_interval: u64,
     pub intervals: Intervals,
     pub reset_day: u8,
     pub interfaces: Vec<String>,
@@ -189,6 +196,9 @@ impl LocalConfig {
         if self.auto_update.check_interval < MIN_UPDATE_CHECK_INTERVAL {
             bail!("auto_update.check_interval must be >= {MIN_UPDATE_CHECK_INTERVAL} seconds");
         }
+        for proxy in &self.auto_update.proxys {
+            validate_update_proxy(proxy)?;
+        }
         if self.reporters.is_empty() {
             bail!("至少需要一个 [[reporters]]");
         }
@@ -208,8 +218,11 @@ impl LocalConfig {
                     if cf.interval == 0 {
                         bail!("reporter {} cf.interval 必须 >= 1", reporter.id);
                     }
-                    if cf.collect_interval == 0 {
-                        bail!("reporter {} cf.collect_interval 必须 >= 1", reporter.id);
+                    if !(1..=5).contains(&cf.wss_report_interval) {
+                        bail!(
+                            "reporter {} cf.wss_report_interval 必须在 1-5 之间",
+                            reporter.id
+                        );
                     }
                     if cf.reset_day > 31 {
                         bail!("reporter {} cf.reset_day 必须在 0-31 之间", reporter.id);
@@ -318,6 +331,8 @@ impl LocalConfig {
                             worker_url: cf.url.clone(),
                             config_version: cf.ext.config_version.clone(),
                             connection_mode: Some(cf.connection_mode),
+                            wss_report_interval: Some(cf.wss_report_interval),
+                            source_collect_interval: cf.collect_interval,
                             intervals: collect.intervals.with_report(cf.interval),
                             reset_day: cf.reset_day,
                             interfaces: collect.interfaces,
@@ -352,6 +367,8 @@ impl LocalConfig {
                             worker_url: komari.endpoint.clone(),
                             config_version: String::new(),
                             connection_mode: None,
+                            wss_report_interval: None,
+                            source_collect_interval: collect.intervals.collect,
                             // komari 按采集周期上报。
                             intervals: collect.intervals.with_report(komari.interval),
                             reset_day: komari.month_rotate,
@@ -374,6 +391,8 @@ impl LocalConfig {
                             worker_url: probe.worker_url.clone(),
                             config_version: probe.ext.config_version.clone(),
                             connection_mode: None,
+                            wss_report_interval: None,
+                            source_collect_interval: collect.intervals.collect,
                             intervals: collect.intervals.with_report(probe.report_interval),
                             reset_day: probe.reset_day,
                             interfaces: collect.interfaces,
@@ -440,6 +459,9 @@ impl LocalConfig {
             .map(|spec| ReporterSummary {
                 id: spec.id,
                 protocol: spec.protocol,
+                source_collect_interval: spec.source_collect_interval,
+                connection_mode: spec.connection_mode,
+                wss_report_interval: spec.wss_report_interval,
                 intervals: CollectionIntervals {
                     collect: spec.intervals.collect,
                     ping: spec.intervals.ping,
@@ -492,7 +514,8 @@ impl LocalConfig {
     }
 
     /// 合并后的全局采集配置实体:各协议段先各自转换为实体,再按路合并
-    /// (周期取 min、GPU 取 OR、网卡/磁盘取并集、Ping 去重取 min)。
+    /// (基础采集周期取 gcd、其他周期取 min、GPU 取 OR、网卡/磁盘取并集、
+    /// Ping 去重取 min)。
     pub fn merged_collect_config(&self) -> CollectConfig {
         CollectConfig {
             intervals: self.effective_collection_intervals(),
@@ -541,7 +564,7 @@ impl LocalConfig {
                 diskio: spec.intervals.diskio,
             })
             .reduce(|a, b| CollectionIntervals {
-                collect: a.collect.min(b.collect),
+                collect: gcd(a.collect, b.collect),
                 ping: a.ping.min(b.ping),
                 slow: a.slow.min(b.slow),
                 gpu: a.gpu.min(b.gpu),
@@ -1085,8 +1108,14 @@ fn apply_remote_cf(section: &mut crate::model::CfSection, remote: &RemoteConfig)
         }
         section.collect_interval = intervals.collect;
     }
+    if let Some(value) = remote.cf_collect_interval {
+        section.collect_interval = value;
+    }
     if let Some(value) = remote.report_interval {
         section.interval = value;
+    }
+    if let Some(value) = remote.wss_report_interval {
+        section.wss_report_interval = value;
     }
     if let Some(value) = remote.connection_mode {
         section.connection_mode = value;
@@ -1169,6 +1198,12 @@ fn validate_remote(remote: &RemoteConfig) -> Result<()> {
     if remote.report_interval == Some(0) {
         bail!("远端 report_interval 必须 >= 1");
     }
+    if remote
+        .wss_report_interval
+        .is_some_and(|value| !(1..=5).contains(&value))
+    {
+        bail!("远端 wss_report_interval 必须在 1-5 之间");
+    }
     if let Some(reset_day) = remote.reset_day {
         if reset_day > 31 {
             bail!("远端 reset_day 非法: {reset_day}");
@@ -1191,6 +1226,29 @@ fn validate_remote(remote: &RemoteConfig) -> Result<()> {
             bail!("远端 pings 数量超限(最多 {MAX_REMOTE_PINGS} 项)");
         }
         validate_pings(pings).context("远端 pings 非法")?;
+    }
+    Ok(())
+}
+
+fn gcd(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left.max(1)
+}
+
+fn validate_update_proxy(raw: &str) -> Result<()> {
+    let proxy = reqwest::Url::parse(raw).context("auto_update.proxys contains an invalid URL")?;
+    if !matches!(proxy.scheme(), "http" | "https") || proxy.host_str().is_none() {
+        bail!("auto_update.proxys entries must be absolute HTTP(S) URLs");
+    }
+    if !proxy.username().is_empty() || proxy.password().is_some() {
+        bail!("auto_update.proxys entries must not contain credentials");
+    }
+    if proxy.query().is_some() || proxy.fragment().is_some() {
+        bail!("auto_update.proxys entries must not contain query strings or fragments");
     }
     Ok(())
 }
@@ -1366,6 +1424,7 @@ mod tests {
                 connection_mode: CfConnectionMode::Auto,
                 interval: 60,
                 collect_interval: 1,
+                wss_report_interval: 2,
                 reset_day: 1,
                 interface: String::new(),
                 ct: Some("gd-ct.example.com:80".into()),
@@ -1639,6 +1698,10 @@ url = "https://example.com/update"
             cfg.reporter("cf").unwrap().connection_mode,
             Some(CfConnectionMode::Auto)
         );
+        let cf = cfg.reporters[0].cf.as_ref().unwrap();
+        assert_eq!(cf.collect_interval, 10); // preserve the pre-existing omitted-field default
+        assert_eq!(cf.wss_report_interval, 2);
+        assert_eq!(cf.effective_collect_interval(), 10);
     }
 
     #[test]
@@ -1646,6 +1709,24 @@ url = "https://example.com/update"
         let mut cfg = base_config();
         cfg.auto_update.check_interval = MIN_UPDATE_CHECK_INTERVAL - 1;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn update_proxys_require_safe_absolute_http_urls() {
+        let mut cfg = base_config();
+        cfg.auto_update.proxys = vec!["https://proxy.example/prefix".into()];
+        cfg.validate().unwrap();
+
+        for invalid in [
+            "proxy.example",
+            "ftp://proxy.example",
+            "https://user:pass@proxy.example",
+            "https://proxy.example/?token=secret",
+            "https://proxy.example/#fragment",
+        ] {
+            cfg.auto_update.proxys = vec![invalid.into()];
+            assert!(cfg.validate().is_err(), "accepted invalid proxy: {invalid}");
+        }
     }
 
     #[test]
@@ -1691,7 +1772,7 @@ report_interval = 60
             komari: Some(KomariSection {
                 endpoint: "https://panel.example".into(),
                 token: "token".into(),
-                interval: 5,
+                interval: 6,
                 month_rotate: 12,
                 enable_gpu: true,
                 include_nics: "Ethernet*".into(),
@@ -1700,15 +1781,19 @@ report_interval = 60
             }),
             probe: None,
         });
-        cfg.reporters.push(cf_reporter("cf-a"));
+        let mut cf_config = cf_reporter("cf-a");
+        let cf_section = cf_config.cf.as_mut().unwrap();
+        cf_section.collect_interval = 0;
+        cf_section.wss_report_interval = 4;
+        cfg.reporters.push(cf_config);
 
         cfg.validate().unwrap();
 
         let komari = cfg.reporter("komari-a").unwrap();
         assert_eq!(komari.protocol, ReporterProtocol::Komari);
         assert_eq!(komari.reset_day, 12);
-        assert_eq!(komari.intervals.collect, 5);
-        assert_eq!(komari.intervals.report, 5); // komari 按采集周期上报
+        assert_eq!(komari.intervals.collect, 6);
+        assert_eq!(komari.intervals.report, 6); // komari 按采集周期上报
         assert!(komari.report_gpu);
         assert!(komari.report_errors);
         assert!(!komari.report_self);
@@ -1717,12 +1802,13 @@ report_interval = 60
 
         let cf = cfg.reporter("cf-a").unwrap();
         assert!(cf.report_gpu); // cf 固定启用 GPU
-        assert_eq!(cf.intervals.collect, 1);
+        assert_eq!(cf.source_collect_interval, 0);
+        assert_eq!(cf.intervals.collect, 4); // auto + collect=0 跟随 WSS 配置周期
         assert_eq!(cf.pings.len(), 1);
         assert_eq!(cf.pings[0].target.name, "ct");
 
         let merged = cfg.merged_collect_config();
-        assert_eq!(merged.intervals.collect, 1); // min(10, 5, 1)
+        assert_eq!(merged.intervals.collect, 2); // gcd(10, 6, 4)
         assert!(merged.report_gpu); // OR
                                     // komari 指定了网卡,但 probe/cf 为空(= 全部)→ 全局为全部
         assert!(merged.interfaces.is_empty());
@@ -1730,6 +1816,10 @@ report_interval = 60
         // probe 的 ct(example.com:80)与 cf 的 ct(gd-ct)不同目标,都保留
         assert_eq!(merged.pings.len(), 2);
         assert_eq!(cfg.effective_intervals().report, 1); // 内部占位,不是上报周期
+
+        let mut http_cfg = cfg.clone();
+        http_cfg.reporters[2].cf.as_mut().unwrap().connection_mode = CfConnectionMode::Http;
+        assert_eq!(http_cfg.reporter("cf-a").unwrap().intervals.collect, 60);
 
         let receipt = cf.static_config(cfg.global_summary(), cfg.reporter_summaries());
         assert_eq!(receipt.reporters.len(), 3);
@@ -1931,7 +2021,9 @@ report_interval = 60
         RemoteConfig {
             config_version: config_version.into(),
             intervals: None,
+            cf_collect_interval: None,
             report_interval: None,
+            wss_report_interval: None,
             connection_mode: None,
             reset_day: None,
             interfaces: None,
@@ -2014,11 +2106,9 @@ report_interval = 60
         let (shared, _rx, _config_rx) = SharedConfig::new(cfg, path.clone());
 
         let mut push = remote("v1");
-        push.intervals = Some(CollectionIntervals {
-            collect: 2,
-            ..Default::default()
-        });
+        push.cf_collect_interval = Some(0);
         push.report_interval = Some(30);
+        push.wss_report_interval = Some(4);
         push.connection_mode = Some(CfConnectionMode::Http);
         push.interfaces = Some(vec!["eth0".into()]);
         push.pings = Some(vec![
@@ -2038,9 +2128,11 @@ report_interval = 60
         assert!(shared.apply_remote_for("primary", push).unwrap());
 
         let cf = shared.get().reporters[0].cf.clone().unwrap();
-        assert_eq!(cf.collect_interval, 2);
+        assert_eq!(cf.collect_interval, 0);
         assert_eq!(cf.interval, 30);
+        assert_eq!(cf.wss_report_interval, 4);
         assert_eq!(cf.connection_mode, CfConnectionMode::Http);
+        assert_eq!(cf.effective_collect_interval(), 30);
         assert_eq!(cf.interface, "eth0");
         assert_eq!(cf.ct.as_deref(), Some("new-ct.example.com:80"));
         assert_eq!(cf.cu.as_deref(), Some("new-cu.example.com:80"));

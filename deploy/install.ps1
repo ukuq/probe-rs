@@ -345,6 +345,12 @@ schema = 1
 
 data_dir = '$DataDir'
 
+[auto_update]
+enabled = false
+channel = "stable"
+check_interval = 21600
+proxys = []
+
 [[reporters]]
 id = "primary"
 

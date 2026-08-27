@@ -64,6 +64,9 @@ interface GlobalPingTarget {
 interface ReporterSummary {
   id: string;
   protocol: string;
+  source_collect_interval: number;
+  connection_mode?: "auto" | "http";
+  wss_report_interval?: number;
   intervals: CollectionIntervals;
   report_interval: number;
   reset_day: number;
@@ -1999,6 +2002,7 @@ function cfgMachineForm(s, st) {
       ['enabled', '未在上报摘要中公开'],
       ['channel', '未在上报摘要中公开'],
       ['check_interval', '未在上报摘要中公开'],
+      ['proxys', '未在上报摘要中公开'],
     ]),
     cfgGroup('运行回执', [
       ['agent_version', st.agent_version || s.agent_version || '–'],
@@ -2033,8 +2037,11 @@ function cfgReadonlyReporterForm(route) {
         ['url', '******', 'cfg-private'],
       ]),
       cfgGroup('[reporters.cf] · 采集与上报', [
+        ['connection_mode', route.connection_mode || 'auto'],
         ['interval', route.report_interval != null ? route.report_interval + ' s' : '–'],
-        ['collect_interval', intervals.collect != null ? intervals.collect + ' s' : '–'],
+        ['wss_report_interval', route.wss_report_interval != null ? route.wss_report_interval + ' s' : '–'],
+        ['collect_interval', route.source_collect_interval != null ? route.source_collect_interval + ' s' : '–'],
+        ['映射后实际采集', intervals.collect != null ? intervals.collect + ' s' : '–'],
         ['reset_day', route.reset_day != null ? String(route.reset_day) : '–'],
         ['interface', cfgList(route.interfaces, '""（全部）')],
         ['report_gpu', cfgBool(route.report_gpu) + '（固定）'],
@@ -2578,7 +2585,7 @@ function renderExample() {
       '上报失败时 agent 有界保留（10 条）待重发——只覆盖短暂抖动，长断网历史不补发；服务端收到延迟记录按 ts 去重排序即可。',
     ]),
     annotatedCard(RESPONSE_EXAMPLE_JSON5, '//', [
-      'agent 行为：整体校验（版本、周期、glob、Ping），全部通过才应用当前 Reporter 并落盘；随后重新计算全局最小周期、GPU OR、网卡/磁盘/Ping 并集。',
+      'agent 行为：整体校验（版本、周期、glob、Ping），全部通过才应用当前 Reporter 并落盘；随后重新计算全局 collect 最大公约数、其他 worker 最小周期、GPU OR、网卡/磁盘/Ping 并集。',
       '🔒 连接身份与 data_dir 只接受本地配置；远端只能修改产生该响应的 Reporter。允许下发 Ping 时，服务端应自行限制目标，避免 SSRF/内网探测。',
     ]));
 }

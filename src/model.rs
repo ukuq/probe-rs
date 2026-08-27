@@ -423,8 +423,13 @@ pub struct CfSection {
     /// 上报周期（原版 report_interval）。
     #[serde(default = "default_report_interval")]
     pub interval: u64,
+    /// 原版 CF 采集周期；0 表示不额外高频采集。
     #[serde(default = "default_collect_interval")]
     pub collect_interval: u64,
+    /// WSS 配置上报周期。collect_interval=0 且 connection_mode=auto 时，
+    /// 用它映射为机器级实际采集周期。
+    #[serde(default = "default_cf_wss_report_interval")]
+    pub wss_report_interval: u64,
     #[serde(default = "default_reset_day")]
     pub reset_day: u8,
     /// 逗号分隔的网卡列表；空 = 全部默认物理网卡。
@@ -461,6 +466,17 @@ impl std::fmt::Display for CfConnectionMode {
 }
 
 impl CfSection {
+    pub fn effective_collect_interval(&self) -> u64 {
+        if self.collect_interval > 0 {
+            return self.collect_interval;
+        }
+        match self.connection_mode {
+            CfConnectionMode::Auto => self.wss_report_interval,
+            CfConnectionMode::Http => self.interval,
+        }
+        .max(1)
+    }
+
     pub fn to_collect_config(&self) -> CollectConfig {
         let pings = [
             ("ct", &self.ct),
@@ -480,7 +496,7 @@ impl CfSection {
         .collect();
         CollectConfig {
             intervals: CollectionIntervals {
-                collect: self.collect_interval,
+                collect: self.effective_collect_interval(),
                 ..Default::default()
             },
             interfaces: split_list(&self.interface, ','),
@@ -655,6 +671,12 @@ pub struct GlobalConfigSummary {
 pub struct ReporterSummary {
     pub id: String,
     pub protocol: ReporterProtocol,
+    /// 协议原始采集值；CF 可为 0。
+    pub source_collect_interval: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_mode: Option<CfConnectionMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wss_report_interval: Option<u64>,
     pub intervals: CollectionIntervals,
     pub report_interval: u64,
     pub reset_day: u8,
@@ -677,8 +699,15 @@ pub struct RemoteConfig {
     /// 修改当前 Reporter 的采集需求；全局 worker 会重新聚合。
     #[serde(default)]
     pub intervals: Option<CollectionIntervals>,
+    /// CF 原生 collect_interval 可为 0；它不能复用要求 >=1 的通用
+    /// CollectionIntervals，因此只在 CF 响应适配层内部传递。
+    #[serde(skip)]
+    pub cf_collect_interval: Option<u64>,
     #[serde(default)]
     pub report_interval: Option<u64>,
+    /// CF Schema 5 的配置 WSS 周期。
+    #[serde(default)]
+    pub wss_report_interval: Option<u64>,
     /// CF Reporter 的连接模式；其他协议忽略。
     #[serde(default)]
     pub connection_mode: Option<CfConnectionMode>,
@@ -711,6 +740,10 @@ fn default_reset_day() -> u8 {
 
 fn default_report_interval() -> u64 {
     60
+}
+
+fn default_cf_wss_report_interval() -> u64 {
+    2
 }
 
 fn default_collect_interval() -> u64 {
