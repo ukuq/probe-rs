@@ -75,7 +75,7 @@ probe-rs/
 
 ### 3.3 缓冲（buffer.rs）
 
-- 共享有界事件日志（`MAX_JOURNAL_RECORDS = 512`，dynamic/async/errors 三类共用一个 journal），每 Reporter 独立 seq 游标：`read()` 非破坏读取游标之后的全部事件；HTTP 在响应成功后 `ack(through)`，CF WSS 按 1 秒节奏异步发送、由后台收到对应服务端 ACK 后再推进游标；日志只裁剪到所有 Reporter 都已确认的位置（min-cursor）。
+- 共享有界事件日志（`MAX_JOURNAL_RECORDS = 512`，dynamic/async/errors 三类共用一个 journal），每 Reporter 独立 seq 游标：`read()` 非破坏读取游标之后的全部事件；HTTP 在响应成功后 `ack(through)`，CF WSS 初始按持久化的 `wss_report_interval`（默认 2 秒）异步发送，并可由服务端 hint 在 1 秒至 5 分钟内动态调整；后台收到对应服务端 ACK 后再推进游标。日志只裁剪到所有 Reporter 都已确认的位置（min-cursor）。
 - 慢端点不会阻塞采集：日志满时丢最旧事件；丢弃**未确认**事件时按 64 条节流注入一条 `source=buffer` 错误事件并打 warn 日志，长中断不静默。
 - errors 同源同文去重在入队前完成；上报失败无需"restore"，未 ack 的事件自然留在日志里待下轮重发。
 
@@ -85,6 +85,7 @@ probe-rs/
 - 采样 task 每 2s：读 /proc/net/dev → 与上一帧 per-iface 计数器算 delta → `current < prev` 记 0（纪律 2）→ append 内存 + 标记 dirty。
 - 保留：**32 天**明细 + 永久归档基数（严格大于最长 31 天账期，账期首日明细不会被归档；reset_day 28-31 的月流量不因修剪少计）
 - 落盘：每 10min 全量重写 `net_static.json`（tmp + rename 原子写，spawn_blocking）；启动时加载。
+- schema 0 升级时保留旧 `net_static_path` 的精确文件名：若不同于新 `data_dir/net_static.json`，先复制账本并保留原文件；新旧目标同时存在时拒绝覆盖并明确报错。
 - 查询：`sum(period_start..=now)` 按白名单网卡过滤求和；`period_start=0` 额外加归档基数，实现真正永久累计。
 - 内存优化（可选二期）：小时粒度合并，见设计书 §5.4。
 
@@ -177,11 +178,11 @@ sudo ./deploy/install.sh       # 装二进制/unit/示例配置；已装过则�
 
 - root 安装：二进制 → `/usr/local/bin/probe-rs`；配置 → `/etc/probe-rs/config.toml`（600，含 secret）；数据 → `/var/lib/probe-rs/`
 - 普通用户安装：二进制 → `~/.local/bin/probe-rs`；配置/数据遵循 `XDG_CONFIG_HOME`、`XDG_DATA_HOME`（缺省为 `~/.config/probe-rs`、`~/.local/share/probe-rs`）；unit → `~/.config/systemd/user/probe-rs.service`
-- 首次安装需先编辑配置填 `server_id` / `secret` / `worker_url`，再执行 `systemctl enable --now probe-rs`（root）或 `systemctl --user enable --now probe-rs`（普通用户）
+- 通用安装器首次写入的是多协议示例：删除不使用的 CF/Komari/probe Reporter，只保留需要的协议段并完整填写其连接字段（probe 为 `[reporters.probe]` 下的 `server_id` / `secret` / `worker_url`），再执行 `systemctl enable --now probe-rs`（root）或 `systemctl --user enable --now probe-rs`（普通用户）
 - 用户服务需要有效的 systemd 用户会话；未启用 linger 时退出登录可能停止服务，管理员可执行 `loginctl enable-linger <user>` 允许其后台常驻
 - unit 加固：`ProtectSystem=strict` + `ReadWritePaths=/var/lib/probe-rs /etc/probe-rs /usr/local/bin`（分别用于流量落盘、配置回写和校验后的原子自替换）；ICMP 使用系统 `ping`，agent 无需 `CAP_NET_RAW`
 - 卸载：`./deploy/install.sh uninstall`（保留配置与数据，加 `--purge` 全清）
-- 一键脚本同样按执行身份选择系统服务或用户服务（换 URL 即可装，参数对齐各官方探针）：CF 模式 `deploy/cf-install.sh`（-id/-secret/-url/-ct/-cu/-cm/-bd）；komari 模式 `deploy/komari-install.sh`（-e 面板地址/-t token/-i 间隔，缺省 collect=1 report=3 对齐官方节奏）
+- 一键脚本同样按执行身份选择系统服务或用户服务（换 URL 即可装，参数对齐各官方探针）：CF 模式 `deploy/cf-install.sh`（-id/-secret/-url/-ct/-cu/-cm/-bd）；komari 模式 `deploy/komari-install.sh`（-e 面板地址/-t token/-i 间隔，缺省采集与上报均为 3 秒）
 
 ### Windows
 
@@ -201,7 +202,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\deploy\install.ps1 ins
 - 默认 User 模式将二进制、配置和数据分别放到 `%LocalAppData%\probe-rs\`、同目录 `config.toml` 和 `data\`，用当前用户启动项运行 Agent/托盘，不注册 SYSTEM 任务，控制与编辑不触发 UAC；注销后停止，重新登录后恢复。自动更新直接重启用户进程，不调用机器级计划任务
 - `-Scope Machine` 将二进制放到 `%ProgramFiles%\probe-rs\probe-rs.exe`，配置与流量数据放到 `%ProgramData%\probe-rs\`，使用 `SYSTEM`、最高权限的计划任务常驻；开机、任意用户登录及休眠唤醒（延迟 10 秒）时触发，异常退出后每分钟重启
 - 登录用户的托盘伴随程序显示探针运行状态和 PID；检测到多个探针进程时会注明数量并列出全部 PID，同时提供启动、停止、重启和查看/编辑配置。托盘本身保持普通权限，仅在执行控制操作或编辑受保护配置时通过 UAC 启动短生命周期管理员 helper；编辑器只打开临时副本，保存时执行完整 TOML/业务校验、并发修改检查和备份，全部通过后才原子替换正式配置，校验失败不会损坏现有配置
-- 首次安装会保留示例配置但禁用任务；填好 `server_id` / `secret` / `worker_url` 后执行 `.\deploy\install.ps1 start`
+- 首次安装会保留多协议示例配置但禁用任务；删除不使用的 Reporter，只保留一个完整协议段（例如 `[reporters.probe]`）并填写其连接字段后，执行 `.\deploy\install.ps1 start`
 - 状态/停止：`.\deploy\install.ps1 status` / `.\deploy\install.ps1 stop`；Machine 模式需追加 `-Scope Machine`
 - 卸载：`.\deploy\install.ps1 uninstall`（保留配置与数据，加 `-Purge` 全清）；Machine 模式需追加 `-Scope Machine`
 - Release 资产名为 `probe-rs-windows-x86_64.exe`，可用 `-BinaryPath` 指向下载后的文件
@@ -224,7 +225,7 @@ Windows 使用同一套 CF 协议逻辑；CF 一键安装默认启用 GPU 采集
 
 **上报映射**（reporter_cf.rs）：顶层 `{id, secret, config_schema, config_md5, collect_interval, report_interval, metrics, samples[]}`；ram/swap/disk 字节→MB；load 转空格字符串；GPU → `gpu_info:[{id,name,info}]`（`id` 来自采集端稳定设备标识，显存/温度丢弃，利用率未知的设备不输出）；ping 按组名落 `ping_ct/cu/cm/bd` + `loss_*`（bgp 是 bd 别名，未配置为 `false`，已配置但失败或缓存过期为 `null`）；`ip_v4/v6` 不可达报数值 `0`；`dynamic[]` → `samples[]`。顶层 dynamic/slow/GPU/Ping/disk I/O 快照按各自采集周期与上报周期校验新鲜度，过期字段不再输出；带 `ts` 的 `samples[]` 仍保留历史批量语义，report 不会触发采集。errors/self/virtualization 无落点，CF 模式下不产生。
 
-**WSS 上报**：`auto` 模式把 `https/http` 的 `worker_url` 映射为 `wss/ws`，保留路径和业务查询参数，并用 query + Header 携带 Schema 5 和配置 MD5。握手必须收到 `type=hello, protocol=update`；连接建立或重连后先用持久化的 `wss_report_interval`（缺省 2 秒）发布与 POST 相同的最新 JSON 文本，随后接受 ACK 或 `realtimeHint` 的 `nextWssReportAfterMs` 动态调整到 1 秒至 5 分钟。无人查看面板时可按服务端提示降频，前端恢复实时订阅时由 hint 立即缩短间隔；hint 只改节奏，不推进 journal 游标。发送槽使用 `watch` 单值覆盖：socket 暂时变慢时只保留最新帧，不会堆积；被覆盖帧的 journal 游标不会提前推进，其记录会合并进替代帧。写出的帧只保留紧凑的游标元数据，后台收到对应 ACK 后才推进 journal；因此 ACK 决定数据确认，但不阻塞下一次发送。从最老未确认报告起连续 15 秒没有 ACK，或单次 socket 写入超过 5 秒，会主动关闭半开连接，随后停止 WSS 发布、按 `report_interval` POST 兜底并重连。`config` 和 `remote_config` 帧也由后台读循环独立处理，其中配置仍按 MD5 幂等校验和原子落盘。普通网络错误按 60 秒到 5 分钟指数退避；认证或配置类 `type=error` 策略帧会同时暂停 WSS 重连和 POST 至少 120 秒。CF 2.8.4 Beta7+ 的 WSS 时段关闭信号是例外：握手 HTTP `409`、`error code=409` 或 close code `1013` 仅在 reason 为 `wss_schedule_inactive` / `wss_schedule_empty` 时临时关闭运行时 WSS，保持本地 `connection_mode=auto` 并按 `report_interval` POST；后续 POST 响应头 `X-Agent-Wss-Mode: active` 会立即解除临时开关并唤醒 WSS actor。配置 body 的 `connection_mode` 字段会应用并持久化到对应 CF Reporter；切换到 `http` 会停用 WSS actor，切回 `auto` 会重新唤醒。
+**WSS 上报**：`auto` 模式把 `[reporters.cf].url` 的 `https/http` 映射为 `wss/ws`，保留路径和业务查询参数，并用 query + Header 携带 Schema 5 和配置 MD5。握手必须收到 `type=hello, protocol=update`；连接建立或重连后先用持久化的 `wss_report_interval`（缺省 2 秒）发布与 POST 相同的最新 JSON 文本，随后接受 ACK 或 `realtimeHint` 的 `nextWssReportAfterMs` 动态调整到 1 秒至 5 分钟。无人查看面板时可按服务端提示降频，前端恢复实时订阅时由 hint 立即缩短间隔；hint 只改节奏，不推进 journal 游标。发送槽使用 `watch` 单值覆盖：socket 暂时变慢时只保留最新帧，不会堆积；被覆盖帧的 journal 游标不会提前推进，其记录会合并进替代帧。写出的帧只保留紧凑的游标元数据，后台收到对应 ACK 后才推进 journal；因此 ACK 决定数据确认，但不阻塞下一次发送。从最老未确认报告起连续 15 秒没有 ACK，或单次 socket 写入超过 5 秒，会主动关闭半开连接，随后停止 WSS 发布、按 `report_interval` POST 兜底并重连。`config` 和 `remote_config` 帧也由后台读循环独立处理，其中配置仍按 MD5 幂等校验和原子落盘。普通网络错误按 60 秒到 5 分钟指数退避；认证或配置类 `type=error` 策略帧会同时暂停 WSS 重连和 POST 至少 120 秒。CF 2.8.4 Beta7+ 的 WSS 时段关闭信号是例外：握手 HTTP `409`、`error code=409` 或 close code `1013` 仅在 reason 为 `wss_schedule_inactive` / `wss_schedule_empty` 时临时关闭运行时 WSS，保持本地 `connection_mode=auto` 并按 `report_interval` POST；后续 POST 响应头 `X-Agent-Wss-Mode: active` 会立即解除临时开关并唤醒 WSS actor。配置 body 的 `connection_mode` 字段会应用并持久化到对应 CF Reporter；切换到 `http` 会停用 WSS actor，切回 `auto` 会重新唤醒。
 
 **配置下发**：请求头升级为 `X-Agent-Config-Schema: 5` + `X-Agent-Config-Md5`（复用 `config_version` 字段存 MD5，空 = `none`）。POST 响应或 WSS ack/config 帧中的 URL-encoded body 会解析 collect_interval/report_interval/wss_report_interval/reset_day/custom_ct/cu/cm/bd/interface/connection_mode，合成 `RemoteConfig`（config_version 取响应/帧 MD5）走 `apply_remote_for`；`collect_interval=0` 与 `wss_report_interval` 都会原值持久化，实际每帧节奏仍可由 `nextWssReportAfterMs` 临时覆盖。当前 CF Reporter 的采集需求按连接模式映射：auto 使用 WSS 周期，http 使用 HTTP 上报周期；逗号分隔的 interface 拆成多个过滤项。`custom_*` 字段缺席时保留对应 Ping，出现空值时清除；非空值只替换对应线路并保留原 interval，`bd` 兼容旧名 `bgp`，HTTP(S) URL 推断为 HTTP 探测，其余按 TCP 探测。落点限制：cf 段只能落 `collect_interval`/`interface`/`ct/cu/cm/bd`/`interval`（上报周期）/`wss_report_interval`/`reset_day`/`connection_mode`，远端推送其他可下发项（非 collect 子间隔、非空 disks、`report_gpu=false`、非四大线路 Ping 名）时整体拒绝。
 

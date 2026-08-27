@@ -14,13 +14,17 @@ channel = "stable" # stable | prerelease
 check_interval = 21600 # seconds; minimum 300
 proxys = [] # direct GitHub download first, then try these proxy prefixes in order
 
+# 下方同时展示 CF、Komari、probe 三种协议。实际部署请删除不使用的示例
+# Reporter，只保留所需线路，并完整替换该协议段中的占位连接信息。
+
 # ----------------------------------------------------------------------
 # CF 上报线(命名对齐 cfsm-agent)
 #
 # 采集行为说明:collect_interval=0 时，auto 映射为 wss_report_interval，
 # http 映射为 interval；这里只定义当前 Reporter 的采集需求。
 # interface 参与全局网卡并集(任一路为空 = 全部);ct/cu/cm/bd 非空时
-# 各生成一个 TCP Ping 任务,按目标去重、周期取最小;CF 线固定启用 GPU。
+# 各生成一个 Ping 任务（HTTP(S) URL 推断为 HTTP，其余为 TCP），按目标去重、
+# 周期取最小；CF 线固定启用 GPU。
 [[reporters]]
 id = "primary"
 
@@ -74,8 +78,8 @@ secret = "change-me"
 worker_url = "http://127.0.0.1:8080/report"
 report_interval = 1
 reset_day = 1
-report_errors = true   # 仅 probe 线可配;cf/komari 固定上报 errors
-report_self = true     # 仅 probe 线可配;cf/komari 固定不上报 self
+report_errors = true   # probe 以 errors 上报；Komari 映射为 message；CF 无错误落点
+report_self = true     # 仅 probe 线可配；cf/komari 不上报 self
 interfaces = []        # 空 = 全部
 disks = []             # 空 = 全部
 report_gpu = true

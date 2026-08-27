@@ -35,12 +35,12 @@
 
 ### 1.1 本地配置结构（schema = 1）
 
-- 顶层：`schema`（结构版本；文件缺省该键 = 旧版 schema 0，启动时自动迁移、备份后回写为 1）、`data_dir`（运行态数据目录，net_static.json 等）、`auto_update`（含直连失败后依次尝试的 `proxys` 数组）。
+- 顶层：`schema`（结构版本；文件缺省该键 = 旧版 schema 0，启动时自动迁移、备份后回写为 1；旧 `net_static_path` 若使用自定义文件名，会把账本复制到新固定位置并保留源文件）、`data_dir`（运行态数据目录，net_static.json 等）、`auto_update`（含直连失败后依次尝试的 `proxys` 数组）。
 - 每条 `[[reporters]]` 只含 `id` + 一个协议段（`[reporters.cf]` / `[reporters.komari]` / `[reporters.probe]`），协议由出现的段决定；连接身份在段内，变更需重启。
 - 协议段内原生参数命名对齐原版 agent：cf 对齐 cfsm-agent（`server_id/secret/url/interval/collect_interval/wss_report_interval/connection_mode/reset_day/interface/ct/cu/cm/bd`）；komari 对齐 komari-agent（`endpoint/token/interval/month_rotate/enable_gpu/include_nics/include_mountpoints`）；probe 是原生完整形态（含 `intervals/interfaces/disks/report_gpu/pings` 与 `report_errors/report_self`）。CF 的 `collect_interval=0` 原值保留并对外上报；映射采集实体时，auto 取 `wss_report_interval`，http 取 `interval`。
 - 采集需求仍按"每路声明 + 聚合"：各协议段先转换为统一的采集配置实体（即 probe 段的采集字段），再按 §1 原则 5 的规则合并出机器级实际配置。
 - Agent 托管状态放在 `[reporters.<协议>.ext]` 下：cf/probe 的 `config_version`、komari 的 `learned_pings`；不进示例，勿手填。
-- `report_errors/report_self` 只有 probe 段可配；cf/komari 线固定 errors=true、self=false。cf 线固定启用 GPU、固定 samples[] 批量上报，连接可选 auto（WSS+POST 回退）或 http。
+- `report_errors/report_self` 只有 probe 段可配；probe 通过 `errors` 输出错误，Komari 固定把错误映射为 `message`，CF wire 没有错误落点；cf/komari 均不输出 self。cf 线固定启用 GPU、固定 samples[] 批量上报，连接可选 auto（WSS+POST 回退）或 http。
 
 ## 2. 指标分类
 
@@ -218,7 +218,7 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 
 | 项 | 约束 |
 |---|---|
-| `intervals` | 当前 Reporter 的六项采集需求，均 >= 1；应用后参与机器级最小值聚合 |
+| `intervals` | 当前 Reporter 的六项采集需求，均 >= 1；collect 参与机器级最大公约数聚合，其他 worker 周期取最小值 |
 | `report_interval` | 当前 Reporter 上报间隔（秒），>= 1；与全局 collect 无任何关系约束 |
 | `reset_day` | 月流量账期重置日，1-31；0 = 不重置（永久累计） |
 | `interfaces` | 当前 Reporter 的网卡白名单（glob 数组） |
@@ -231,7 +231,7 @@ Ping 去重键是“类型 + 规范化目标”：TCP 为小写 host + 有效端
 
 响应信封的 `server_time` 提供公共 NTP 不可用时的毫秒级兜底时间，`config` 收配置（除 config_version 外均可选，出现的才应用），`next` 放对下一次上报的指令（如 `next.static`）。响应只能修改产生该响应的 Reporter；机器级实际配置没有可直接写入口，而是每次从全部 Reporter 重新聚合，因此多路下发不会互相覆盖。🔒 连接身份与 `data_dir` 仍只接受本地 TOML。允许远端 Ping 时，服务端必须自行限制目标范围。
 
-落点随协议段不同：probe 段全量落地（上表所有项）；cf 段可落 `collect_interval`（允许 0）、`report_interval`（→ `interval`）、`wss_report_interval`、`connection_mode`、`reset_day`、`interfaces`（→ `interface` 串）、`pings`（仅 ct/cu/cm/bd 槽位），出现其他可下发项（非 collect 子间隔、非空 disks、`report_gpu=false`、非四大线路 Ping 名）整体拒绝，`report_errors/report_self` 对 cf 固定、直接忽略；komari 协议没有下发通道。
+落点随协议段不同：probe 段全量落地（上表所有项）；cf 段可落 `collect_interval`（允许 0）、`report_interval`（→ `interval`）、`wss_report_interval`、`connection_mode`、`reset_day`、`interfaces`（→ `interface` 串）、`pings`（仅 ct/cu/cm/bd 槽位），出现其他可下发项（非 collect 子间隔、非空 disks、`report_gpu=false`、非四大线路 Ping 名）整体拒绝；CF 的 `report_errors/report_self` 固定为 false，远端值直接忽略；komari 协议没有下发通道。
 
 ### 4.2 下发机制
 

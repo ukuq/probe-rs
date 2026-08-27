@@ -31,13 +31,38 @@ pub async fn run_if_requested() -> Result<bool> {
             set_traffic_correction(parse_correction_args(args)?).await?;
             Ok(true)
         }
+        "migrate-config" => {
+            migrate_config(args)?;
+            Ok(true)
+        }
         // 未知子命令必须报错:静默回退为启动 agent 会把拼错的管理命令变成
         // 一次意外的前台探针启动。
         other if !other.starts_with('-') => {
-            bail!("unknown command: {other} (supported: configure-cf, set-traffic-correction)")
+            bail!(
+                "unknown command: {other} (supported: configure-cf, set-traffic-correction, migrate-config)"
+            )
         }
         _ => Ok(false),
     }
+}
+
+fn migrate_config(args: impl Iterator<Item = String>) -> Result<()> {
+    let mut config_path = None;
+    let mut args = args;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" => {
+                config_path = Some(PathBuf::from(
+                    args.next().context("--config requires a value")?,
+                ));
+            }
+            _ => bail!("unknown migrate-config option: {arg}"),
+        }
+    }
+    let path = config_path.context("migrate-config requires --config")?;
+    config::load(&path).with_context(|| format!("failed to migrate {}", path.display()))?;
+    println!("{}", path.display());
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -675,6 +700,39 @@ mod tests {
             .find(|line| line.starts_with("IGNORED_WITH_VALUE="))
             .unwrap()
             .contains("--install-ghproxy"));
+        assert!(script.contains(r#""$BIN_DST" migrate-config --config "$CONFIG_PATH""#));
+    }
+
+    #[test]
+    fn migrate_config_command_upgrades_legacy_komari_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let ledger = dir
+            .path()
+            .join("net_static.json")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let raw = format!(
+            r#"net_static_path = "{ledger}"
+
+[[reporters]]
+id = "komari"
+protocol = "komari"
+secret = "token"
+worker_url = "https://komari.example.com"
+report_interval = 3
+
+[reporters.intervals]
+collect = 3
+"#
+        );
+        std::fs::write(&path, raw).unwrap();
+
+        migrate_config(vec!["--config".into(), path.display().to_string()].into_iter()).unwrap();
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(migrated.contains("schema = 1"));
+        assert!(migrated.contains("[reporters.komari]"));
+        assert!(path.with_extension("toml.bak").exists());
     }
 
     #[test]

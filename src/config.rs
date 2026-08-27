@@ -338,8 +338,8 @@ impl LocalConfig {
                             interfaces: collect.interfaces,
                             disks: collect.disks,
                             report_gpu: collect.report_gpu,
-                            // cf 线固定上报 errors、不上报 self。
-                            report_errors: true,
+                            // CF wire 没有 errors/self 落点。
+                            report_errors: false,
                             report_self: false,
                             pings: scoped_pings(collect.pings),
                         }
@@ -603,27 +603,10 @@ pub(crate) fn split_list(raw: &str, delimiter: char) -> Vec<String> {
         .collect()
 }
 
-/// CF 四大线路节点的 Ping 类型:URL 形式为 HTTP,其余按 TCP(host[:port])。
-pub(crate) fn cf_node_ping(name: &str, target: &str) -> Result<PingTarget> {
-    if target.trim().is_empty() {
-        bail!("cf.{name} 不能为空串,不需要时请删除该键");
-    }
-    let lowercase = target.to_ascii_lowercase();
-    let kind = if lowercase.starts_with("http://") || lowercase.starts_with("https://") {
-        PingKind::Http
-    } else {
-        PingKind::Tcp
-    };
-    Ok(PingTarget {
-        name: name.to_string(),
-        kind,
-        target: target.to_string(),
-        interval: None,
-    })
-}
-
 fn validate_cf_node(name: &str, target: &str) -> Result<()> {
-    ping_task_key(&cf_node_ping(name, target)?)?;
+    let ping = crate::model::cf_node_ping(name, target)
+        .with_context(|| format!("cf.{name} 不能为空串,不需要时请删除该键"))?;
+    ping_task_key(&ping)?;
     Ok(())
 }
 
@@ -1153,7 +1136,7 @@ fn apply_remote_cf(section: &mut crate::model::CfSection, remote: &RemoteConfig)
             bail!("cf 线固定启用 GPU,不能远端关闭");
         }
     }
-    // report_errors/report_self 对 cf 线固定,远端推送直接忽略。
+    // CF wire 没有 errors/self 落点；两项固定为 false，远端推送直接忽略。
     section.ext.config_version = remote.config_version.clone();
     Ok(())
 }
@@ -1257,7 +1240,14 @@ pub fn load(path: &Path) -> Result<LocalConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("读取配置失败: {}", path.display()))?;
     if is_legacy_schema(&raw)? {
-        let (cfg, warnings) = crate::config_legacy::migrate(&raw)?;
+        let (cfg, mut warnings, legacy_net_static_path) =
+            crate::config_legacy::migrate_for_load(&raw)?;
+        if let Some(source) = legacy_net_static_path {
+            if let Some(warning) = migrate_legacy_net_static_file(&source, &cfg.net_static_path())?
+            {
+                warnings.push(warning);
+            }
+        }
         let backup_path = path.with_extension("toml.bak");
         persist_bytes(&backup_path, raw.as_bytes())
             .with_context(|| format!("备份旧配置失败: {}", backup_path.display()))?;
@@ -1273,6 +1263,46 @@ pub fn load(path: &Path) -> Result<LocalConfig> {
         return Ok(cfg);
     }
     parse_text(&raw)
+}
+
+fn migrate_legacy_net_static_file(source: &Path, target: &Path) -> Result<Option<String>> {
+    if source == target || !source.exists() {
+        return Ok(None);
+    }
+    if !source.is_file() {
+        bail!("旧 net_static_path 不是文件: {}", source.display());
+    }
+    if target.exists() {
+        let same_file = source
+            .canonicalize()
+            .ok()
+            .zip(target.canonicalize().ok())
+            .is_some_and(|(source, target)| source == target);
+        if same_file {
+            return Ok(None);
+        }
+        bail!(
+            "旧流量账本 {} 与新账本 {} 同时存在，拒绝覆盖；请先合并或移走其中一个文件",
+            source.display(),
+            target.display()
+        );
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建新账本目录失败: {}", parent.display()))?;
+    }
+    std::fs::copy(source, target).with_context(|| {
+        format!(
+            "迁移旧流量账本失败: {} -> {}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    Ok(Some(format!(
+        "旧流量账本已复制到 {}，原文件 {} 保留作为备份",
+        target.display(),
+        source.display()
+    )))
 }
 
 /// 顶层缺少 schema 键即视为旧版(schema 0)配置。
@@ -1802,6 +1832,7 @@ report_interval = 60
 
         let cf = cfg.reporter("cf-a").unwrap();
         assert!(cf.report_gpu); // cf 固定启用 GPU
+        assert!(!cf.report_errors); // CF wire 没有错误事件落点
         assert_eq!(cf.source_collect_interval, 0);
         assert_eq!(cf.intervals.collect, 4); // auto + collect=0 跟随 WSS 配置周期
         assert_eq!(cf.pings.len(), 1);
@@ -1859,6 +1890,21 @@ report_interval = 60
         assert_eq!(global.pings.len(), 1);
         assert_eq!(global.pings[0].target, "tcp://example.com:80");
         assert_eq!(global.pings[0].interval, 10);
+    }
+
+    #[test]
+    fn cf_url_nodes_keep_http_ping_type_when_building_specs() {
+        let mut cfg = base_config();
+        cfg.reporters.clear();
+        let mut cf = cf_reporter("cf-url");
+        cf.cf.as_mut().unwrap().ct = Some("https://example.com".into());
+        cfg.reporters.push(cf);
+        cfg.validate().unwrap();
+
+        let spec = cfg.reporter("cf-url").unwrap();
+        assert_eq!(spec.pings.len(), 1);
+        assert_eq!(spec.pings[0].target.kind, PingKind::Http);
+        assert_eq!(spec.pings[0].task_id, "http:https://example.com:443");
     }
 
     #[test]

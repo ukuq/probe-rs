@@ -8,7 +8,7 @@
 # 参数映射：-e/-t/-i/--month-rotate/--gpu/--include-nics/--install-version 直接生效；
 # 其余官方参数（--disable-web-ssh 等）兼容接收、提示后忽略——同一条命令永不过错。
 # 说明：komari 探针没有 collect/report 之分（每 tick 直采直发），
-# -i 是官方 interval 语义；脚本按建议值拆成 collect=1 / report=<interval>。
+# -i 是官方 interval 语义；同一个值同时作为采集与上报周期。
 #
 # 卸载：bash komari-install.sh uninstall [--purge]
 set -euo pipefail
@@ -256,6 +256,16 @@ install -d -m 0755 "$DATA_DIR"
 install -d -m 0750 "$CONF_DIR"
 CONFIG_PATH="$CONF_DIR/config.toml"
 
+# v0.1.3 等无 schema 的扁平配置必须先由当前二进制统一迁移；直接用 shell
+# 追加 [reporters.komari] 会生成新旧结构混合、无法再次加载的文件。
+if [ -s "$CONFIG_PATH" ]; then
+    if ! grep -Eq '^[[:space:]]*schema[[:space:]]*=[[:space:]]*1([[:space:]]*#.*)?[[:space:]]*$' "$CONFIG_PATH"; then
+        log "检测到旧版配置，迁移为 schema 1"
+    fi
+    # migrate-config 由 TOML 解析结果判断 schema；对新版文件则只做完整校验。
+    "$BIN_DST" migrate-config --config "$CONFIG_PATH" >/dev/null
+fi
+
 # Remove one complete [[reporters]] subtree while preserving all other
 # reporters and any root tables serialized after it.
 remove_reporter_block() {
@@ -401,13 +411,8 @@ fi
 
 
 if [ -s "$CONFIG_PATH" ] &&
-   grep -q '^[[:space:]]*\[\[reporters\]\]' "$CONFIG_PATH" &&
-   ! awk '
-       /^[[:space:]]*\[intervals\][[:space:]]*$/ || /^[[:space:]]*\[\[pings\]\][[:space:]]*$/ { found=1; exit }
-       /^[[:space:]]*\[/ { exit }
-       /^[[:space:]]*(server_id|enable_gpu)[[:space:]]*=/ { found=1 }
-       END { exit found ? 0 : 1 }
-   ' "$CONFIG_PATH"; then
+   grep -q '^[[:space:]]*schema[[:space:]]*=[[:space:]]*1' "$CONFIG_PATH" &&
+   grep -q '^[[:space:]]*\[\[reporters\]\]' "$CONFIG_PATH"; then
     remove_reporter_block "$CONFIG_PATH" "$REPORTER_ID"
     cat >> "$CONFIG_PATH" <<EOF
 
@@ -425,7 +430,7 @@ include_mountpoints = ""
 EOF
     log "preserved other Reporters and upserted Komari Reporter '$REPORTER_ID'"
 else
-    # 缺失配置或旧的根连接 schema 都直接覆盖为新 canonical 格式，不做兼容迁移。
+    # 仅缺失配置时创建新 canonical 文件；旧配置已在上方统一迁移。
 cat > "$CONFIG_PATH" <<EOF
 schema = 1
 

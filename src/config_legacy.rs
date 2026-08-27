@@ -4,7 +4,7 @@
 //! 新格式拆成协议段(cf / komari / probe),采集字段按协议段的原版命名
 //! 重新归位。无法在目标段形中表达的旧字段尽力迁移并逐条产生警告。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -97,8 +97,17 @@ impl Default for LegacyCfExt {
 
 /// 把旧版配置文本转换为新结构;返回配置与逐条迁移警告。
 pub fn migrate(raw: &str) -> Result<(LocalConfig, Vec<String>)> {
+    let (config, warnings, _) = migrate_for_load(raw)?;
+    Ok((config, warnings))
+}
+
+/// 配置加载路径额外返回旧账本的精确文件名，供调用方在写入 schema 1
+/// 前迁移到新的固定 data_dir/net_static.json。
+pub(crate) fn migrate_for_load(raw: &str) -> Result<(LocalConfig, Vec<String>, Option<PathBuf>)> {
     let legacy: LegacyLocalConfig = toml::from_str(raw).context("解析旧版配置失败")?;
     let mut warnings = Vec::new();
+    let legacy_net_static_path = (!legacy.net_static_path.trim().is_empty())
+        .then(|| PathBuf::from(legacy.net_static_path.trim()));
 
     let data_dir = {
         let path = Path::new(legacy.net_static_path.trim());
@@ -133,7 +142,7 @@ pub fn migrate(raw: &str) -> Result<(LocalConfig, Vec<String>)> {
         reporters,
     };
     cfg.validate().context("旧配置迁移结果非法")?;
-    Ok((cfg, warnings))
+    Ok((cfg, warnings, legacy_net_static_path))
 }
 
 fn convert_reporter(legacy: LegacyReporterConfig, warnings: &mut Vec<String>) -> ReporterConfig {
@@ -236,7 +245,7 @@ fn convert_reporter(legacy: LegacyReporterConfig, warnings: &mut Vec<String>) ->
             }
             if !legacy.report_errors {
                 warnings.push(format!(
-                    "reporter {id}: report_errors=false 已失效,komari 线固定上报 errors"
+                    "reporter {id}: report_errors=false 已失效,komari 线固定把错误映射为 message"
                 ));
             }
             if legacy.report_self {
@@ -509,6 +518,23 @@ last_seen_at = 1786252800000
         // 幂等:第二次加载不再触发迁移
         let again = crate::config::load(&path).unwrap();
         assert_eq!(again, cfg);
+    }
+
+    #[test]
+    fn custom_legacy_ledger_filename_is_copied_to_the_canonical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let legacy_ledger = dir.path().join("monthly.json");
+        let legacy_toml_path = legacy_ledger.to_string_lossy().replace('\\', "/");
+        let raw = LEGACY_PROBE.replace("/var/lib/probe-rs/net_static.json", &legacy_toml_path);
+        std::fs::write(&config_path, raw).unwrap();
+        std::fs::write(&legacy_ledger, b"legacy-ledger").unwrap();
+
+        let cfg = crate::config::load(&config_path).unwrap();
+        let canonical = cfg.net_static_path();
+        assert_eq!(canonical, dir.path().join("net_static.json"));
+        assert_eq!(std::fs::read(&canonical).unwrap(), b"legacy-ledger");
+        assert_eq!(std::fs::read(&legacy_ledger).unwrap(), b"legacy-ledger");
     }
 
     #[test]

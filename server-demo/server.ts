@@ -2389,7 +2389,7 @@ var EXAMPLE_JSON5 = \`{
       },
       "reporters": [                        // 本机全部 Reporter 的脱敏拓扑/输出策略；当前线路是 primary/probe
         {
-          "id": "primary", "protocol": "probe", "report_interval": 30, "reset_day": 1,
+          "id": "primary", "protocol": "probe", "source_collect_interval": 1, "report_interval": 30, "reset_day": 1,
           "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
           "interfaces": [], "disks": [], "report_gpu": true, "report_errors": true, "report_self": true,
           "pings": [
@@ -2399,15 +2399,16 @@ var EXAMPLE_JSON5 = \`{
           ]
         },
         {
-          "id": "cf-upstream", "protocol": "cf", "report_interval": 30, "reset_day": 1,
-          "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
-          "interfaces": [], "disks": [], "report_gpu": true, "report_errors": true, "report_self": false,
+          "id": "cf-upstream", "protocol": "cf", "source_collect_interval": 0,
+          "connection_mode": "auto", "wss_report_interval": 2, "report_interval": 30, "reset_day": 1,
+          "intervals": { "collect": 2, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
+          "interfaces": [], "disks": [], "report_gpu": true, "report_errors": false, "report_self": false,
           "pings": [
             { "name": "ct", "type": "tcp", "target": "gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 }
           ]
         },
         {
-          "id": "komari", "protocol": "komari", "report_interval": 1, "reset_day": 12,
+          "id": "komari", "protocol": "komari", "source_collect_interval": 1, "report_interval": 1, "reset_day": 12,
           "intervals": { "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
           "interfaces": [], "disks": [], "report_gpu": true, "report_errors": true, "report_self": false,
           "pings": []
@@ -2490,13 +2491,15 @@ var CONFIG_EXAMPLE_JSON5 = \`{
       "cf": {                                   // 命名对齐 cfsm-agent
         "server_id": "cf-panel-uuid", "secret": "cf-api-secret",
         "url": "https://cf.example.com/update",
+        "connection_mode": "auto",                // auto = WSS + POST 回退；http = 仅 POST
         "interval": 30,                         // 上报周期(原版 report_interval)
-        "collect_interval": 1,                  // 采集需求:参与全局最小值聚合
+        "collect_interval": 0,                  // 0 时按连接模式映射当前 Reporter 的采集需求
+        "wss_report_interval": 2,               // auto + collect_interval=0 时使用
         "reset_day": 1,
         "interface": "",                        // 逗号分隔;空 = 全部默认物理网卡
         "ct": "gd-ct-dualstack.ip.zstaticcdn.com:80",
         "cu": "gd-cu-dualstack.ip.zstaticcdn.com:80"
-        // cf 线固定:启用 GPU、上报 errors、samples[] 批量、auto(WSS+POST 回退)
+        // cf 线固定:启用 GPU、samples[] 批量；wire 没有 errors/self 落点
         // config_version 由 Agent 回写至 cf.ext,勿手填
       }
     },

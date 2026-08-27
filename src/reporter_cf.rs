@@ -342,7 +342,8 @@ pub struct CfPush {
     pub connection_mode: Option<CfConnectionMode>,
 }
 
-/// 把 CF 推送合成为当前 Reporter 的远端配置；其 collect 需求随后参与全局最小值聚合。
+/// 把 CF 推送合成为当前 Reporter 的远端配置；映射后的 collect 需求随后交给
+/// 通用全局聚合。
 pub fn synthesize_remote(
     push: &CfPush,
     current: &crate::model::Intervals,

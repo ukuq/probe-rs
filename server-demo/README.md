@@ -43,8 +43,20 @@ HOST=0.0.0.0 deno run --allow-net --allow-env=HOST server.ts # 显式对外监�
 ## 演示流程
 
 1. 启动服务端：`deno run --allow-net --allow-env=HOST server.ts`
-2. 在 agent 的 `config.toml` 中增加一条 `[[reporters]]`：`protocol = "probe"`、
-   `worker_url = "http://127.0.0.1:8080/report"`、`secret = "change-me"`
+2. 在 agent 的 `config.toml` 中只保留需要的 Reporter（删除示例中的 CF/Komari
+   占位项），并增加或填写当前嵌套结构：
+
+```toml
+[[reporters]]
+id = "local-demo"
+
+[reporters.probe]
+server_id = "my-host"
+secret = "change-me"
+worker_url = "http://127.0.0.1:8080/report"
+report_interval = 10
+```
+
 3. 启动 agent：`probe-rs -c config.toml`，面板上出现数据
 4. 下发配置（演示远端热更新）：
 
@@ -56,8 +68,8 @@ curl -X POST localhost:8080/api/config/URL编码后的instance_id \
 
 服务端校验周期、glob 与 Ping 基本格式 → 下次上报随响应下发 → agent 原子应用该
 Reporter 配置并落盘，面板上的 `cfg v` 版本号随之更新。Agent
-随后自动重算实际机器级配置：周期取所有 Reporter 最小值、GPU 取
-OR、网卡/磁盘/Ping 取并集。生产服务端允许下发 Ping 时应额外限制目标， 避免
+随后自动重算实际机器级配置：collect 取所有 Reporter 需求的最大公约数，其他
+worker 周期取最小值，GPU 取 OR，网卡/磁盘/Ping 取并集。生产服务端允许下发 Ping 时应额外限制目标，避免
 SSRF/内网探测。
 
 ## 注意
@@ -66,5 +78,5 @@ SSRF/内网探测。
 - 全局单一密钥 `change-me`，生产应按 server_id 分配并换 HTTPS
 - 面板只能列出实际向本 Demo 上报的实例；发往外部 CF/Komari
   面板的连接地址、密钥和状态不会被枚举
-- Reporter 的新增/删除及 `server_id`、`secret`、`worker_url`、`protocol`
-  只允许改本地配置；远端配置始终只作用于响应所属实例
+- Reporter 的新增/删除、协议段选择及其中的连接字段（如 probe 的
+  `server_id`、`secret`、`worker_url`）只允许改本地配置；远端配置始终只作用于响应所属实例

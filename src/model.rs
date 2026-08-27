@@ -486,12 +486,9 @@ impl CfSection {
         ]
         .into_iter()
         .filter_map(|(name, target)| {
-            target.as_ref().map(|target| PingTarget {
-                name: name.to_string(),
-                kind: PingKind::Tcp,
-                target: target.clone(),
-                interval: None,
-            })
+            target
+                .as_deref()
+                .and_then(|target| cf_node_ping(name, target))
         })
         .collect();
         CollectConfig {
@@ -506,6 +503,26 @@ impl CfSection {
             pings,
         }
     }
+}
+
+/// CF 四大线路节点沿用原协议的类型推断：HTTP(S) URL 使用 HTTP Ping，
+/// 其余 host[:port] 使用 TCP Ping。空值由配置校验负责报错。
+pub(crate) fn cf_node_ping(name: &str, target: &str) -> Option<PingTarget> {
+    if target.trim().is_empty() {
+        return None;
+    }
+    let lowercase = target.to_ascii_lowercase();
+    let kind = if lowercase.starts_with("http://") || lowercase.starts_with("https://") {
+        PingKind::Http
+    } else {
+        PingKind::Tcp
+    };
+    Some(PingTarget {
+        name: name.to_string(),
+        kind,
+        target: target.to_string(),
+        interval: None,
+    })
 }
 
 /// CF 段的 Agent 托管状态；不出现在示例配置中。
