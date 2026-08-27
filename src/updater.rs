@@ -6,11 +6,11 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
-use crate::config::{AutoUpdateConfig, LocalConfig, UpdateChannel};
+use crate::config::{validate_update_repository, AutoUpdateConfig, LocalConfig, UpdateChannel};
 
-/// 发布源身份：所有 GitHub URL（含资产下载域的前缀安全检查）都从该常量派生，
-/// 仓库迁移时只改这一处。
-const GITHUB_REPO: &str = "ukuq/probe-rs";
+/// Release 工作流将当前 `${{ github.repository }}` 写入构建环境。源码构建未提供
+/// 该值时不猜测上游仓库；只有本地配置显式指定来源后才允许自动更新。
+const EMBEDDED_UPDATE_REPOSITORY: Option<&str> = option_env!("PROBE_RS_UPDATE_REPOSITORY");
 const CHECKSUM_ASSET: &str = "SHA256SUMS";
 const MAX_BINARY_BYTES: usize = 100 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: usize = 1024 * 1024;
@@ -84,6 +84,7 @@ pub fn spawn(
                 tracing::info!(
                     current = env!("CARGO_PKG_VERSION"),
                     channel = %settings.channel,
+                    repository = effective_update_repository(&settings).unwrap_or("<unconfigured>"),
                     "checking for updates"
                 );
                 match check_and_apply(&settings).await {
@@ -143,6 +144,7 @@ pub fn spawn(
 }
 
 async fn check_and_apply(settings: &AutoUpdateConfig) -> Result<CheckOutcome> {
+    let repository = effective_update_repository(settings)?;
     let asset_name = platform_asset_name(std::env::consts::OS, std::env::consts::ARCH)
         .context("automatic updates are not published for this platform")?;
     let current = Version::parse(env!("CARGO_PKG_VERSION"))
@@ -152,18 +154,19 @@ async fn check_and_apply(settings: &AutoUpdateConfig) -> Result<CheckOutcome> {
         .user_agent(concat!("probe-rs/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("failed to create update HTTP client")?;
-    let releases = fetch_releases(&client, settings.channel).await?;
+    let releases = fetch_releases(&client, repository, settings.channel).await?;
     let Some(candidate) = select_candidate(&releases, &current, settings.channel, asset_name)
     else {
         return Ok(CheckOutcome::Unchanged);
     };
 
-    validate_release_download_url(&candidate.binary_url, &candidate.tag)?;
-    validate_release_download_url(&candidate.checksum_url, &candidate.tag)?;
+    validate_release_download_url(&candidate.binary_url, repository, &candidate.tag)?;
+    validate_release_download_url(&candidate.checksum_url, repository, &candidate.tag)?;
     tracing::info!(
         current = %current,
         available = %candidate.version,
         channel = %settings.channel,
+        repository,
         asset = asset_name,
         "new release available"
     );
@@ -255,15 +258,28 @@ async fn install_staged_update(staging: &tempfile::NamedTempFile) -> Result<Chec
     Ok(CheckOutcome::Restart)
 }
 
-fn releases_api() -> String {
-    format!("https://api.github.com/repos/{GITHUB_REPO}/releases")
+fn effective_update_repository(settings: &AutoUpdateConfig) -> Result<&str> {
+    let repository = settings
+        .repository
+        .as_deref()
+        .or(EMBEDDED_UPDATE_REPOSITORY)
+        .context(
+            "automatic update repository is not configured; set auto_update.repository or use a release build",
+        )?;
+    validate_update_repository(repository)?;
+    Ok(repository)
+}
+
+fn releases_api(repository: &str) -> String {
+    format!("https://api.github.com/repos/{repository}/releases")
 }
 
 async fn fetch_releases(
     client: &reqwest::Client,
+    repository: &str,
     channel: UpdateChannel,
 ) -> Result<Vec<GithubRelease>> {
-    let api = releases_api();
+    let api = releases_api(repository);
     let request = match channel {
         UpdateChannel::Stable => client.get(format!("{api}/latest")),
         UpdateChannel::Prerelease => client.get(format!("{api}?per_page=30")),
@@ -401,9 +417,10 @@ fn download_candidates(direct_url: &str, proxys: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn validate_release_download_url(url: &str, tag: &str) -> Result<()> {
+fn validate_release_download_url(url: &str, repository: &str, tag: &str) -> Result<()> {
+    validate_update_repository(repository)?;
     let url = reqwest::Url::parse(url).context("invalid release asset URL")?;
-    let expected_prefix = format!("/{GITHUB_REPO}/releases/download/{tag}/");
+    let expected_prefix = format!("/{repository}/releases/download/{tag}/");
     if url.scheme() != "https"
         || url.host_str() != Some("github.com")
         || !url.path().starts_with(&expected_prefix)
@@ -848,19 +865,21 @@ pub fn maybe_finish_windows_update() -> Result<bool> {
 mod tests {
     use super::*;
 
+    const TEST_REPOSITORY: &str = "fork-owner/probe-rs";
+
     fn release(version: &str, prerelease: bool, complete: bool) -> GithubRelease {
         let tag = format!("v{version}");
         let mut assets = vec![GithubAsset {
             name: "probe-rs-linux-x86_64".into(),
             browser_download_url: format!(
-                "https://github.com/ukuq/probe-rs/releases/download/{tag}/probe-rs-linux-x86_64"
+                "https://github.com/{TEST_REPOSITORY}/releases/download/{tag}/probe-rs-linux-x86_64"
             ),
         }];
         if complete {
             assets.push(GithubAsset {
                 name: CHECKSUM_ASSET.into(),
                 browser_download_url: format!(
-                    "https://github.com/ukuq/probe-rs/releases/download/{tag}/{CHECKSUM_ASSET}"
+                    "https://github.com/{TEST_REPOSITORY}/releases/download/{tag}/{CHECKSUM_ASSET}"
                 ),
             });
         }
@@ -952,6 +971,48 @@ mod tests {
         let parsed = checksum_for_asset(sums.as_bytes(), "probe-rs-linux-x86_64").unwrap();
         verify_sha256(data, &parsed, "probe-rs-linux-x86_64").unwrap();
         assert!(verify_sha256(b"tampered", &parsed, "probe-rs-linux-x86_64").is_err());
+    }
+
+    #[test]
+    fn configured_repository_overrides_the_embedded_source() {
+        let settings = AutoUpdateConfig {
+            repository: Some(TEST_REPOSITORY.into()),
+            ..AutoUpdateConfig::default()
+        };
+        assert_eq!(
+            effective_update_repository(&settings).unwrap(),
+            TEST_REPOSITORY
+        );
+        assert_eq!(
+            releases_api(TEST_REPOSITORY),
+            "https://api.github.com/repos/fork-owner/probe-rs/releases"
+        );
+    }
+
+    #[test]
+    fn missing_source_never_falls_back_to_the_official_repository() {
+        let settings = AutoUpdateConfig::default();
+        match EMBEDDED_UPDATE_REPOSITORY {
+            Some(repository) => {
+                assert_eq!(effective_update_repository(&settings).unwrap(), repository)
+            }
+            None => assert!(effective_update_repository(&settings).is_err()),
+        }
+    }
+
+    #[test]
+    fn release_asset_must_belong_to_the_selected_repository() {
+        let tag = "v1.0.0";
+        let expected = format!(
+            "https://github.com/{TEST_REPOSITORY}/releases/download/{tag}/probe-rs-linux-x86_64"
+        );
+        validate_release_download_url(&expected, TEST_REPOSITORY, tag).unwrap();
+        assert!(validate_release_download_url(
+            "https://github.com/ukuq/probe-rs/releases/download/v1.0.0/probe-rs-linux-x86_64",
+            TEST_REPOSITORY,
+            tag,
+        )
+        .is_err());
     }
 
     #[test]

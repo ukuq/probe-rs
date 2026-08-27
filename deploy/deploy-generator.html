@@ -324,7 +324,7 @@ bash <(curl -sL ...) -e https://panel.example.com -t your-token -i 1 --month-rot
   <section id="output"></section>
 
   <footer class="page">
-    生成目标：<span class="mono">deploy/cf-install.sh · deploy/komari-install.sh · deploy/install.sh</span>（ukuq/probe-rs）
+    生成目标：<span class="mono">deploy/cf-install.sh · deploy/komari-install.sh · deploy/install.sh</span>（更新仓库可配置）
   </footer>
 </div>
 
@@ -334,7 +334,30 @@ bash <(curl -sL ...) -e https://panel.example.com -t your-token -i 1 --month-rot
 /* ============================================================
  * 模式与字段定义（与 deploy/ 下三个安装脚本的参数一一对应）
  * ============================================================ */
-const SCRIPT_RAW_BASE = "https://raw.githubusercontent.com/ukuq/probe-rs/master/deploy";
+const OFFICIAL_UPDATE_REPOSITORY = "ukuq/probe-rs";
+const UPDATE_REPOSITORY_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+function isValidUpdateRepository(repository) {
+  if (!UPDATE_REPOSITORY_RE.test(repository)) return false;
+  return repository.split("/").every(part => part !== "." && part !== "..");
+}
+function inferPageRepository() {
+  const parts = location.pathname.split("/").filter(Boolean);
+  if (location.hostname === "raw.githubusercontent.com" && parts.length >= 2) {
+    return `${parts[0]}/${parts[1]}`;
+  }
+  if (location.hostname === "github.com" && parts.length >= 2) {
+    return `${parts[0]}/${parts[1]}`;
+  }
+  return OFFICIAL_UPDATE_REPOSITORY;
+}
+const DEFAULT_UPDATE_REPOSITORY = inferPageRepository();
+function normalizedUpdateRepository(value) {
+  const repository = String(value || "").trim();
+  return isValidUpdateRepository(repository) ? repository : OFFICIAL_UPDATE_REPOSITORY;
+}
+function scriptRawBase(repository) {
+  return `https://raw.githubusercontent.com/${repository}/master/deploy`;
+}
 const SCRIPT_VERSION = "v0.1.4-beta.4";
 
 const FIELDS = {
@@ -372,6 +395,8 @@ const FIELDS = {
         opts: [["", "缺省（保持现状）"], ["1", "开启"], ["0", "关闭"]] },
       { k: "update_channel", label: "更新通道", arg: "-update_channel", type: "select",
         opts: [["", "缺省 stable"], ["stable", "stable"], ["prerelease", "prerelease"]] },
+      { k: "update_repository", label: "更新仓库", arg: "-update_repository", def: DEFAULT_UPDATE_REPOSITORY, ph: "owner/repo", mono: true,
+        hint: "脚本、首次安装和后续自动更新均使用该 GitHub Release 仓库" },
       { k: "reporter_id", label: "Reporter ID", arg: "-reporter_id", def: "cf", ph: "cf", mono: true,
         hint: "在已有配置中追加/更新指定 Reporter" },
       { k: "install_version", label: "安装版本", arg: "-install-version", ph: "缺省脚本内置 " + SCRIPT_VERSION, mono: true },
@@ -406,6 +431,8 @@ const FIELDS = {
         opts: [["1", "开启（缺省）"], ["0", "关闭（--disable-auto-update）"]] },
       { k: "update_channel", label: "更新通道", arg: "--update-channel", type: "select", def: "stable",
         opts: [["stable", "stable（缺省）"], ["prerelease", "prerelease"]] },
+      { k: "update_repository", label: "更新仓库", arg: "--update-repository", def: DEFAULT_UPDATE_REPOSITORY, ph: "owner/repo", mono: true,
+        hint: "脚本、首次安装和后续自动更新均使用该 GitHub Release 仓库" },
       { k: "install_version", label: "安装版本", arg: "--install-version", ph: "缺省 latest", mono: true },
       { k: "ghproxy", label: "GitHub 代理前缀", arg: "--install-ghproxy", ph: "https://mirror.example.com/", mono: true,
         hint: "安装与自动更新均先直连，失败后再尝试代理" },
@@ -440,6 +467,8 @@ const FIELDS = {
         opts: [["0", "关闭（缺省）"], ["1", "开启"]] },
       { k: "update_channel", label: "更新通道", type: "select", def: "stable",
         opts: [["stable", "stable（缺省）"], ["prerelease", "prerelease"]] },
+      { k: "update_repository", label: "更新仓库", toml: "auto_update.repository", def: DEFAULT_UPDATE_REPOSITORY, ph: "owner/repo", mono: true,
+        hint: "本地构建未嵌入发布来源时，开启自动更新必须填写" },
       { k: "update_proxys", label: "更新代理", ph: "https://proxy-a.example,https://proxy-b.example", mono: true,
         hint: "自动更新先直连 GitHub，失败后按顺序尝试这些代理前缀" },
       { k: "bin_path", label: "二进制路径", ph: "缺省 ../target/release/probe-rs", mono: true,
@@ -540,6 +569,8 @@ function buildCF() {
   const missing = [];
   const args = [];
   const push = (flag, val) => { if (val !== "" && val !== undefined && val !== null) args.push(`${flag}=${shq(val)}`); };
+  const repository = String(v.update_repository || "").trim();
+  if (!isValidUpdateRepository(repository)) missing.push("更新仓库（owner/repo）");
   push("-id", v.id); push("-secret", v.secret); push("-url", v.url);
   push("-connection_mode", v.connection_mode);
   push("-collect_interval", v.collect); push("-wss_report_interval", v.wss_interval); push("-interval", v.interval);
@@ -547,6 +578,7 @@ function buildCF() {
   push("-ct", v.ct); push("-cu", v.cu); push("-cm", v.cm); push("-bd", v.bd);
   push("-interface", v.interfaces);
   push("-auto_update", v.auto_update); push("-update_channel", v.update_channel);
+  if (isValidUpdateRepository(repository)) push("-update_repository", repository);
   push("-rx_correction", v.rx_correction); push("-tx_correction", v.tx_correction);
   push("-reporter_id", v.reporter_id);
   args.push(`-debug=${v.debug ? "1" : "0"}`);
@@ -560,6 +592,8 @@ function buildKomari() {
   const missing = [];
   if (!v.endpoint) missing.push("面板地址");
   if (!v.token) missing.push("API Token");
+  const repository = String(v.update_repository || "").trim();
+  if (!isValidUpdateRepository(repository)) missing.push("更新仓库（owner/repo）");
   const t = [];
   if (v.endpoint) t.push("-e", shq(v.endpoint));
   if (v.token) t.push("-t", shq(v.token));
@@ -570,6 +604,7 @@ function buildKomari() {
   if (v.reporter_id && v.reporter_id !== "komari") t.push("--reporter-id", shq(v.reporter_id));
   if (v.auto_update === "0") t.push("--disable-auto-update");
   if (v.update_channel && v.update_channel !== "stable") t.push("--update-channel", shq(v.update_channel));
+  if (isValidUpdateRepository(repository)) t.push("--update-repository", shq(repository));
   if (v.install_version) t.push("--install-version", shq(v.install_version));
   if (v.ghproxy) t.push("--install-ghproxy", shq(v.ghproxy));
   if (v.bin) t.push("-bin=" + shq(v.bin));
@@ -582,6 +617,8 @@ function buildNativeToml() {
   if (!v.server_id) missing.push("服务器 ID");
   if (!v.secret) missing.push("密钥");
   if (!v.worker_url) missing.push("上报地址");
+  const repository = String(v.update_repository || "").trim();
+  if (!isValidUpdateRepository(repository)) missing.push("更新仓库（owner/repo）");
   const scope = v.scope || "user";
   if (scope === "user" && !v.data_dir) missing.push("数据目录绝对路径");
   const dataDir = v.data_dir || (scope === "system" ? "/var/lib/probe-rs" : "/home/YOUR_USER/.local/share/probe-rs");
@@ -596,6 +633,7 @@ data_dir = ${tomlStr(dataDir)}
 
 [auto_update]
 enabled = ${v.auto_update === "1"}
+repository = ${tomlStr(normalizedUpdateRepository(repository))}
 channel = ${tomlStr(v.update_channel || "stable")}
 check_interval = 21600
 proxys = ${tomlArr(v.update_proxys)}
@@ -660,7 +698,8 @@ function renderOutput() {
     const { missing, args } = buildCF();
     if (missing.length) html += `<div class="missing show">缺少必填项：${missing.join("、")} — 填好后命令即可使用</div>`;
     const shell = vals.cf.scope === "system" ? "sudo sh" : "sh";
-    const cmd = `curl -fsSL ${SCRIPT_RAW_BASE}/cf-install.sh | ${shell} -s -- install ${args.join(" ")}`;
+    const rawBase = scriptRawBase(normalizedUpdateRepository(vals.cf.update_repository));
+    const cmd = `curl -fsSL ${rawBase}/cf-install.sh | ${shell} -s -- install ${args.join(" ")}`;
     html += outBlock("sh — cf-install.sh", cmd);
     const pairs = [["scope", vals.cf.scope]].concat(args.map(a => { const i = a.indexOf("="); return [a.slice(0, i), a.slice(i + 1)]; }));
     if (pairs.length) html += `<div class="summary-label">安装参数（${pairs.length}）</div><div class="chips">${chipList(pairs)}</div>`;
@@ -668,7 +707,8 @@ function renderOutput() {
     const { missing, args } = buildKomari();
     if (missing.length) html += `<div class="missing show">缺少必填项：${missing.join("、")} — 填好后命令即可使用</div>`;
     const shell = vals.komari.scope === "system" ? "sudo bash" : "bash";
-    const cmd = `wget -qO- ${SCRIPT_RAW_BASE}/komari-install.sh | ${shell} -s -- ${args.join(" ")}`;
+    const rawBase = scriptRawBase(normalizedUpdateRepository(vals.komari.update_repository));
+    const cmd = `wget -qO- ${rawBase}/komari-install.sh | ${shell} -s -- ${args.join(" ")}`;
     html += outBlock("bash — komari-install.sh", cmd);
     const pairs = [["scope", vals.komari.scope]];
     for (let i = 0; i < args.length; i++) {
@@ -704,6 +744,7 @@ function renderOutput() {
       ["report_interval", v.report_interval || "60"], ["reset_day", v.reset_day || "1"],
       ["collect", v.collect || "10"], ["report_gpu", String(!!v.report_gpu)],
       ["auto_update", v.auto_update === "1" ? "on" : "off"],
+      ["update_repository", normalizedUpdateRepository(v.update_repository)],
     ])}</div>`;
   }
   out.innerHTML = html;
@@ -735,6 +776,11 @@ function tokenize(text) {
   });
 }
 
+function repositoryFromGeneratedCommand(text) {
+  const match = text.match(/raw\.githubusercontent\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/[^/]+\/deploy\/(?:cf-install|komari-install)\.sh/i);
+  return match ? match[1] : "";
+}
+
 function parseCF(rawText) {
   const map = {};
   const alias = {
@@ -747,6 +793,7 @@ function parseCF(rawText) {
     ct: "ct", cu: "cu", cm: "cm", bd: "bd",
     interface: "interfaces", interfaces: "interfaces", iface: "interfaces",
     auto_update: "auto_update", "auto-update": "auto_update",
+    update_repository: "update_repository", "update-repository": "update_repository",
     update_channel: "update_channel", "update-channel": "update_channel",
     rx_correction: "rx_correction", tx_correction: "tx_correction",
     reporter_id: "reporter_id", "reporter-id": "reporter_id",
@@ -768,6 +815,10 @@ function parseCF(rawText) {
     if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
     map[key] = val;
   }
+  if (map.update_repository === undefined) {
+    const sourceRepository = repositoryFromGeneratedCommand(rawText);
+    if (sourceRepository) map.update_repository = sourceRepository;
+  }
   const cfCommand = /(?:cf-install\.sh|huilang-me\/cfsm-agent)/i.test(rawText);
   const cfSpecific = ["id","secret","url","collect","wss_interval","connection_mode","reset_day","ct","cu","cm","bd","rx_correction","tx_correction"].some(k => map[k] !== undefined);
   if (!cfCommand && !cfSpecific) return null;
@@ -775,7 +826,7 @@ function parseCF(rawText) {
   v.scope = /\|\s*sudo\s+(?:sh|bash)\b/.test(rawText) ? "system" : "user";
   for (const k of ["id","secret","url","collect","wss_interval","interval","connection_mode","reset_day","ct","cu","cm","bd",
                    "interfaces","auto_update","update_channel","rx_correction","tx_correction","reporter_id",
-                   "install_version","ghproxy","bin"]) {
+                   "update_repository","install_version","ghproxy","bin"]) {
     if (map[k] !== undefined) v[k] = map[k];
   }
   if (map.debug !== undefined) v.debug = map.debug === "1" || map.debug === "true";
@@ -794,6 +845,7 @@ function parseKomari(tokens) {
     "--include-nics": "include_nics",
     "--install-version": "install_version",
     "--install-ghproxy": "ghproxy",
+    "--update-repository": "update_repository", "--update-repo": "update_repository",
     "--reporter-id": "reporter_id",
     "--update-channel": "update_channel",
   };
@@ -834,6 +886,11 @@ function autoParse() {
   }
   const kmKeys = parseKomari(tokens);
   if (kmKeys) {
+    const sourceRepository = repositoryFromGeneratedCommand(text);
+    if (sourceRepository && !kmKeys.includes("update_repository")) {
+      vals.komari.update_repository = sourceRepository;
+      kmKeys.push("update_repository");
+    }
     renderForm("komari"); setMode("komari");
     showParseResult(true, `识别为 Komari 安装命令，已填充 ${kmKeys.length} 个参数`, kmKeys);
     return;

@@ -35,7 +35,7 @@
 
 ### 1.1 本地配置结构（schema = 1）
 
-- 顶层：`schema`（结构版本；文件缺省该键 = 旧版 schema 0，启动时自动迁移、备份后回写为 1；旧 `net_static_path` 若使用自定义文件名，会把账本复制到新固定位置并保留源文件）、`data_dir`（运行态数据目录，net_static.json 等）、`auto_update`（含直连失败后依次尝试的 `proxys` 数组）。
+- 顶层：`schema`（结构版本；文件缺省该键 = 旧版 schema 0，启动时自动迁移、备份后回写为 1；旧 `net_static_path` 若使用自定义文件名，会把账本复制到新固定位置并保留源文件）、`data_dir`（运行态数据目录，net_static.json 等）、`auto_update`（可选 `repository = "owner/repo"` 本地覆盖，以及直连失败后依次尝试的 `proxys` 数组）。Release 构建默认绑定构建它的 GitHub 仓库；源码构建未显式提供来源时不猜测上游。
 - 每条 `[[reporters]]` 只含 `id` + 一个协议段（`[reporters.cf]` / `[reporters.komari]` / `[reporters.probe]`），协议由出现的段决定；连接身份在段内，变更需重启。
 - 协议段内原生参数命名对齐原版 agent：cf 对齐 cfsm-agent（`server_id/secret/url/interval/collect_interval/wss_report_interval/connection_mode/reset_day/interface/ct/cu/cm/bd`）；komari 对齐 komari-agent（`endpoint/token/interval/month_rotate/enable_gpu/include_nics/include_mountpoints`）；probe 是原生完整形态（含 `intervals/interfaces/disks/report_gpu/pings` 与 `report_errors/report_self`）。CF 的 `collect_interval=0` 原值保留并对外上报；映射采集实体时，auto 取 `wss_report_interval`，http 取 `interval`。
 - 采集需求仍按"每路声明 + 聚合"：各协议段先转换为统一的采集配置实体（即 probe 段的采集字段），再按 §1 原则 5 的规则合并出机器级实际配置。

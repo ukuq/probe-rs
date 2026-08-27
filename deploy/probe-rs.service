@@ -19,7 +19,8 @@ RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
 # /usr/local/bin is writable so the checksum-verified updater can atomically
-# replace probe-rs. The repository and asset names are fixed in the binary.
+# replace probe-rs. The release repository comes from local config or build
+# metadata; platform asset names remain fixed by the updater.
 ReadWritePaths=-/var/lib/probe-rs -/etc/probe-rs -/usr/local/bin
 ProtectHome=true
 PrivateTmp=true

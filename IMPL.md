@@ -125,8 +125,9 @@ probe-rs/
 
 - `[auto_update] enabled=false` 默认关闭；`stable` 只读取正式 Release，`prerelease` 同时接受预发布版及之后更高的正式版。
 - 仅当远端版本按 SemVer precedence 严格大于编译版本时更新；draft、缺少当前平台资产或缺少 `SHA256SUMS` 的 Release 均跳过。
-- GitHub 仓库、下载路径和平台资产名编译期固定；二进制下载后必须通过 Release 附带的 SHA-256 校验。
-- `[auto_update].proxys` 是代理前缀数组；Release 资产始终先直连，失败后才按数组顺序尝试代理。GitHub Releases API 仍保持直连。CF/Komari 安装器的 `install-ghproxy` 同样只作安装下载兜底，并追加到该数组供后续自动更新使用。
+- Release 工作流把当前 `${{ github.repository }}` 编译进产物，因此 Fork 的 Release 默认只跟随自己的仓库；本地 `auto_update.repository = "owner/repo"` 可覆盖该来源。源码构建既没有内嵌来源、也没有本地覆盖时拒绝自动更新，不静默回退到官方仓库。
+- 更新仓库只接受 `owner/repo`，不能由 Reporter 远端配置下发；下载 URL 必须属于所选仓库的对应 Release，二进制还必须通过 Release 附带的 SHA-256 校验。
+- `[auto_update].proxys` 是代理前缀数组；Release 资产始终先直连，失败后才按数组顺序尝试代理。GitHub Releases API 仍保持直连。CF/Komari 安装器的 `update-repository` 同时控制首次下载和配置覆盖，`install-ghproxy` 只作下载兜底，并追加到该数组供后续自动更新使用。
 - Linux 原子替换后由 systemd `Restart=always` 拉起；Windows 使用新版 helper 等旧 Agent 退出后重新运行计划任务（等待超时会安全失败、不会双 Agent 并存），托盘 companion 单独替换、会话内替换需下次登录生效。
 - GitHub/API/下载/校验失败只记日志，不中断采集和上报；检查周期最低 300 秒，默认 6 小时。
 

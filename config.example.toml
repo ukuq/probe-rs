@@ -10,6 +10,9 @@ data_dir = "/var/lib/probe-rs"
 # releases and a later stable release. The version must increase by SemVer.
 [auto_update]
 enabled = false
+# Optional local override. Release builds default to the repository that built
+# them; source builds have no implicit update source.
+# repository = "owner/probe-rs"
 channel = "stable" # stable | prerelease
 check_interval = 21600 # seconds; minimum 300
 proxys = [] # direct GitHub download first, then try these proxy prefixes in order

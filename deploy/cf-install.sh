@@ -4,7 +4,7 @@
 set -eu
 
 SCRIPT_VERSION=v0.1.4-beta.4
-GITHUB_REPO=https://github.com/ukuq/probe-rs
+DEFAULT_UPDATE_REPOSITORY=ukuq/probe-rs
 
 log() { printf '%s\n' "[probe-rs] $*"; }
 die() { printf '%s\n' "[probe-rs] error: $*" >&2; exit 1; }
@@ -74,6 +74,7 @@ usage() {
         '  -rx_correction= -tx_correction=      current billing-period totals in GiB' \
         '  -debug=                              0/1' \
         '  -install-version[=]                   release tag (default: script version)' \
+        '  -update_repository[=]                 GitHub Release repository (owner/repo)' \
         '  -install-ghproxy[=]                   GitHub proxy URL prefix; persisted as update fallback' \
         '  -no_start / -no-start[=0|1]          install without starting' \
         '' \
@@ -125,13 +126,13 @@ esac
 ID= SECRET= URL= BIN=
 COLLECT= WSS_REPORT= REPORT= RESET_DAY= INTERFACES= CONNECTION_MODE=
 CT= CU= CM= BD=
-AUTO_UPDATE= UPDATE_CHANNEL= RX_CORRECTION= TX_CORRECTION=
+AUTO_UPDATE= UPDATE_REPOSITORY= UPDATE_CHANNEL= RX_CORRECTION= TX_CORRECTION=
 REPORTER_ID=cf INSTALL_VERSION=$SCRIPT_VERSION GH_PROXY=
 DEBUG=false NO_START=false
 ID_SET=false SECRET_SET=false URL_SET=false
 COLLECT_SET=false WSS_REPORT_SET=false REPORT_SET=false RESET_SET=false INTERFACES_SET=false CONNECTION_MODE_SET=false
 CT_SET=false CU_SET=false CM_SET=false BD_SET=false
-AUTO_UPDATE_SET=false UPDATE_CHANNEL_SET=false
+AUTO_UPDATE_SET=false UPDATE_REPOSITORY_SET=false UPDATE_CHANNEL_SET=false
 RX_SET=false TX_SET=false DEBUG_SET=false
 
 while [ "$#" -gt 0 ]; do
@@ -157,6 +158,14 @@ while [ "$#" -gt 0 ]; do
             ;;
         -update_channel=*|--update-channel=*)
             UPDATE_CHANNEL=${arg#*=}; UPDATE_CHANNEL_SET=true
+            ;;
+        -update_repository=*|-update-repository=*|--update-repository=*)
+            UPDATE_REPOSITORY=${arg#*=}; UPDATE_REPOSITORY_SET=true
+            ;;
+        -update_repository|-update-repository|--update-repository)
+            [ "$#" -gt 0 ] || die "$arg requires a value"
+            UPDATE_REPOSITORY=$1; UPDATE_REPOSITORY_SET=true
+            shift
             ;;
         -rx_correction=*) RX_CORRECTION=${arg#*=}; RX_SET=true ;;
         -tx_correction=*) TX_CORRECTION=${arg#*=}; TX_SET=true ;;
@@ -216,6 +225,11 @@ case "$REPORTER_ID" in ''|*[!A-Za-z0-9_.-]*) die "invalid reporter_id" ;; esac
 if [ "$UPDATE_CHANNEL_SET" = true ]; then
     case "$UPDATE_CHANNEL" in stable|prerelease) ;; *) die "invalid update_channel" ;; esac
 fi
+if [ "$UPDATE_REPOSITORY_SET" = true ]; then
+    case "$UPDATE_REPOSITORY" in
+        ''|/*|*/|*/*/*|./*|../*|*/.|*/..|*[!A-Za-z0-9_./-]*) die "update_repository must use owner/repo" ;;
+    esac
+fi
 if [ -n "$GH_PROXY" ]; then
     case "$GH_PROXY" in http://*|https://*) ;; *) die "install-ghproxy must be an absolute HTTP(S) URL" ;; esac
     case "$GH_PROXY" in *'?'*|*'#'*|http://*@*|https://*@*)
@@ -223,6 +237,8 @@ if [ -n "$GH_PROXY" ]; then
         ;;
     esac
 fi
+DOWNLOAD_REPOSITORY=${UPDATE_REPOSITORY:-$DEFAULT_UPDATE_REPOSITORY}
+GITHUB_REPO=https://github.com/$DOWNLOAD_REPOSITORY
 if [ "$DEBUG_SET" = false ] && [ -f "$UNIT_DST" ] && grep -q ' --debug' "$UNIT_DST"; then
     DEBUG=true
 fi
@@ -333,6 +349,7 @@ set -- configure-cf --config "$CONFIG_PATH" --net-static-path "$DATA_DIR/net_sta
 [ "$CM_SET" = false ] || set -- "$@" --cm "$CM"
 [ "$BD_SET" = false ] || set -- "$@" --bd "$BD"
 [ "$AUTO_UPDATE_SET" = false ] || set -- "$@" --auto-update "$AUTO_UPDATE"
+[ "$UPDATE_REPOSITORY_SET" = false ] || set -- "$@" --update-repository "$UPDATE_REPOSITORY"
 [ "$UPDATE_CHANNEL_SET" = false ] || set -- "$@" --update-channel "$UPDATE_CHANNEL"
 [ -z "$GH_PROXY" ] || set -- "$@" --update-proxy "$GH_PROXY"
 SELECTED_REPORTER=$($BIN_DST "$@")

@@ -17,6 +17,9 @@ concurrency:
 
 jobs:
   build:
+    env:
+      # Fork 的 Release 产物默认只从当前 Fork 更新，不回退到上游仓库。
+      PROBE_RS_UPDATE_REPOSITORY: ${{ github.repository }}
     strategy:
       fail-fast: false
       matrix:

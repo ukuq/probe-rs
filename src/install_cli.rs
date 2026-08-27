@@ -81,6 +81,7 @@ struct ConfigureCfOptions {
     interfaces: Option<Vec<String>>,
     pings: Vec<(String, String)>,
     auto_update: Option<bool>,
+    update_repository: Option<String>,
     update_channel: Option<UpdateChannel>,
     update_proxys: Vec<String>,
 }
@@ -100,6 +101,7 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
     let mut interfaces = None;
     let mut pings = Vec::new();
     let mut auto_update = None;
+    let mut update_repository = None;
     let mut update_channel = None;
     let mut update_proxys = Vec::new();
     let mut args = args;
@@ -156,6 +158,7 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
                 pings.push((arg.trim_start_matches("--").to_owned(), value(&mut args)?));
             }
             "--auto-update" => auto_update = Some(parse_bool(&arg, &value(&mut args)?)?),
+            "--update-repository" => update_repository = Some(value(&mut args)?),
             "--update-channel" => {
                 // 大小写归一,与 PowerShell ValidateSet 的大小写不敏感一致。
                 update_channel = Some(match value(&mut args)?.to_ascii_lowercase().as_str() {
@@ -185,6 +188,7 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
         interfaces,
         pings,
         auto_update,
+        update_repository: optional_nonempty(update_repository, "--update-repository")?,
         update_channel,
         update_proxys,
     })
@@ -281,6 +285,9 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
     }
     if let Some(value) = options.auto_update {
         config.auto_update.enabled = value;
+    }
+    if let Some(value) = options.update_repository {
+        config.auto_update.repository = Some(value);
     }
     if let Some(value) = options.update_channel {
         config.auto_update.channel = value;
@@ -565,6 +572,7 @@ mod tests {
             interfaces: None,
             pings: vec![("ct".into(), "ct.example.com:80".into())],
             auto_update: Some(true),
+            update_repository: Some("fork-owner/probe-rs".into()),
             update_channel: Some(UpdateChannel::Prerelease),
             update_proxys: Vec::new(),
         }
@@ -606,11 +614,17 @@ mod tests {
             "0".into(),
             "--wss-report-interval".into(),
             "4".into(),
+            "--update-repository".into(),
+            "fork-owner/probe-rs".into(),
         ];
         let options = parse_configure_args(args.into_iter()).unwrap();
         assert_eq!(options.reporter_id, "cf");
         assert_eq!(options.collect, Some(0));
         assert_eq!(options.wss_report_interval, Some(4));
+        assert_eq!(
+            options.update_repository.as_deref(),
+            Some("fork-owner/probe-rs")
+        );
         assert!(options.server_id.is_none());
         assert!(options.secret.is_none());
         assert!(options.worker_url.is_none());
@@ -636,6 +650,10 @@ mod tests {
         assert_eq!(cf.interval, 60);
         assert_eq!(cf.ct.as_deref(), Some("ct.example.com:80"));
         assert!(config.auto_update.enabled);
+        assert_eq!(
+            config.auto_update.repository.as_deref(),
+            Some("fork-owner/probe-rs")
+        );
         assert_eq!(config.auto_update.channel, UpdateChannel::Prerelease);
         assert_eq!(config.auto_update.proxys, ["https://proxy.example"]);
     }
@@ -671,6 +689,8 @@ mod tests {
         assert!(generator.contains(r#"def: "user""#));
         assert!(generator.contains("https://monitor.example.com/update"));
         assert!(generator.contains("首次安装填写完整的 /update 地址"));
+        assert!(generator.contains("更新仓库"));
+        assert!(generator.contains("-update_repository"));
     }
 
     #[test]
@@ -680,7 +700,9 @@ mod tests {
             "REPORTER_ID=cf",
             "-no_start|-no-start) NO_START=true",
             "-install-version|--install-version)",
+            "-update_repository|-update-repository|--update-repository)",
             "-install-ghproxy|--install-ghproxy)",
+            "--update-repository \"$UPDATE_REPOSITORY\"",
             "--update-proxy \"$GH_PROXY\"",
         ] {
             assert!(script.contains(expected), "missing {expected}");
@@ -694,6 +716,8 @@ mod tests {
         let script = include_str!("../deploy/komari-install.sh");
         assert!(script.contains(r#"[ -z "$VERSION" ] || [ "$VERSION" = latest ]"#));
         assert!(script.contains(r#"$RELEASE_BASE/latest/download/probe-rs-linux-$arch"#));
+        assert!(script.contains("--update-repository|--update-repo)"));
+        assert!(script.contains(r#"repository = \"" repository "\""#));
         assert!(script.contains("--install-ghproxy)   GH_PROXY="));
         assert!(!script
             .lines()
@@ -782,6 +806,8 @@ collect = 3
             "& $Installer uninstall -Scope Machine -Purge:$Purge",
             "& $Installer install -Scope Machine -BinaryPath $resolvedBinary",
             "& $Installer start -Scope Machine",
+            "$GitHubRepo = \"https://github.com/$downloadRepository\"",
+            "$configureArgs += @(\"--update-repository\", $UpdateRepository)",
         ] {
             assert!(script.contains(expected), "missing {expected}");
         }

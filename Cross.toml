@@ -1,3 +1,8 @@
+[build.env]
+# Release 产物需保留当前 Fork 的更新来源；cross 默认不会把任意宿主变量
+# 传入构建容器。
+passthrough = ["PROBE_RS_UPDATE_REPOSITORY"]
+
 [target.loongarch64-unknown-linux-musl]
 # cross 0.2.5 predates this upstream target image and otherwise falls back to
 # the host linker. Pin the official image so LoongArch64 builds stay reproducible.

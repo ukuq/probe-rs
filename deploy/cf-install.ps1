@@ -59,6 +59,10 @@ param(
     [ValidateSet("stable", "prerelease")]
     [string]$UpdateChannel,
 
+    [Alias("update_repository", "update-repository")]
+    [ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')]
+    [string]$UpdateRepository,
+
     [Alias("rx_correction")]
     [string]$RxCorrection,
 
@@ -91,7 +95,7 @@ $InstalledBinary = Join-Path $InstallDir "probe-rs.exe"
 $DataDir = Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "probe-rs"
 $ConfigPath = Join-Path $DataDir "config.toml"
 $NetStaticPath = Join-Path $DataDir "net_static.json"
-$GitHubRepo = "https://github.com/ukuq/probe-rs"
+$DefaultUpdateRepository = "ukuq/probe-rs"
 $AssetName = "probe-rs-windows-x86_64.exe"
 
 function ConvertTo-Boolean {
@@ -143,6 +147,21 @@ if ($PSBoundParameters.ContainsKey("InstallGhProxy")) {
         throw "-InstallGhProxy must be an absolute HTTP(S) URL without credentials, query, or fragment."
     }
 }
+if ($PSBoundParameters.ContainsKey("UpdateRepository")) {
+    $repositoryParts = $UpdateRepository.Split('/')
+    if ($repositoryParts.Count -ne 2 -or
+        $repositoryParts[0] -in @('.', '..') -or
+        $repositoryParts[1] -in @('.', '..')) {
+        throw "-UpdateRepository must use owner/repo."
+    }
+}
+$downloadRepository = if ($PSBoundParameters.ContainsKey("UpdateRepository")) {
+    $UpdateRepository
+}
+else {
+    $DefaultUpdateRepository
+}
+$GitHubRepo = "https://github.com/$downloadRepository"
 
 $noStartEnabled = [bool]$NoStart
 $autoUpdateEnabled = $null
@@ -321,6 +340,9 @@ try {
     }
     if ($PSBoundParameters.ContainsKey("AutoUpdate")) {
         $configureArgs += @("--auto-update", $autoUpdateEnabled.ToString().ToLowerInvariant())
+    }
+    if ($PSBoundParameters.ContainsKey("UpdateRepository")) {
+        $configureArgs += @("--update-repository", $UpdateRepository)
     }
     if ($PSBoundParameters.ContainsKey("UpdateChannel")) {
         $configureArgs += @("--update-channel", $UpdateChannel)

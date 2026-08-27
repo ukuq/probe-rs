@@ -44,6 +44,9 @@ impl std::fmt::Display for UpdateChannel {
 #[serde(default, deny_unknown_fields)]
 pub struct AutoUpdateConfig {
     pub enabled: bool,
+    /// 可选的 GitHub Release 仓库覆盖；缺省使用构建产物内嵌的来源。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
     pub channel: UpdateChannel,
     pub check_interval: u64,
     /// Release 资产直连失败后依次尝试的 GitHub 代理前缀。
@@ -54,6 +57,7 @@ impl Default for AutoUpdateConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            repository: None,
             channel: UpdateChannel::Stable,
             check_interval: 21_600,
             proxys: Vec::new(),
@@ -195,6 +199,9 @@ impl LocalConfig {
         }
         if self.auto_update.check_interval < MIN_UPDATE_CHECK_INTERVAL {
             bail!("auto_update.check_interval must be >= {MIN_UPDATE_CHECK_INTERVAL} seconds");
+        }
+        if let Some(repository) = &self.auto_update.repository {
+            validate_update_repository(repository)?;
         }
         for proxy in &self.auto_update.proxys {
             validate_update_proxy(proxy)?;
@@ -1236,6 +1243,28 @@ fn validate_update_proxy(raw: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_update_repository(repository: &str) -> Result<()> {
+    let Some((owner, name)) = repository.split_once('/') else {
+        bail!("auto_update.repository must use owner/repo");
+    };
+    let valid_component = |value: &str| {
+        !value.is_empty()
+            && value != "."
+            && value != ".."
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+    };
+    if repository.trim() != repository
+        || name.contains('/')
+        || !valid_component(owner)
+        || !valid_component(name)
+    {
+        bail!("auto_update.repository must use owner/repo with only A-Z, a-z, 0-9, _, . or -");
+    }
+    Ok(())
+}
+
 pub fn load(path: &Path) -> Result<LocalConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("读取配置失败: {}", path.display()))?;
@@ -1756,6 +1785,29 @@ url = "https://example.com/update"
         ] {
             cfg.auto_update.proxys = vec![invalid.into()];
             assert!(cfg.validate().is_err(), "accepted invalid proxy: {invalid}");
+        }
+    }
+
+    #[test]
+    fn update_repository_accepts_only_github_owner_repo_slugs() {
+        let mut cfg = base_config();
+        cfg.auto_update.repository = Some("fork-owner/probe.rs".into());
+        cfg.validate().unwrap();
+
+        for invalid in [
+            "probe-rs",
+            "/probe-rs",
+            "owner/",
+            "owner/repo/extra",
+            "https://github.com/owner/repo",
+            "owner/repo?ref=main",
+            " owner/repo",
+        ] {
+            cfg.auto_update.repository = Some(invalid.into());
+            assert!(
+                cfg.validate().is_err(),
+                "accepted invalid repository: {invalid}"
+            );
         }
     }
 

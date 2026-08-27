@@ -13,7 +13,7 @@
 # 卸载：bash komari-install.sh uninstall [--purge]
 set -euo pipefail
 
-RELEASE_BASE="https://github.com/ukuq/probe-rs/releases"
+DEFAULT_UPDATE_REPOSITORY="ukuq/probe-rs"
 
 usage() {
     cat <<'EOF'
@@ -28,6 +28,7 @@ usage() {
   --gpu                 开启 GPU 详细采集（缺省关）
   --include-nics <列表> 网卡白名单，逗号分隔通配符（写入 include_nics）
   --install-version <v> 指定 probe-rs 版本（缺省 latest）
+  --update-repository <owner/repo> 初次下载及后续自动更新使用的 GitHub 仓库
   --install-ghproxy <URL> GitHub 代理前缀；直连失败后使用并持久化为更新兜底
   --name <名称>         已忽略（komari 段无 server_id 字段，面板按 token 识别）
   --reporter-id <id>   已有配置中追加/更新的 Reporter id（缺省 komari）
@@ -109,9 +110,9 @@ if [ "${1:-}" = "uninstall" ]; then
 fi
 [ $# -gt 0 ] || { usage; exit 1; }
 
-ENDPOINT=""; TOKEN=""; INTERVAL=3; RESET_DAY=1; BIN=""; GH_PROXY=""
+ENDPOINT=""; TOKEN=""; INTERVAL=3; RESET_DAY=1; BIN=""; GH_PROXY=""; UPDATE_REPOSITORY=""
 ENABLE_GPU=false; INTERFACES=""; VERSION=""; REPORTER_ID="komari"
-AUTO_UPDATE=true; UPDATE_CHANNEL=stable
+AUTO_UPDATE=true; UPDATE_CHANNEL=stable; UPDATE_REPOSITORY_SET=false
 # 需要吞掉一个值的官方参数（接受但忽略）
 IGNORED_WITH_VALUE="--auto-discovery --max-retries -r --reconnect-interval -c --info-report-interval --exclude-nics --include-mountpoint --custom-dns --custom-ipv4 --custom-ipv6 --config --protocol-version --prefer-ip-version --install-dir --install-service-name --name"
 # 纯标志位官方参数
@@ -126,6 +127,7 @@ while [ $# -gt 0 ]; do
         --gpu)               ENABLE_GPU=true; shift ;;
         --include-nics)      INTERFACES="$2"; shift 2 ;;
         --install-version)   VERSION="$2"; shift 2 ;;
+        --update-repository|--update-repo) UPDATE_REPOSITORY="$2"; UPDATE_REPOSITORY_SET=true; shift 2 ;;
         --install-ghproxy)   GH_PROXY="$2"; shift 2 ;;
         --reporter-id)       REPORTER_ID="$2"; shift 2 ;;
         --disable-auto-update) AUTO_UPDATE=false; shift ;;
@@ -151,6 +153,13 @@ case "$UPDATE_CHANNEL" in
     stable|prerelease) ;;
     *) die "--update-channel must be stable or prerelease" ;;
 esac
+if [ "$UPDATE_REPOSITORY_SET" = true ]; then
+    case "$UPDATE_REPOSITORY" in
+        ''|/*|*/|*/*/*|./*|../*|*/.|*/..|*[!A-Za-z0-9_./-]*)
+            die "--update-repository must use owner/repo"
+            ;;
+    esac
+fi
 if [ -n "$GH_PROXY" ]; then
     case "$GH_PROXY" in http://*|https://*) ;; *) die "--install-ghproxy must be an absolute HTTP(S) URL" ;; esac
     case "$GH_PROXY" in *'?'*|*'#'*|*'"'*|*'\'*|http://*@*|https://*@*)
@@ -175,6 +184,9 @@ toml_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 INTERVAL=$((10#$INTERVAL)); RESET_DAY=$((10#$RESET_DAY))
 TOKEN_ESC=$(toml_escape "$TOKEN"); ENDPOINT_ESC=$(toml_escape "$ENDPOINT"); NICS_ESC=$(toml_escape "$INTERFACES")
 GH_PROXY_ESC=$(toml_escape "$GH_PROXY")
+UPDATE_REPOSITORY_ESC=$(toml_escape "$UPDATE_REPOSITORY")
+DOWNLOAD_REPOSITORY=${UPDATE_REPOSITORY:-$DEFAULT_UPDATE_REPOSITORY}
+RELEASE_BASE="https://github.com/$DOWNLOAD_REPOSITORY/releases"
 
 
 # ---- 二进制 ----
@@ -334,7 +346,8 @@ strip_seeded_sample_reporters() {
 
 upsert_auto_update_config() {
     cfg="$1"; tmp=$(mktemp "$CONF_DIR/config.toml.XXXXXX")
-    awk -v enabled="$AUTO_UPDATE" -v channel="$UPDATE_CHANNEL" -v proxy="$GH_PROXY_ESC" '
+    awk -v enabled="$AUTO_UPDATE" -v channel="$UPDATE_CHANNEL" -v repository="$UPDATE_REPOSITORY_ESC" \
+        -v set_repository="$UPDATE_REPOSITORY_SET" -v proxy="$GH_PROXY_ESC" '
         function proxy_array() {
             return proxy == "" ? "[]" : "[\"" proxy "\"]"
         }
@@ -353,6 +366,7 @@ upsert_auto_update_config() {
         }
         function finish_auto() {
             if (!seen_enabled) print "enabled = " enabled
+            if (set_repository == "true" && !seen_repository) print "repository = \"" repository "\""
             if (!seen_channel) print "channel = \"" channel "\""
             if (!seen_interval) print "check_interval = 21600"
             if (!seen_proxys) print "proxys = " proxy_array()
@@ -360,6 +374,7 @@ upsert_auto_update_config() {
         function print_auto() {
             print "[auto_update]"
             print "enabled = " enabled
+            if (set_repository == "true") print "repository = \"" repository "\""
             print "channel = \"" channel "\""
             print "check_interval = 21600"
             print "proxys = " proxy_array()
@@ -368,7 +383,7 @@ upsert_auto_update_config() {
         BEGIN { in_auto=0; inserted=0 }
         /^[[:space:]]*\[auto_update\][[:space:]]*$/ {
             in_auto=1; inserted=1
-            seen_enabled=seen_channel=seen_interval=seen_proxys=0
+            seen_enabled=seen_repository=seen_channel=seen_interval=seen_proxys=0
             print
             next
         }
@@ -380,6 +395,12 @@ upsert_auto_update_config() {
             if ($0 ~ /^[[:space:]]*enabled[[:space:]]*=/) {
                 if (!seen_enabled) print "enabled = " enabled
                 seen_enabled=1
+            } else if ($0 ~ /^[[:space:]]*repository[[:space:]]*=/) {
+                if (!seen_repository) {
+                    if (set_repository == "true") print "repository = \"" repository "\""
+                    else print
+                }
+                seen_repository=1
             } else if ($0 ~ /^[[:space:]]*channel[[:space:]]*=/) {
                 if (!seen_channel) print "channel = \"" channel "\""
                 seen_channel=1

@@ -2000,6 +2000,7 @@ function cfgMachineForm(s, st) {
     ]),
     cfgGroup('[auto_update]', [
       ['enabled', '未在上报摘要中公开'],
+      ['repository', '未在上报摘要中公开'],
       ['channel', '未在上报摘要中公开'],
       ['check_interval', '未在上报摘要中公开'],
       ['proxys', '未在上报摘要中公开'],
