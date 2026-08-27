@@ -26,6 +26,7 @@ id = "primary"
 server_id = "cf-server-uuid"
 secret = "cf-api-secret"
 url = "https://monitor.example.com/update"
+connection_mode = "auto" # auto = WSS + POST fallback; http = POST only
 interval = 60          # 上报周期(原版 report_interval)
 collect_interval = 1   # 采集周期
 reset_day = 1          # 流量统计月份重置日

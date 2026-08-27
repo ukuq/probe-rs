@@ -409,13 +409,17 @@ pub struct CollectConfig {
 }
 
 /// CF 协议段（命名对齐 cfsm-agent：server_id/secret/url/interval/
-/// collect_interval/reset_day/interface/ct/cu/cm/bd）。
+/// collect_interval/connection_mode/reset_day/interface/ct/cu/cm/bd）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CfSection {
     pub server_id: String,
     pub secret: String,
     pub url: String,
+    /// auto = WSS 实时上报，连接不可用时按 interval 回退 POST；
+    /// http = 仅使用 POST /update。
+    #[serde(default)]
+    pub connection_mode: CfConnectionMode,
     /// 上报周期（原版 report_interval）。
     #[serde(default = "default_report_interval")]
     pub interval: u64,
@@ -437,6 +441,23 @@ pub struct CfSection {
     pub bd: Option<String>,
     #[serde(default, skip_serializing_if = "CfExt::is_empty")]
     pub ext: CfExt,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CfConnectionMode {
+    #[default]
+    Auto,
+    Http,
+}
+
+impl std::fmt::Display for CfConnectionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Http => f.write_str("http"),
+        }
+    }
 }
 
 impl CfSection {
@@ -658,6 +679,9 @@ pub struct RemoteConfig {
     pub intervals: Option<CollectionIntervals>,
     #[serde(default)]
     pub report_interval: Option<u64>,
+    /// CF Reporter 的连接模式；其他协议忽略。
+    #[serde(default)]
+    pub connection_mode: Option<CfConnectionMode>,
     #[serde(default)]
     pub reset_day: Option<u8>,
     #[serde(default)]

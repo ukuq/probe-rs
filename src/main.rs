@@ -309,11 +309,12 @@ async fn main() -> Result<()> {
             None
         };
         let (cf_ws, cf_ws_events) = if spec.protocol == ReporterProtocol::Cf {
+            let enabled = spec.connection_mode == Some(model::CfConnectionMode::Auto);
             let (sender, events, handle) = worker::cf::spawn(
                 spec.id.clone(),
                 spec.worker_url.clone(),
                 AGENT_VERSION.to_string(),
-                true,
+                enabled,
                 spec.config_version.clone(),
             );
             watch_task("cf-wss", handle);

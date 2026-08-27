@@ -193,7 +193,6 @@ mod tests {
             pings: vec![],
             report_errors: true,
             report_self: false,
-            ext: None,
         };
         let info = super::collect(None, None, None, "test", &cfg);
         assert!(!info.os.is_empty());

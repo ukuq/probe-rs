@@ -11,7 +11,7 @@ use chrono::{Local, TimeZone};
 
 use crate::collector::net::IfaceFilter;
 use crate::config::{self, AutoUpdateConfig, LocalConfig, UpdateChannel, CONFIG_SCHEMA};
-use crate::model::{CfSection, ReporterConfig, ReporterProtocol};
+use crate::model::{CfConnectionMode, CfSection, ReporterConfig, ReporterProtocol};
 use crate::netstatic::{self, NetStatic};
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -50,8 +50,7 @@ struct ConfigureCfOptions {
     reporter_id: Option<String>,
     collect: Option<u64>,
     report_interval: Option<u64>,
-    /// 已废弃:连接固定为 auto。仅为兼容旧安装脚本保留解析。
-    connection_mode: Option<String>,
+    connection_mode: Option<CfConnectionMode>,
     reset_day: Option<u8>,
     interfaces: Option<Vec<String>>,
     pings: Vec<(String, String)>,
@@ -94,7 +93,11 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
                 report_interval = Some(parse_positive_u64(&arg, &value(&mut args)?)?)
             }
             "--connection-mode" => {
-                connection_mode = Some(value(&mut args)?.to_ascii_lowercase());
+                connection_mode = Some(match value(&mut args)?.to_ascii_lowercase().as_str() {
+                    "auto" => CfConnectionMode::Auto,
+                    "http" => CfConnectionMode::Http,
+                    _ => bail!("--connection-mode must be auto or http"),
+                });
             }
             "--reset-day" => {
                 let parsed = value(&mut args)?
@@ -155,14 +158,6 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
 }
 
 fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
-    if let Some(mode) = &options.connection_mode {
-        if mode != "auto" {
-            tracing::warn!(
-                mode,
-                "--connection-mode 已废弃,连接固定为 auto(WSS+POST 回退)"
-            );
-        }
-    }
     let mut config = load_install_config(
         &options.config_path,
         options.default_net_static_path.clone(),
@@ -223,6 +218,9 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
     if let Some(value) = options.report_interval {
         cf.interval = value;
     }
+    if let Some(value) = options.connection_mode {
+        cf.connection_mode = value;
+    }
     if let Some(value) = options.reset_day {
         cf.reset_day = value;
     }
@@ -260,6 +258,7 @@ fn new_cf_reporter(id: String) -> ReporterConfig {
             server_id: String::new(),
             secret: String::new(),
             url: String::new(),
+            connection_mode: CfConnectionMode::Auto,
             interval: 60,
             collect_interval: 1,
             reset_day: 1,
@@ -492,7 +491,7 @@ mod tests {
             reporter_id: None,
             collect: Some(2),
             report_interval: Some(60),
-            connection_mode: Some("auto".into()),
+            connection_mode: Some(CfConnectionMode::Http),
             reset_day: Some(20),
             interfaces: None,
             pings: vec![("ct".into(), "ct.example.com:80".into())],
@@ -500,6 +499,31 @@ mod tests {
             update_channel: Some(UpdateChannel::Prerelease),
             replace_cf: false,
         }
+    }
+
+    fn configure_args(mode: &str) -> std::vec::IntoIter<String> {
+        vec![
+            "--config".into(),
+            "config.toml".into(),
+            "--net-static-path".into(),
+            "net-static.json".into(),
+            "--server-id".into(),
+            "server".into(),
+            "--secret".into(),
+            "secret".into(),
+            "--url".into(),
+            "https://example.com/update".into(),
+            "--connection-mode".into(),
+            mode.to_owned(),
+        ]
+        .into_iter()
+    }
+
+    #[test]
+    fn configure_parser_accepts_http_connection_mode() {
+        let options = parse_configure_args(configure_args("HTTP")).unwrap();
+        assert_eq!(options.connection_mode, Some(CfConnectionMode::Http));
+        assert!(parse_configure_args(configure_args("tcp")).is_err());
     }
 
     #[test]
@@ -513,6 +537,7 @@ mod tests {
         assert_eq!(reporter.reset_day, 20);
         assert_eq!(reporter.pings[0].target.target, "ct.example.com:80");
         let cf = config.reporters[0].cf.as_ref().unwrap();
+        assert_eq!(cf.connection_mode, CfConnectionMode::Http);
         assert_eq!(cf.interval, 60);
         assert_eq!(cf.ct.as_deref(), Some("ct.example.com:80"));
         assert!(config.auto_update.enabled);
@@ -527,6 +552,25 @@ mod tests {
         );
         assert!(include_str!("../deploy/cf-install.ps1")
             .contains(&format!("[string]$InstallVersion = \"{expected}\"")));
+        let generator = include_str!("../deploy/deploy-generator.html");
+        assert!(generator.contains(&format!("脚本基线 {expected}")));
+        assert!(generator.contains(&format!("const SCRIPT_VERSION = \"{expected}\";")));
+    }
+
+    #[test]
+    fn deploy_generator_defaults_to_user_scope_and_complete_cf_url() {
+        let generator = include_str!("../deploy/deploy-generator.html");
+        assert!(generator.starts_with("<!doctype html>"));
+        assert!(generator.contains(r#"def: "user""#));
+        assert!(generator.contains("https://monitor.example.com/update"));
+        assert!(generator.contains("安装器不会自动补路径"));
+    }
+
+    #[test]
+    fn komari_installer_accepts_explicit_latest_version() {
+        let script = include_str!("../deploy/komari-install.sh");
+        assert!(script.contains(r#"[ -z "$VERSION" ] || [ "$VERSION" = latest ]"#));
+        assert!(script.contains(r#"$RELEASE_BASE/latest/download/probe-rs-linux-$arch"#));
     }
 
     #[test]

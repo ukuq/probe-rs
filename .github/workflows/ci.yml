@@ -29,6 +29,44 @@ jobs:
           shared-key: ci-${{ runner.os }}
       - run: cargo fmt --check
       - run: cargo test
+      - name: Validate PowerShell deploy scripts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($file in @('deploy/install.ps1', 'deploy/cf-install.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            foreach ($error in $errors) {
+              Write-Error "$file`: $($error.Message)"
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate deploy shell scripts
+        run: |
+          sh -n deploy/install.sh
+          sh -n deploy/cf-install.sh
+          bash -n deploy/komari-install.sh
+      - name: Validate deploy generator JavaScript
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const html = fs.readFileSync('deploy/deploy-generator.html', 'utf8');
+          const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+          if (scripts.length === 0) throw new Error('no inline script found');
+          for (const script of scripts) new Function(script[1]);
+          NODE
 
   demo:
     runs-on: ubuntu-latest

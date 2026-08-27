@@ -1,4 +1,8 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>probe-rs 部署命令生成器</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap">
 <style>
@@ -274,6 +278,8 @@
     .sw .track, .sw .track::after { transition: none; }
   }
 </style>
+</head>
+<body>
 
 <div class="wrap">
   <header class="page">
@@ -284,14 +290,14 @@
     </div>
     <h1>probe-rs 部署命令生成器</h1>
     <div class="sub">原生 / CF-Server-Monitor / Komari 三种上报模式的一键安装命令</div>
-    <span class="ver-pill">脚本基线 v0.1.4-beta.2</span>
+    <span class="ver-pill">脚本基线 v0.1.4-beta.4</span>
   </header>
 
   <!-- ============ 解析器 ============ -->
   <div class="card-title">快速解析</div>
   <section class="card card-pad">
     <textarea id="paste" spellcheck="false" placeholder='粘贴 CF-Server-Monitor 或 Komari 官方生成的安装命令，例如：
-curl -fsSL https://your-worker/install.sh | bash -s -- install -id=server123 -secret=abc -url=https://worker.example.com
+curl -fsSL https://your-worker/install.sh | bash -s -- install -id=server123 -secret=abc -url=https://worker.example.com/update
 bash <(curl -sL ...) -e https://panel.example.com -t your-token -i 1 --month-rotate 1'></textarea>
     <div class="btn-row">
       <button class="btn" id="btn-demo-cf" type="button">CF 示例</button>
@@ -329,15 +335,15 @@ bash <(curl -sL ...) -e https://panel.example.com -t your-token -i 1 --month-rot
  * 模式与字段定义（与 deploy/ 下三个安装脚本的参数一一对应）
  * ============================================================ */
 const SCRIPT_RAW_BASE = "https://raw.githubusercontent.com/ukuq/probe-rs/master/deploy";
-const SCRIPT_VERSION = "v0.1.4-beta.2";
+const SCRIPT_VERSION = "v0.1.4-beta.4";
 
 const FIELDS = {
   cf: [
     { sec: "连接信息", items: [
       { k: "id",     label: "服务器 ID", arg: "-id",     ph: "cf-server-uuid", req: true, mono: true },
       { k: "secret", label: "密钥 Secret", arg: "-secret", ph: "API secret",   req: true, mono: true },
-      { k: "url",    label: "上报地址 URL", arg: "-url",  ph: "https://monitor.example.com", req: true, mono: true,
-        hint: "Worker 地址，脚本会自动补 /update 等路径" },
+      { k: "url",    label: "上报地址 URL", arg: "-url",  ph: "https://monitor.example.com/update", req: true, mono: true,
+        hint: "填写完整的 /update 地址；安装器不会自动补路径" },
       { k: "connection_mode", label: "连接模式", arg: "-connection_mode", type: "select",
         opts: [["", "缺省（保持现状）"], ["auto", "auto（WSS + HTTP 回退）"], ["http", "http（仅 HTTP）"]] },
     ]},
@@ -358,6 +364,8 @@ const FIELDS = {
       { k: "tx_correction", label: "上行流量校正", arg: "-tx_correction", num: true, ph: "GiB，覆盖本月上行" },
     ]},
     { sec: "安装行为", items: [
+      { k: "scope", label: "安装范围", type: "select", def: "user",
+        opts: [["user", "当前用户（缺省）"], ["system", "系统级（sudo）"]] },
       { k: "auto_update", label: "自动更新", arg: "-auto_update", type: "select",
         opts: [["", "缺省（保持现状）"], ["1", "开启"], ["0", "关闭"]] },
       { k: "update_channel", label: "更新通道", arg: "-update_channel", type: "select",
@@ -389,6 +397,8 @@ const FIELDS = {
       { k: "gpu", label: "GPU 详细采集", arg: "--gpu" },
     ]},
     { sec: "安装行为", items: [
+      { k: "scope", label: "安装范围", type: "select", def: "user",
+        opts: [["user", "当前用户（缺省）"], ["system", "系统级（sudo）"]] },
       { k: "reporter_id", label: "Reporter ID", arg: "--reporter-id", def: "komari", ph: "缺省 komari", mono: true },
       { k: "auto_update", label: "自动更新", type: "select", def: "1",
         opts: [["1", "开启（缺省）"], ["0", "关闭（--disable-auto-update）"]] },
@@ -417,6 +427,10 @@ const FIELDS = {
         hint: "把 agent 自身指标也上报" },
     ]},
     { sec: "安装行为", items: [
+      { k: "scope", label: "安装范围", type: "select", def: "user",
+        opts: [["user", "当前用户（缺省）"], ["system", "系统级（sudo）"]] },
+      { k: "data_dir", label: "数据目录", toml: "data_dir", ph: "/home/alice/.local/share/probe-rs", mono: true,
+        hint: "用户级安装需填写当前用户可写的绝对路径；系统级缺省 /var/lib/probe-rs" },
       { k: "reporter_id", label: "Reporter ID", toml: "id", def: "primary", ph: "缺省 primary", mono: true },
       { k: "auto_update", label: "自动更新", type: "select", def: "0",
         opts: [["0", "关闭（缺省）"], ["1", "开启"]] },
@@ -562,13 +576,17 @@ function buildNativeToml() {
   if (!v.server_id) missing.push("服务器 ID");
   if (!v.secret) missing.push("密钥");
   if (!v.worker_url) missing.push("上报地址");
+  const scope = v.scope || "user";
+  if (scope === "user" && !v.data_dir) missing.push("数据目录绝对路径");
+  const dataDir = v.data_dir || (scope === "system" ? "/var/lib/probe-rs" : "/home/YOUR_USER/.local/share/probe-rs");
+  const configPath = scope === "system" ? "/etc/probe-rs/config.toml" : "${XDG_CONFIG_HOME:-$HOME/.config}/probe-rs/config.toml";
   const ri = parseInt(v.report_interval || "60", 10) || 60;
   const rd = parseInt(v.reset_day || "1", 10); const rdN = isNaN(rd) ? 1 : rd;
   const ci = parseInt(v.collect || "10", 10) || 10;
-  const toml = `# /etc/probe-rs/config.toml — 由部署命令生成器生成（原生 probe 协议）
+  const toml = `# ${configPath} — 由部署命令生成器生成（原生 probe 协议）
 schema = 1
 
-data_dir = "/var/lib/probe-rs"
+data_dir = ${tomlStr(dataDir)}
 
 [auto_update]
 enabled = ${v.auto_update === "1"}
@@ -598,7 +616,7 @@ gpu = 60
 ip = 600
 diskio = 10
 `;
-  return { missing, toml };
+  return { missing, toml, scope, dataDir, configPath };
 }
 
 /* ============================================================
@@ -634,16 +652,18 @@ function renderOutput() {
   if (mode === "cf") {
     const { missing, args } = buildCF();
     if (missing.length) html += `<div class="missing show">缺少必填项：${missing.join("、")} — 填好后命令即可使用</div>`;
-    const cmd = `curl -fsSL ${SCRIPT_RAW_BASE}/cf-install.sh | sudo sh -s -- install ${args.join(" ")}`;
+    const shell = vals.cf.scope === "system" ? "sudo sh" : "sh";
+    const cmd = `curl -fsSL ${SCRIPT_RAW_BASE}/cf-install.sh | ${shell} -s -- install ${args.join(" ")}`;
     html += outBlock("sh — cf-install.sh", cmd);
-    const pairs = args.map(a => { const i = a.indexOf("="); return [a.slice(0, i), a.slice(i + 1)]; });
+    const pairs = [["scope", vals.cf.scope]].concat(args.map(a => { const i = a.indexOf("="); return [a.slice(0, i), a.slice(i + 1)]; }));
     if (pairs.length) html += `<div class="summary-label">安装参数（${pairs.length}）</div><div class="chips">${chipList(pairs)}</div>`;
   } else if (mode === "komari") {
     const { missing, args } = buildKomari();
     if (missing.length) html += `<div class="missing show">缺少必填项：${missing.join("、")} — 填好后命令即可使用</div>`;
-    const cmd = `wget -qO- ${SCRIPT_RAW_BASE}/komari-install.sh | sudo bash -s -- ${args.join(" ")}`;
+    const shell = vals.komari.scope === "system" ? "sudo bash" : "bash";
+    const cmd = `wget -qO- ${SCRIPT_RAW_BASE}/komari-install.sh | ${shell} -s -- ${args.join(" ")}`;
     html += outBlock("bash — komari-install.sh", cmd);
-    const pairs = [];
+    const pairs = [["scope", vals.komari.scope]];
     for (let i = 0; i < args.length; i++) {
       const a = args[i];
       if (a.startsWith("-bin=")) pairs.push(["-bin", a.slice(5)]);
@@ -653,20 +673,26 @@ function renderOutput() {
     }
     if (pairs.length) html += `<div class="summary-label">安装参数（${pairs.length}）</div><div class="chips">${chipList(pairs)}</div>`;
   } else {
-    const { missing, toml } = buildNativeToml();
+    const { missing, toml, scope, dataDir, configPath } = buildNativeToml();
     if (missing.length) html += `<div class="missing show">缺少必填项：${missing.join("、")} — 填好后配置即可使用</div>`;
-    html += outBlock("① config.toml — 写入 /etc/probe-rs/config.toml（权限 600）", toml);
+    html += outBlock(`① config.toml — 写入 ${configPath}（权限 600）`, toml);
     const binArg = vals.native.bin_path ? ` ${shq(vals.native.bin_path)}` : "";
-    const cmd = [
+    const cmd = scope === "system" ? [
       "# 先把上面的配置写入 /etc/probe-rs/config.toml，再执行：",
       `sudo ./deploy/install.sh${binArg}`,
       "# 配置合法时脚本会自动 enable + restart；也可手动：",
       "# sudo systemctl enable --now probe-rs",
+    ].join("\n") : [
+      '# 先创建配置目录：mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/probe-rs"',
+      '# 再把上面的配置写入 "${XDG_CONFIG_HOME:-$HOME/.config}/probe-rs/config.toml"，然后执行：',
+      `./deploy/install.sh${binArg}`,
+      "# 配置合法时脚本会自动 enable + restart；也可手动：",
+      "# systemctl --user enable --now probe-rs",
     ].join("\n");
     html += outBlock("② sh — install.sh（需先 cargo build --release 或有现成二进制）", cmd);
     const v = vals.native;
     html += `<div class="summary-label">安装参数</div><div class="chips">${chipList([
-      ["protocol", "probe"], ["id", v.reporter_id || "primary"],
+      ["scope", scope], ["data_dir", dataDir], ["protocol", "probe"], ["id", v.reporter_id || "primary"],
       ["server_id", v.server_id || "—"], ["worker_url", v.worker_url || "—"],
       ["report_interval", v.report_interval || "60"], ["reset_day", v.reset_day || "1"],
       ["collect", v.collect || "10"], ["report_gpu", String(!!v.report_gpu)],
@@ -731,6 +757,7 @@ function parseCF(rawText) {
   }
   if (!map.id && !map.secret && !map.url) return null;
   const v = modeDefaults("cf");
+  v.scope = /\|\s*sudo\s+(?:sh|bash)\b/.test(rawText) ? "system" : "user";
   for (const k of ["id","secret","url","collect","interval","connection_mode","reset_day","ct","cu","cm","bd",
                    "interfaces","auto_update","update_channel","rx_correction","tx_correction","reporter_id",
                    "install_version","ghproxy","bin"]) {
@@ -766,6 +793,7 @@ function parseKomari(tokens) {
     if (flags[tk]) { const [k, val] = flags[tk]; map[k] = val; }
   }
   if (!map.endpoint && !map.token) return null;
+  map.scope = tokens.some((token, index) => token === "sudo" && tokens[index - 1] === "|") ? "system" : "user";
   vals.komari = Object.assign(modeDefaults("komari"), map);
   return Object.keys(map);
 }
@@ -803,7 +831,7 @@ document.getElementById("paste").addEventListener("input", autoParse);
 document.getElementById("btn-demo-cf").addEventListener("click", () => {
   document.getElementById("paste").value =
     "curl -fsSL https://monitor.example.com/install.sh | bash -s -- install -id=3f2504e0-4f89-41d3-9a0c-0305e82c3301 " +
-    "-secret=s3cr3t-key -url=https://monitor.example.com -interval=30 -collect_interval=1 -reset_day=15 " +
+    "-secret=s3cr3t-key -url=https://monitor.example.com/update -interval=30 -collect_interval=1 -reset_day=15 " +
     "-ct=gd-ct.example.com:80 -cu=gd-cu.example.com:80 -interface=eth0,ens3 -auto_update=1";
   autoParse();
 });
@@ -816,3 +844,5 @@ document.getElementById("btn-demo-komari").addEventListener("click", () => {
 
 renderOutput();
 </script>
+</body>
+</html>

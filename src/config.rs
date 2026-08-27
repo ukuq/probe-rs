@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::model::{
-    CollectConfig, CollectionIntervals, GlobalConfigSummary, GlobalPingTarget, Intervals,
-    KomariLearnedPing, PingKind, PingTarget, RemoteConfig, ReporterConfig, ReporterProtocol,
-    ReporterSummary, StaticConfig,
+    CfConnectionMode, CollectConfig, CollectionIntervals, GlobalConfigSummary, GlobalPingTarget,
+    Intervals, KomariLearnedPing, PingKind, PingTarget, RemoteConfig, ReporterConfig,
+    ReporterProtocol, ReporterSummary, StaticConfig,
 };
 
 pub const KOMARI_LEARNED_PING_LIMIT: usize = 5;
@@ -85,6 +85,7 @@ pub struct ReporterSpec {
     pub secret: String,
     pub worker_url: String,
     pub config_version: String,
+    pub connection_mode: Option<CfConnectionMode>,
     pub intervals: Intervals,
     pub reset_day: u8,
     pub interfaces: Vec<String>,
@@ -316,6 +317,7 @@ impl LocalConfig {
                             secret: cf.secret.clone(),
                             worker_url: cf.url.clone(),
                             config_version: cf.ext.config_version.clone(),
+                            connection_mode: Some(cf.connection_mode),
                             intervals: collect.intervals.with_report(cf.interval),
                             reset_day: cf.reset_day,
                             interfaces: collect.interfaces,
@@ -349,6 +351,7 @@ impl LocalConfig {
                             secret: komari.token.clone(),
                             worker_url: komari.endpoint.clone(),
                             config_version: String::new(),
+                            connection_mode: None,
                             // komari 按采集周期上报。
                             intervals: collect.intervals.with_report(komari.interval),
                             reset_day: komari.month_rotate,
@@ -370,6 +373,7 @@ impl LocalConfig {
                             secret: probe.secret.clone(),
                             worker_url: probe.worker_url.clone(),
                             config_version: probe.ext.config_version.clone(),
+                            connection_mode: None,
                             intervals: collect.intervals.with_report(probe.report_interval),
                             reset_day: probe.reset_day,
                             interfaces: collect.interfaces,
@@ -1066,8 +1070,8 @@ impl SharedConfig {
     }
 }
 
-/// CF 远端配置落点:段形只能表达 collect_interval/interface/ct/cu/cm/bd,
-/// 落不下的字段整体拒绝,不静默丢弃。
+/// CF 远端配置落点:段形只能表达 collect_interval/connection_mode/
+/// interface/ct/cu/cm/bd 等直属字段；落不下的字段整体拒绝,不静默丢弃。
 fn apply_remote_cf(section: &mut crate::model::CfSection, remote: &RemoteConfig) -> Result<()> {
     if let Some(intervals) = remote.intervals {
         let entity = section.to_collect_config().intervals;
@@ -1083,6 +1087,9 @@ fn apply_remote_cf(section: &mut crate::model::CfSection, remote: &RemoteConfig)
     }
     if let Some(value) = remote.report_interval {
         section.interval = value;
+    }
+    if let Some(value) = remote.connection_mode {
+        section.connection_mode = value;
     }
     if let Some(value) = remote.reset_day {
         section.reset_day = value;
@@ -1356,6 +1363,7 @@ mod tests {
                 server_id: "cf-id".into(),
                 secret: "cf-secret".into(),
                 url: "https://worker.example/update".into(),
+                connection_mode: CfConnectionMode::Auto,
                 interval: 60,
                 collect_interval: 1,
                 reset_day: 1,
@@ -1605,6 +1613,32 @@ mod tests {
     fn example_config_stays_valid() {
         let cfg: LocalConfig = toml::from_str(include_str!("../config.example.toml")).unwrap();
         cfg.validate().unwrap();
+        assert_eq!(
+            cfg.reporter("primary").unwrap().connection_mode,
+            Some(CfConnectionMode::Auto)
+        );
+    }
+
+    #[test]
+    fn cf_connection_mode_defaults_to_auto_when_omitted() {
+        let text = r#"
+schema = 1
+data_dir = "/tmp/x"
+
+[[reporters]]
+id = "cf"
+
+[reporters.cf]
+server_id = "server"
+secret = "secret"
+url = "https://example.com/update"
+"#;
+        let cfg: LocalConfig = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.reporter("cf").unwrap().connection_mode,
+            Some(CfConnectionMode::Auto)
+        );
     }
 
     #[test]
@@ -1898,6 +1932,7 @@ report_interval = 60
             config_version: config_version.into(),
             intervals: None,
             report_interval: None,
+            connection_mode: None,
             reset_day: None,
             interfaces: None,
             disks: None,
@@ -1984,6 +2019,7 @@ report_interval = 60
             ..Default::default()
         });
         push.report_interval = Some(30);
+        push.connection_mode = Some(CfConnectionMode::Http);
         push.interfaces = Some(vec!["eth0".into()]);
         push.pings = Some(vec![
             PingTarget {
@@ -2004,11 +2040,18 @@ report_interval = 60
         let cf = shared.get().reporters[0].cf.clone().unwrap();
         assert_eq!(cf.collect_interval, 2);
         assert_eq!(cf.interval, 30);
+        assert_eq!(cf.connection_mode, CfConnectionMode::Http);
         assert_eq!(cf.interface, "eth0");
         assert_eq!(cf.ct.as_deref(), Some("new-ct.example.com:80"));
         assert_eq!(cf.cu.as_deref(), Some("new-cu.example.com:80"));
         assert_eq!(cf.cm, None); // 缺席 = 清除
         assert_eq!(cf.ext.config_version, "v1");
+
+        let on_disk = load(&path).unwrap();
+        assert_eq!(
+            on_disk.reporters[0].cf.as_ref().unwrap().connection_mode,
+            CfConnectionMode::Http
+        );
 
         // 非 collect 的 intervals 字段:整体拒绝
         let mut push = remote("v2");

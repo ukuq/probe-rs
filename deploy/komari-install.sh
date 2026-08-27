@@ -182,15 +182,15 @@ if [ -z "$BIN" ]; then
         loongarch64|loong64) arch=loong64 ;;
         *) die "不支持的架构: $arch" ;;
     esac
-    if [ -n "$VERSION" ]; then
+    if [ -z "$VERSION" ] || [ "$VERSION" = latest ]; then
+        BIN="$RELEASE_BASE/latest/download/probe-rs-linux-$arch"
+        SUM_URL="$RELEASE_BASE/latest/download/SHA256SUMS"
+    else
         # 与 cf-install.sh 对齐：缺 v 前缀自动补，非法字符拒绝
         case "$VERSION" in v*) tag=$VERSION ;; *) tag=v$VERSION ;; esac
         case "$tag" in *[!A-Za-z0-9._-]*) die "invalid install-version" ;; esac
         BIN="$RELEASE_BASE/download/$tag/probe-rs-linux-$arch"
         SUM_URL="$RELEASE_BASE/download/$tag/SHA256SUMS"
-    else
-        BIN="$RELEASE_BASE/latest/download/probe-rs-linux-$arch"
-        SUM_URL="$RELEASE_BASE/latest/download/SHA256SUMS"
     fi
     # 脚本自动推导的 Release 源必须校验;用户显式 -bin=<路径或URL> 视为信任输入
     VERIFY_SUMS=1

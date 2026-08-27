@@ -16,8 +16,8 @@ use crate::buffer::{BufferBatch, Buffers};
 use crate::collector::{self, net, CpuMonitor};
 use crate::config::{ReporterSpec, SharedConfig};
 use crate::model::{
-    AsyncRecord, DynamicRecord, ErrorRecord, GpuRecord, Intervals, NetInterfaceSample, PingRecord,
-    Report, ReporterProtocol, SelfRecord, SlowBlock, StaticInfo,
+    AsyncRecord, CfConnectionMode, DynamicRecord, ErrorRecord, GpuRecord, Intervals,
+    NetInterfaceSample, PingRecord, Report, ReporterProtocol, SelfRecord, SlowBlock, StaticInfo,
 };
 use crate::netstatic::{period_start_ms, NetStatic};
 use crate::reporter::{AgentClock, Reporter};
@@ -421,7 +421,11 @@ impl ReporterRunner {
 
     fn sync_cf_ws(&self, spec: &ReporterSpec) {
         if let Some(ws) = &self.cf_ws {
-            ws.set_config(spec.protocol == ReporterProtocol::Cf, &spec.config_version);
+            ws.set_config(
+                spec.protocol == ReporterProtocol::Cf
+                    && spec.connection_mode == Some(CfConnectionMode::Auto),
+                &spec.config_version,
+            );
         }
     }
 
@@ -457,7 +461,9 @@ impl ReporterRunner {
             }
         }
         let report = Duration::from_secs(spec.intervals.report.max(1));
-        if spec.protocol != ReporterProtocol::Cf {
+        if spec.protocol != ReporterProtocol::Cf
+            || spec.connection_mode == Some(CfConnectionMode::Http)
+        {
             return report;
         }
         if let Some(ws) = self.cf_ws.as_ref().filter(|ws| ws.connected()) {
@@ -485,14 +491,15 @@ impl ReporterRunner {
         let Some(spec) = self.cfg.get().reporter(&self.id) else {
             return;
         };
-        let cf_inflight_through = (spec.protocol == ReporterProtocol::Cf)
-            .then(|| {
-                self.cf_ws
-                    .as_ref()
-                    .filter(|ws| ws.connected())
-                    .and_then(CfWsSender::in_flight_through)
-            })
-            .flatten();
+        let cf_inflight_through = (spec.protocol == ReporterProtocol::Cf
+            && spec.connection_mode == Some(CfConnectionMode::Auto))
+        .then(|| {
+            self.cf_ws
+                .as_ref()
+                .filter(|ws| ws.connected())
+                .and_then(CfWsSender::in_flight_through)
+        })
+        .flatten();
         let batch = match cf_inflight_through {
             Some(through) => self.buffers.read_after(&self.id, Some(through)),
             None => self.buffers.read(&self.id),
@@ -834,21 +841,23 @@ impl ReporterRunner {
             samples,
         };
 
-        if let Some(ws) = self.cf_ws.as_ref().filter(|ws| ws.connected()) {
-            match ws.send(&update, through, include_static) {
-                Ok(()) => {
-                    // The socket actor reports the sequence actually
-                    // written. Subsequent ticks skip those in-flight
-                    // samples while ACK handling independently advances
-                    // the durable journal cursor.
-                    return false;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        reporter_id = %self.id,
-                        %error,
-                        "CF WSS report failed; POST fallback will follow report_interval"
-                    );
+        if spec.connection_mode == Some(CfConnectionMode::Auto) {
+            if let Some(ws) = self.cf_ws.as_ref().filter(|ws| ws.connected()) {
+                match ws.send(&update, through, include_static) {
+                    Ok(()) => {
+                        // The socket actor reports the sequence actually
+                        // written. Subsequent ticks skip those in-flight
+                        // samples while ACK handling independently advances
+                        // the durable journal cursor.
+                        return false;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            reporter_id = %self.id,
+                            %error,
+                            "CF WSS report failed; POST fallback will follow report_interval"
+                        );
+                    }
                 }
             }
         }
@@ -1110,7 +1119,10 @@ impl ReporterRunner {
 }
 
 fn report_schedule_changed(previous: &ReporterSpec, current: &ReporterSpec) -> bool {
-    previous.protocol != current.protocol || previous.intervals.report != current.intervals.report
+    previous.protocol != current.protocol
+        || previous.intervals.report != current.intervals.report
+        || (current.protocol == ReporterProtocol::Cf
+            && previous.connection_mode != current.connection_mode)
 }
 
 fn dynamic_traffic_window(record: &DynamicRecord, reset_day: u8) -> (i64, i64) {
@@ -1327,6 +1339,7 @@ mod tests {
             secret: "secret".into(),
             worker_url: "https://example.com/report".into(),
             config_version: String::new(),
+            connection_mode: None,
             intervals: Intervals::default(),
             reset_day: 1,
             interfaces: vec![],
@@ -1379,7 +1392,12 @@ mod tests {
 
         let mut cf = original.clone();
         cf.protocol = ReporterProtocol::Cf;
+        cf.connection_mode = Some(CfConnectionMode::Auto);
         assert!(report_schedule_changed(&original, &cf));
+
+        let mut cf_http = cf.clone();
+        cf_http.connection_mode = Some(CfConnectionMode::Http);
+        assert!(report_schedule_changed(&cf, &cf_http));
     }
 
     #[test]

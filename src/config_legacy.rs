@@ -11,8 +11,8 @@ use serde::Deserialize;
 
 use crate::config::{AutoUpdateConfig, LocalConfig, CONFIG_SCHEMA};
 use crate::model::{
-    CfSection, CollectionIntervals, KomariSection, PingKind, PingTarget, ProbeSection,
-    ReporterConfig, ReporterProtocol,
+    CfConnectionMode, CfSection, CollectionIntervals, KomariSection, PingKind, PingTarget,
+    ProbeSection, ReporterConfig, ReporterProtocol,
 };
 
 #[derive(Debug, Deserialize)]
@@ -82,7 +82,7 @@ struct LegacyCfExt {
     #[serde(default = "default_true")]
     batch: bool,
     #[serde(default)]
-    connection_mode: LegacyConnectionMode,
+    connection_mode: CfConnectionMode,
 }
 
 impl Default for LegacyCfExt {
@@ -90,17 +90,9 @@ impl Default for LegacyCfExt {
         Self {
             correction: true,
             batch: true,
-            connection_mode: LegacyConnectionMode::default(),
+            connection_mode: CfConnectionMode::default(),
         }
     }
-}
-
-#[derive(Debug, Default, PartialEq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum LegacyConnectionMode {
-    #[default]
-    Auto,
-    Http,
 }
 
 /// 把旧版配置文本转换为新结构;返回配置与逐条迁移警告。
@@ -204,11 +196,6 @@ fn convert_reporter(legacy: LegacyReporterConfig, warnings: &mut Vec<String>) ->
                     "reporter {id}: ext.cf.batch=false 已失效,上报固定为 samples[] 批量"
                 ));
             }
-            if legacy.ext.cf.connection_mode == LegacyConnectionMode::Http {
-                warnings.push(format!(
-                    "reporter {id}: ext.cf.connection_mode=http 已失效,连接固定为 auto(WSS+POST 回退)"
-                ));
-            }
             let (ct, cu, cm, bd) = convert_cf_pings(&id, legacy.pings, warnings);
             ReporterConfig {
                 id: legacy.id,
@@ -216,6 +203,7 @@ fn convert_reporter(legacy: LegacyReporterConfig, warnings: &mut Vec<String>) ->
                     server_id: legacy.server_id,
                     secret: legacy.secret,
                     url: legacy.worker_url,
+                    connection_mode: legacy.ext.cf.connection_mode,
                     interval: legacy.report_interval.max(1),
                     collect_interval: legacy.intervals.collect.max(1),
                     reset_day: legacy.reset_day,
@@ -444,14 +432,15 @@ connection_mode = "http"
         let cf = cfg.reporters[0].cf.as_ref().unwrap();
         assert_eq!(cf.server_id, "cf-server-uuid");
         assert_eq!(cf.url, "https://monitor.example.com/update");
+        assert_eq!(cf.connection_mode, CfConnectionMode::Http);
         assert_eq!(cf.interval, 30);
         assert_eq!(cf.collect_interval, 1);
         assert_eq!(cf.interface, "eth0,eth1");
         assert_eq!(cf.ct.as_deref(), Some("gd-ct.example.com:80"));
         assert_eq!(cf.cu, None);
         assert_eq!(cf.ext.config_version, "abc");
-        // disks、report_gpu=false、ping=45、homepage、correction=false、http 模式
-        assert_eq!(warnings.len(), 6, "warnings: {warnings:?}");
+        // disks、report_gpu=false、ping=45、homepage、correction=false
+        assert_eq!(warnings.len(), 5, "warnings: {warnings:?}");
     }
 
     #[test]
