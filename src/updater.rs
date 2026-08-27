@@ -584,6 +584,7 @@ pub fn maybe_finish_windows_update() -> Result<bool> {
     if original_args.first().is_some_and(|arg| arg == "--") {
         original_args.remove(0);
     }
+    let user_mode = windows_user_mode(&original_args);
 
     let parent = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, parent_id) };
     if !parent.is_null() {
@@ -622,33 +623,35 @@ pub fn maybe_finish_windows_update() -> Result<bool> {
         }
     }
 
-    'task_start: for _ in 0..15 {
-        match windows_agent_process_running(parent_id) {
-            Ok(true) => return Ok(true),
-            Ok(false) => {}
-            Err(error) => {
-                tracing::warn!(%error, "failed to inspect Windows processes while confirming restart");
-                break;
-            }
-        }
-        let status = Command::new("schtasks.exe")
-            .args(["/Run", "/TN", "probe-rs"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
-        if status.is_ok_and(|status| status.success()) {
-            for _ in 0..5 {
-                std::thread::sleep(Duration::from_millis(200));
-                match windows_agent_process_running(parent_id) {
-                    Ok(true) => return Ok(true),
-                    Ok(false) => {}
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to inspect Windows processes while confirming restart");
-                        break 'task_start;
-                    }
+    if !user_mode {
+        'task_start: for _ in 0..15 {
+            match windows_agent_process_running(parent_id) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "failed to inspect Windows processes while confirming restart");
+                    break;
                 }
             }
-        } else {
-            std::thread::sleep(Duration::from_secs(1));
+            let status = Command::new("schtasks.exe")
+                .args(["/Run", "/TN", "probe-rs"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+            if status.is_ok_and(|status| status.success()) {
+                for _ in 0..5 {
+                    std::thread::sleep(Duration::from_millis(200));
+                    match windows_agent_process_running(parent_id) {
+                        Ok(true) => return Ok(true),
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to inspect Windows processes while confirming restart");
+                            break 'task_start;
+                        }
+                    }
+                }
+            } else {
+                std::thread::sleep(Duration::from_secs(1));
+            }
         }
     }
 
@@ -665,6 +668,12 @@ pub fn maybe_finish_windows_update() -> Result<bool> {
         .spawn()
         .context("failed to restart updated probe-rs")?;
     Ok(true)
+}
+
+#[cfg(windows)]
+fn windows_user_mode(args: &[std::ffi::OsString]) -> bool {
+    args.iter()
+        .any(|arg| arg == std::ffi::OsStr::new("--user-mode"))
 }
 
 #[cfg(windows)]
@@ -938,5 +947,19 @@ mod tests {
             ".probe-rs-update-abc.exe.previous.exe\\..\\victim"
         ))
         .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_detects_user_mode_restart() {
+        assert!(windows_user_mode(&[
+            "--user-mode".into(),
+            "--config".into(),
+            "user.toml".into(),
+        ]));
+        assert!(!windows_user_mode(&[
+            "--config".into(),
+            "machine.toml".into(),
+        ]));
     }
 }

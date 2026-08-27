@@ -1,15 +1,15 @@
 #Requires -Version 5.1
-#Requires -RunAsAdministrator
 
 <#
 .SYNOPSIS
-Installs probe-rs as a SYSTEM task that starts at boot, logon, and resume, with an interactive tray companion.
+Installs probe-rs either as a machine-wide SYSTEM task or for the current user.
 
 .EXAMPLE
 .\install.ps1
 .\install.ps1 install -BinaryPath C:\path\to\probe-rs.exe
+.\install.ps1 install -Scope Machine -BinaryPath C:\path\to\probe-rs.exe
 .\install.ps1 status
-.\install.ps1 uninstall
+.\install.ps1 uninstall -Scope Machine
 .\install.ps1 uninstall -Purge
 #>
 
@@ -19,7 +19,10 @@ param(
     [ValidateSet("install", "uninstall", "start", "stop", "status")]
     [string]$Action = "install",
 
-    [string]$BinaryPath = (Join-Path $PSScriptRoot "..\target\release\probe-rs.exe"),
+    [string]$BinaryPath,
+
+    [ValidateSet("Machine", "User")]
+    [string]$Scope = "User",
 
     [switch]$NoStart,
 
@@ -29,19 +32,40 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if ([string]::IsNullOrWhiteSpace($BinaryPath)) {
+    $BinaryPath = Join-Path $PSScriptRoot "..\target\release\probe-rs.exe"
+}
 $TaskName = "probe-rs"
 $SystemSid = "S-1-5-18"
 $TaskTriggerEvent = 0
 $TaskCreateOrUpdate = 6
 $TaskLogonServiceAccount = 5
-$InstallDir = Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "probe-rs"
-$DataDir = Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "probe-rs"
+$IsMachine = $Scope -eq "Machine"
+if ($IsMachine) {
+    $InstallDir = Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "probe-rs"
+    $DataDir = Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "probe-rs"
+    $ConfigPath = Join-Path $DataDir "config.toml"
+    $StartupDir = [Environment]::GetFolderPath("CommonStartup")
+}
+else {
+    $InstallDir = Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "probe-rs"
+    $DataDir = Join-Path $InstallDir "data"
+    $ConfigPath = Join-Path $InstallDir "config.toml"
+    $StartupDir = [Environment]::GetFolderPath("Startup")
+}
 $InstalledBinary = Join-Path $InstallDir "probe-rs.exe"
 $InstalledTrayBinary = Join-Path $InstallDir "probe-rs-tray.exe"
-$ConfigPath = Join-Path $DataDir "config.toml"
 $ExampleConfig = Join-Path $PSScriptRoot "..\config.example.toml"
-$TrayShortcut = Join-Path ([Environment]::GetFolderPath("CommonStartup")) "probe-rs-tray.lnk"
+$TrayShortcut = Join-Path $StartupDir "probe-rs-tray.lnk"
+$AgentShortcut = Join-Path $StartupDir "probe-rs-agent.lnk"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+$isAdministrator = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($IsMachine -and -not $isAdministrator) {
+    throw "Machine scope requires an elevated administrator PowerShell. Use -Scope User for a non-admin installation."
+}
 
 if ($Purge -and $Action -ne "uninstall") {
     throw "-Purge can only be used with uninstall."
@@ -51,6 +75,9 @@ if ($NoStart -and $Action -ne "install") {
 }
 
 function Get-ProbeTask {
+    if (-not $IsMachine) {
+        return $null
+    }
     Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 }
 
@@ -101,8 +128,7 @@ function Test-PlaceholderConfig {
         $text -match '(?m)^url\s*=\s*"https://monitor\.example\.com/update"\s*$' -or
         $text -match '(?m)^endpoint\s*=\s*"https://komari\.example\.com"\s*$' -or
         $text -match '(?m)^worker_url\s*=\s*"https://monitor\.example\.com/(report|update)"\s*$' -or
-        $text -match '(?m)^worker_url\s*=\s*"https://komari\.example\.com"\s*$' -or
-        $text -match '(?m)^worker_url\s*=\s*"http://127\.0\.0\.1:8080/report"\s*$'
+        $text -match '(?m)^worker_url\s*=\s*"https://komari\.example\.com"\s*$'
 }
 
 function Set-ProtectedPathAcl {
@@ -140,6 +166,9 @@ function Set-ProtectedPathAcl {
 }
 
 function Protect-DataDirectory {
+    if (-not $IsMachine) {
+        return
+    }
     # Config contains the reporting secret. Directories need inheritable rules,
     # while files need rules that apply to the file itself. Applying (OI)(CI)
     # recursively with icacls can leave an existing file with an empty DACL.
@@ -150,32 +179,130 @@ function Protect-DataDirectory {
 }
 
 function Get-TrayProcesses {
-    $processes = @(
-        Get-CimInstance Win32_Process -Filter "Name='probe-rs.exe'" -ErrorAction SilentlyContinue
-        Get-CimInstance Win32_Process -Filter "Name='probe-rs-tray.exe'" -ErrorAction SilentlyContinue
+    @(
+        Get-Process -Name "probe-rs-tray" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -eq $InstalledTrayBinary }
     )
-    @($processes | Where-Object {
-            $_.ExecutablePath -in @($InstalledBinary, $InstalledTrayBinary) -and
-            $_.CommandLine -match '(?i)(?:^|\s|")--tray(?:\s|$|")'
-        })
+}
+
+function Get-AgentProcesses {
+    @(
+        Get-Process -Name "probe-rs" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -eq $InstalledBinary }
+    )
+}
+
+function Stop-ProbeProcesses {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Processes,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Kind
+    )
+
+    $processIds = @($Processes | ForEach-Object { $_.Id })
+    foreach ($processId in $processIds) {
+        Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+    }
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    do {
+        $remaining = @(
+            $processIds | Where-Object {
+                Get-Process -Id $_ -ErrorAction SilentlyContinue
+            }
+        )
+        if ($remaining.Count -eq 0) {
+            return
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    throw "Timed out waiting for $Kind process(es) to stop: $($remaining -join ', ')"
 }
 
 function Stop-Tray {
-    foreach ($process in @(Get-TrayProcesses)) {
-        Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+    Stop-ProbeProcesses -Processes @(Get-TrayProcesses) -Kind "tray"
+}
+
+function Stop-Agent {
+    Stop-ProbeProcesses -Processes @(Get-AgentProcesses) -Kind "agent"
+}
+
+function Get-AgentArguments {
+    $arguments = ('--config "{0}"' -f $ConfigPath)
+    if (-not $IsMachine) {
+        $arguments = "--user-mode $arguments"
+    }
+    if ($DebugLog) {
+        $arguments += ' --debug'
+    }
+    return $arguments
+}
+
+function Get-TrayArguments {
+    $arguments = ('--tray --config "{0}"' -f $ConfigPath)
+    if (-not $IsMachine) {
+        $arguments = "--tray --user-mode --config `"$ConfigPath`""
+    }
+    return $arguments
+}
+
+function Set-StartupShortcut {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TargetPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Arguments,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($Path)
+    $shortcut.TargetPath = $TargetPath
+    $shortcut.Arguments = $Arguments
+    $shortcut.WorkingDirectory = $InstallDir
+    $shortcut.IconLocation = $InstalledBinary
+    $shortcut.Description = $Description
+    $shortcut.WindowStyle = 7
+    $shortcut.Save()
+    $saved = $shell.CreateShortcut($Path)
+    if ($saved.TargetPath -ne $TargetPath) {
+        throw "Failed to create startup shortcut target: $Path -> $TargetPath"
     }
 }
 
 function Install-TrayStartup {
-    $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut($TrayShortcut)
-    $shortcut.TargetPath = $InstalledTrayBinary
-    $shortcut.Arguments = "--tray"
-    $shortcut.WorkingDirectory = $InstallDir
-    $shortcut.IconLocation = $InstalledBinary
-    $shortcut.Description = "probe-rs notification area companion"
-    $shortcut.WindowStyle = 7
-    $shortcut.Save()
+    Set-StartupShortcut `
+        -Path $TrayShortcut `
+        -TargetPath $InstalledTrayBinary `
+        -Arguments (Get-TrayArguments) `
+        -Description "probe-rs notification area companion ($Scope)"
+}
+
+function Install-AgentStartup {
+    if ($IsMachine) {
+        return
+    }
+    Set-StartupShortcut `
+        -Path $AgentShortcut `
+        -TargetPath $InstalledBinary `
+        -Arguments (Get-AgentArguments) `
+        -Description "probe-rs monitoring agent (User)"
+}
+
+function Remove-AgentStartup {
+    if (Test-Path -LiteralPath $AgentShortcut) {
+        Remove-Item -LiteralPath $AgentShortcut -Force
+    }
 }
 
 function Start-Tray {
@@ -185,10 +312,21 @@ function Start-Tray {
     if (@(Get-TrayProcesses).Count -eq 0) {
         Start-Process `
             -FilePath $InstalledTrayBinary `
-            -ArgumentList "--tray" `
+            -ArgumentList (Get-TrayArguments) `
             -WorkingDirectory $InstallDir `
             -WindowStyle Hidden
     }
+}
+
+function Start-UserAgent {
+    if ($IsMachine -or @(Get-AgentProcesses).Count -gt 0) {
+        return
+    }
+    Start-Process `
+        -FilePath $InstalledBinary `
+        -ArgumentList (Get-AgentArguments) `
+        -WorkingDirectory $InstallDir `
+        -WindowStyle Hidden
 }
 
 function Write-InitialConfig {
@@ -244,6 +382,9 @@ function Install-Probe {
     if ($existingTask) {
         Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     }
+    if (-not $IsMachine) {
+        Stop-Agent
+    }
     Stop-Tray
 
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
@@ -262,60 +403,74 @@ function Install-Probe {
         Write-Host "Keeping existing config: $ConfigPath"
     }
 
-    $agentArguments = ('--config "{0}"' -f $ConfigPath)
-    if ($DebugLog) {
-        $agentArguments += ' --debug'
+    if ($IsMachine) {
+        $taskAction = New-ScheduledTaskAction `
+            -Execute $InstalledBinary `
+            -Argument (Get-AgentArguments) `
+            -WorkingDirectory $InstallDir
+        $triggers = @(
+            New-ScheduledTaskTrigger -AtStartup
+            # No -User means any interactive user logon; the task still runs as SYSTEM.
+            New-ScheduledTaskTrigger -AtLogOn
+        )
+        $taskPrincipal = New-ScheduledTaskPrincipal `
+            -UserId $SystemSid `
+            -LogonType ServiceAccount `
+            -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -Disable `
+            -DontStopIfGoingOnBatteries `
+            -MultipleInstances IgnoreNew `
+            -StartWhenAvailable `
+            -RestartCount 999 `
+            -RestartInterval (New-TimeSpan -Minutes 1) `
+            -ExecutionTimeLimit ([TimeSpan]::Zero)
+        $task = New-ScheduledTask `
+            -Action $taskAction `
+            -Trigger $triggers `
+            -Principal $taskPrincipal `
+            -Settings $settings `
+            -Description "probe-rs server monitoring agent"
+        Register-ScheduledTask -TaskName $TaskName -InputObject $task -Force | Out-Null
+        Add-ProbeResumeTrigger -Name $TaskName
     }
-    $taskAction = New-ScheduledTaskAction `
-        -Execute $InstalledBinary `
-        -Argument $agentArguments `
-        -WorkingDirectory $InstallDir
-    $triggers = @(
-        New-ScheduledTaskTrigger -AtStartup
-        # No -User means any interactive user logon; the task still runs as SYSTEM.
-        New-ScheduledTaskTrigger -AtLogOn
-    )
-    $principal = New-ScheduledTaskPrincipal `
-        -UserId $SystemSid `
-        -LogonType ServiceAccount `
-        -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet `
-        -AllowStartIfOnBatteries `
-        -Disable `
-        -DontStopIfGoingOnBatteries `
-        -MultipleInstances IgnoreNew `
-        -StartWhenAvailable `
-        -RestartCount 999 `
-        -RestartInterval (New-TimeSpan -Minutes 1) `
-        -ExecutionTimeLimit ([TimeSpan]::Zero)
-    $task = New-ScheduledTask `
-        -Action $taskAction `
-        -Trigger $triggers `
-        -Principal $principal `
-        -Settings $settings `
-        -Description "probe-rs server monitoring agent"
-    Register-ScheduledTask -TaskName $TaskName -InputObject $task -Force | Out-Null
-    Add-ProbeResumeTrigger -Name $TaskName
     Install-TrayStartup
 
     if ($NoStart) {
-        Disable-ScheduledTask -TaskName $TaskName | Out-Null
+        if ($IsMachine) {
+            Disable-ScheduledTask -TaskName $TaskName | Out-Null
+        }
+        else {
+            Remove-AgentStartup
+        }
         Write-Host "Installed without starting."
         return
     }
 
     if (Test-PlaceholderConfig $ConfigPath) {
-        Disable-ScheduledTask -TaskName $TaskName | Out-Null
+        if ($IsMachine) {
+            Disable-ScheduledTask -TaskName $TaskName | Out-Null
+        }
+        else {
+            Remove-AgentStartup
+        }
         Write-Host "Installed, but the sample config is still in use."
         Write-Host "Edit: $ConfigPath"
-        Write-Host "Then run: .\deploy\install.ps1 start"
+        Write-Host "Then run: .\deploy\install.ps1 start -Scope $Scope"
         return
     }
 
-    Enable-ScheduledTask -TaskName $TaskName | Out-Null
-    Start-ScheduledTask -TaskName $TaskName
+    if ($IsMachine) {
+        Enable-ScheduledTask -TaskName $TaskName | Out-Null
+        Start-ScheduledTask -TaskName $TaskName
+    }
+    else {
+        Install-AgentStartup
+        Start-UserAgent
+    }
     Start-Tray
-    Write-Host "Installed and started. Check status with: .\deploy\install.ps1 status"
+    Write-Host "Installed and started ($Scope). Check status with: .\deploy\install.ps1 status -Scope $Scope"
 }
 
 function Uninstall-Probe {
@@ -324,35 +479,44 @@ function Uninstall-Probe {
         Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     }
+    if (-not $IsMachine) {
+        Stop-Agent
+    }
     Stop-Tray
     if (Test-Path -LiteralPath $TrayShortcut) {
         Remove-Item -LiteralPath $TrayShortcut -Force
     }
+    Remove-AgentStartup
     if (Test-Path -LiteralPath $InstalledBinary) {
         Remove-Item -LiteralPath $InstalledBinary -Force
     }
     if (Test-Path -LiteralPath $InstalledTrayBinary) {
         Remove-Item -LiteralPath $InstalledTrayBinary -Force
     }
+    if ($Purge) {
+        if (-not $IsMachine -and (Test-Path -LiteralPath $InstallDir)) {
+            Remove-Item -LiteralPath $InstallDir -Recurse -Force
+        }
+        elseif (Test-Path -LiteralPath $DataDir) {
+            Remove-Item -LiteralPath $DataDir -Recurse -Force
+        }
+        Write-Host "Uninstalled and removed config/data ($Scope)."
+    }
+    else {
+        Write-Host "Uninstalled ($Scope). Config/data kept (use -Purge to remove them)."
+    }
     if ((Test-Path -LiteralPath $InstallDir) -and
         -not (Get-ChildItem -LiteralPath $InstallDir -Force | Select-Object -First 1)) {
         Remove-Item -LiteralPath $InstallDir -Force
     }
-
-    if ($Purge) {
-        if (Test-Path -LiteralPath $DataDir) {
-            Remove-Item -LiteralPath $DataDir -Recurse -Force
-        }
-        Write-Host "Uninstalled and removed config/data from $DataDir"
-    }
-    else {
-        Write-Host "Uninstalled. Config/data kept at $DataDir (use -Purge to remove them)."
-    }
 }
 
 function Start-Probe {
-    if (-not (Get-ProbeTask)) {
+    if ($IsMachine -and -not (Get-ProbeTask)) {
         throw "Scheduled task '$TaskName' is not installed."
+    }
+    if (-not $IsMachine -and -not (Test-Path -LiteralPath $InstalledBinary -PathType Leaf)) {
+        throw "User installation not found: $InstalledBinary"
     }
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
         throw "Config not found: $ConfigPath"
@@ -361,39 +525,72 @@ function Start-Probe {
         throw "Edit the placeholder config before starting: $ConfigPath"
     }
     Protect-DataDirectory
-    Enable-ScheduledTask -TaskName $TaskName | Out-Null
-    Start-ScheduledTask -TaskName $TaskName
+    if ($IsMachine) {
+        Enable-ScheduledTask -TaskName $TaskName | Out-Null
+        Start-ScheduledTask -TaskName $TaskName
+    }
+    else {
+        Install-AgentStartup
+        Start-UserAgent
+    }
     Install-TrayStartup
     Start-Tray
-    Write-Host "probe-rs started."
+    Write-Host "probe-rs started ($Scope)."
 }
 
 function Stop-Probe {
-    if (-not (Get-ProbeTask)) {
+    if ($IsMachine -and -not (Get-ProbeTask)) {
         throw "Scheduled task '$TaskName' is not installed."
     }
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($IsMachine) {
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    }
+    else {
+        Stop-Agent
+    }
     Stop-Tray
-    Write-Host "probe-rs stopped; it remains enabled for the next startup, logon, or resume."
+    Write-Host "probe-rs stopped ($Scope); it remains enabled for the next applicable startup."
 }
 
 function Show-ProbeStatus {
-    $task = Get-ProbeTask
-    if (-not $task) {
-        Write-Host "probe-rs is not installed."
-        return
+    if ($IsMachine) {
+        $task = Get-ProbeTask
+        if (-not $task) {
+            Write-Host "probe-rs is not installed (Machine)."
+            return
+        }
+        $info = Get-ScheduledTaskInfo -TaskName $TaskName
+        $state = $task.State
+        $enabled = $task.Settings.Enabled
+        $lastRunTime = $info.LastRunTime
+        $lastTaskResult = $info.LastTaskResult
+        $nextRunTime = $info.NextRunTime
     }
-    $info = Get-ScheduledTaskInfo -TaskName $TaskName
+    else {
+        if (-not (Test-Path -LiteralPath $InstalledBinary -PathType Leaf)) {
+            Write-Host "probe-rs is not installed (User)."
+            return
+        }
+        $agentProcesses = @(Get-AgentProcesses)
+        $state = if ($agentProcesses.Count -gt 0) { "Running" } else { "Stopped" }
+        $enabled = Test-Path -LiteralPath $AgentShortcut
+        $lastRunTime = $null
+        $lastTaskResult = $null
+        $nextRunTime = $null
+    }
     [PSCustomObject]@{
-        TaskName       = $TaskName
-        State          = $task.State
-        Enabled        = $task.Settings.Enabled
-        LastRunTime    = $info.LastRunTime
-        LastTaskResult = $info.LastTaskResult
-        NextRunTime    = $info.NextRunTime
+        Scope          = $Scope
+        TaskName       = if ($IsMachine) { $TaskName } else { $null }
+        State          = $state
+        Enabled        = $enabled
+        LastRunTime    = $lastRunTime
+        LastTaskResult = $lastTaskResult
+        NextRunTime    = $nextRunTime
         Binary         = $InstalledBinary
         TrayBinary     = $InstalledTrayBinary
         Config         = $ConfigPath
+        Data            = $DataDir
+        AgentStartup    = if ($IsMachine) { $null } else { $AgentShortcut }
         TrayStartup    = $TrayShortcut
     } | Format-List
 }

@@ -182,22 +182,29 @@ sudo ./deploy/install.sh       # 装二进制/unit/示例配置；已装过则�
 - 卸载：`./deploy/install.sh uninstall`（保留配置与数据，加 `--purge` 全清）
 - 一键脚本同样按执行身份选择系统服务或用户服务（换 URL 即可装，参数对齐各官方探针）：CF 模式 `deploy/cf-install.sh`（-id/-secret/-url/-ct/-cu/-cm/-bd）；komari 模式 `deploy/komari-install.sh`（-e 面板地址/-t token/-i 间隔，缺省 collect=1 report=3 对齐官方节奏）
 
-### Windows + 计划任务
+### Windows
 
-在管理员 PowerShell 中执行：
+默认免管理员安装到当前用户（仅在该用户登录期间运行）：
 
 ```powershell
 cargo build --release
 .\deploy\install.ps1
 ```
 
-- 二进制 → `%ProgramFiles%\probe-rs\probe-rs.exe`；配置与流量数据 → `%ProgramData%\probe-rs\`
-- 使用 `SYSTEM`、最高权限的计划任务常驻；开机、任意用户登录及休眠唤醒（延迟 10 秒）时触发，异常退出后每分钟重启
+如需开机未登录也常驻，在管理员 PowerShell 中显式安装为机器级计划任务：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\deploy\install.ps1 install -Scope Machine
+```
+
+- 默认 User 模式将二进制、配置和数据分别放到 `%LocalAppData%\probe-rs\`、同目录 `config.toml` 和 `data\`，用当前用户启动项运行 Agent/托盘，不注册 SYSTEM 任务，控制与编辑不触发 UAC；注销后停止，重新登录后恢复。自动更新直接重启用户进程，不调用机器级计划任务
+- `-Scope Machine` 将二进制放到 `%ProgramFiles%\probe-rs\probe-rs.exe`，配置与流量数据放到 `%ProgramData%\probe-rs\`，使用 `SYSTEM`、最高权限的计划任务常驻；开机、任意用户登录及休眠唤醒（延迟 10 秒）时触发，异常退出后每分钟重启
 - 登录用户的托盘伴随程序显示探针运行状态和 PID；检测到多个探针进程时会注明数量并列出全部 PID，同时提供启动、停止、重启和查看/编辑配置。托盘本身保持普通权限，仅在执行控制操作或编辑受保护配置时通过 UAC 启动短生命周期管理员 helper；编辑器只打开临时副本，保存时执行完整 TOML/业务校验、并发修改检查和备份，全部通过后才原子替换正式配置，校验失败不会损坏现有配置
 - 首次安装会保留示例配置但禁用任务；填好 `server_id` / `secret` / `worker_url` 后执行 `.\deploy\install.ps1 start`
-- 状态/停止：`.\deploy\install.ps1 status` / `.\deploy\install.ps1 stop`
-- 卸载：`.\deploy\install.ps1 uninstall`（保留配置与数据，加 `-Purge` 全清）
+- 状态/停止：`.\deploy\install.ps1 status` / `.\deploy\install.ps1 stop`；Machine 模式需追加 `-Scope Machine`
+- 卸载：`.\deploy\install.ps1 uninstall`（保留配置与数据，加 `-Purge` 全清）；Machine 模式需追加 `-Scope Machine`
 - Release 资产名为 `probe-rs-windows-x86_64.exe`，可用 `-BinaryPath` 指向下载后的文件
+- CF 与 Komari reporter 均可在 User 或 Machine 模式运行；协议与采集逻辑不依赖安装范围。Windows `cf-install.ps1` 为兼容既有部署仍明确使用 Machine 模式；User 模式可通过通用安装器和配置文件启用 CF/Komari reporter
 
 ## CF 协议模式（`[reporters.cf]` 段）
 
@@ -212,7 +219,7 @@ Windows 使用同一套 CF 协议逻辑；CF 一键安装默认启用 GPU 采集
   -Url https://<worker>/update -CollectInterval 0 -Interval 60 -ConnectionMode auto
 ```
 
-脚本默认下载 `probe-rs-windows-x86_64.exe`，也可用 `-BinarySource`/`-Bin` 指定本地文件或 URL；卸载使用 `.\deploy\cf-install.ps1 uninstall`，加 `-Purge` 可清除配置与流量数据。也可以通过通用 `deploy/install.ps1` 安装后，手动将 `%ProgramData%\probe-rs\config.toml` 的 `protocol` 改为 `"cf"`。
+脚本默认下载 `probe-rs-windows-x86_64.exe`，也可用 `-BinarySource`/`-Bin` 指定本地文件或 URL；卸载使用 `.\deploy\cf-install.ps1 uninstall`，加 `-Purge` 可清除配置与流量数据。也可以通过通用 `deploy/install.ps1` 安装后，在 User 模式的 `%LocalAppData%\probe-rs\config.toml` 或 Machine 模式的 `%ProgramData%\probe-rs\config.toml` 中配置 CF reporter。
 
 **上报映射**（reporter_cf.rs）：顶层 `{id, secret, config_schema, config_md5, collect_interval, report_interval, metrics, samples[]}`；ram/swap/disk 字节→MB；load 转空格字符串；GPU → `gpu_info:[{id,name,info}]`（`id` 来自采集端稳定设备标识，显存/温度丢弃，利用率未知的设备不输出）；ping 按组名落 `ping_ct/cu/cm/bd` + `loss_*`（bgp 是 bd 别名，未配置为 `false`，已配置但失败或缓存过期为 `null`）；`ip_v4/v6` 不可达报数值 `0`；`dynamic[]` → `samples[]`。顶层 dynamic/slow/GPU/Ping/disk I/O 快照按各自采集周期与上报周期校验新鲜度，过期字段不再输出；带 `ts` 的 `samples[]` 仍保留历史批量语义，report 不会触发采集。errors/self/virtualization 无落点，CF 模式下不产生。
 

@@ -110,7 +110,7 @@ if ($Purge -and $Action -ne "uninstall") {
     throw "-Purge can only be used with uninstall."
 }
 if ($Action -eq "uninstall") {
-    & $Installer uninstall -Purge:$Purge
+    & $Installer uninstall -Scope Machine -Purge:$Purge
     exit
 }
 
@@ -247,7 +247,7 @@ try {
     $previousTaskEnabled = $taskBeforeInstall -and [bool]$taskBeforeInstall.Settings.Enabled
     $previousTaskRunning = $taskBeforeInstall -and ([string]$taskBeforeInstall.State -eq "Running")
     $taskStateNeedsRestore = [bool]$taskBeforeInstall
-    & $Installer install -BinaryPath $resolvedBinary -NoStart -DebugLog:$debugEnabled
+    & $Installer install -Scope Machine -BinaryPath $resolvedBinary -NoStart -DebugLog:$debugEnabled
 
     $configureArgs = @(
         "configure-cf",
@@ -329,7 +329,7 @@ try {
         Write-Host "CF mode installed without starting. Reporter: $selectedReporter"
     }
     else {
-        & $Installer start
+        & $Installer start -Scope Machine
         Write-Host "CF mode installed and started. Reporter: $selectedReporter"
     }
     Write-Host "Config: $ConfigPath"

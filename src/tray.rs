@@ -6,10 +6,12 @@
 
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
@@ -23,7 +25,11 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Threading::{CreateMutexW, CREATE_NO_WINDOW};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+    CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+};
 use windows_sys::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
     NOTIFYICONDATAW,
@@ -49,6 +55,23 @@ const MENU_ABOUT: usize = 1005;
 const MENU_EXIT: usize = 1006;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+static RUNTIME_OPTIONS: OnceLock<RuntimeOptions> = OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeOptions {
+    user_mode: bool,
+    config_path: PathBuf,
+}
+
+impl RuntimeOptions {
+    fn scope_name(&self) -> &'static str {
+        if self.user_mode {
+            "User"
+        } else {
+            "Machine"
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlAction {
@@ -58,12 +81,18 @@ enum ControlAction {
     EditConfig,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlRequest {
+    action: ControlAction,
+    options: RuntimeOptions,
+}
+
 pub fn run_control_if_requested() -> Result<bool> {
-    let Some(action) = parse_control_request(std::env::args_os().skip(1))? else {
+    let Some(request) = parse_control_request(std::env::args_os().skip(1))? else {
         return Ok(false);
     };
 
-    if let Err(error) = execute_control(action) {
+    if let Err(error) = execute_control(&request) {
         unsafe {
             show_message(
                 null_mut(),
@@ -79,7 +108,7 @@ pub fn run_control_if_requested() -> Result<bool> {
 
 fn parse_control_request(
     args: impl IntoIterator<Item = OsString>,
-) -> Result<Option<ControlAction>> {
+) -> Result<Option<ControlRequest>> {
     let mut args = args.into_iter();
     let Some(flag) = args.next() else {
         return Ok(None);
@@ -100,41 +129,116 @@ fn parse_control_request(
         Some(action) => bail!("unknown --tray-control action: {action}"),
         None => bail!("--tray-control action is not valid Unicode"),
     };
-    if args.next().is_some() {
-        bail!("--tray-control accepts exactly one action");
-    }
-    Ok(Some(action))
+    let options = parse_runtime_options(args)?;
+    Ok(Some(ControlRequest { action, options }))
 }
 
-fn execute_control(action: ControlAction) -> Result<()> {
-    match action {
-        ControlAction::Start => start_agent(),
-        ControlAction::Stop => stop_agent(),
-        ControlAction::Restart => restart_agent(),
-        ControlAction::EditConfig => edit_config(),
+fn parse_runtime_options(args: impl IntoIterator<Item = OsString>) -> Result<RuntimeOptions> {
+    let mut user_mode = false;
+    let mut config_path = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == OsStr::new("--user-mode") {
+            user_mode = true;
+            continue;
+        }
+        if arg == OsStr::new("--tray") {
+            continue;
+        }
+        if arg == OsStr::new("--config") || arg == OsStr::new("-c") {
+            let value = args.next().context("--config requires a path")?;
+            if value.is_empty() {
+                bail!("--config requires a path");
+            }
+            config_path = Some(PathBuf::from(value));
+            continue;
+        }
+        if let Some(arg) = arg.to_str() {
+            if let Some(value) = arg.strip_prefix("--config=") {
+                if value.is_empty() {
+                    bail!("--config= requires a path");
+                }
+                config_path = Some(PathBuf::from(value));
+                continue;
+            }
+        }
+        bail!("unsupported tray argument: {}", arg.to_string_lossy());
+    }
+    Ok(RuntimeOptions {
+        user_mode,
+        config_path: config_path.unwrap_or_else(|| default_config_path(user_mode)),
+    })
+}
+
+fn default_config_path(user_mode: bool) -> PathBuf {
+    let base = if user_mode {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Users\Default\AppData\Local"))
+    } else {
+        std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+    };
+    base.join("probe-rs").join("config.toml")
+}
+
+fn execute_control(request: &ControlRequest) -> Result<()> {
+    match request.action {
+        ControlAction::Start => start_agent(&request.options),
+        ControlAction::Stop => stop_agent(&request.options),
+        ControlAction::Restart => restart_agent(&request.options),
+        ControlAction::EditConfig => edit_config(&request.options.config_path),
     }
 }
 
-fn start_agent() -> Result<()> {
-    if agent_running().context("failed to inspect probe-rs process state")? {
+fn start_agent(options: &RuntimeOptions) -> Result<()> {
+    let agent = installed_agent_path()?;
+    if agent_running(&agent, !options.user_mode)
+        .context("failed to inspect probe-rs process state")?
+    {
         return Ok(());
     }
-    run_schtasks(&["/Change", "/TN", TASK_NAME, "/ENABLE"])?;
-    run_schtasks(&["/Run", "/TN", TASK_NAME])?;
-    wait_for_agent_state(true)
+    if options.user_mode {
+        let directory = agent
+            .parent()
+            .context("installed agent has no parent directory")?;
+        let mut command = Command::new(&agent);
+        command
+            .arg("--user-mode")
+            .arg("--config")
+            .arg(&options.config_path)
+            .current_dir(directory)
+            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        command
+            .spawn()
+            .with_context(|| format!("failed to start {}", agent.display()))?;
+    } else {
+        run_schtasks(&["/Change", "/TN", TASK_NAME, "/ENABLE"])?;
+        run_schtasks(&["/Run", "/TN", TASK_NAME])?;
+    }
+    wait_for_agent_state(&agent, !options.user_mode, true)
 }
 
-fn stop_agent() -> Result<()> {
-    if !agent_running().context("failed to inspect probe-rs process state")? {
+fn stop_agent(options: &RuntimeOptions) -> Result<()> {
+    let agent = installed_agent_path()?;
+    let process_ids = agent_process_ids(&agent, !options.user_mode)?;
+    if process_ids.is_empty() {
         return Ok(());
     }
-    run_schtasks(&["/End", "/TN", TASK_NAME])?;
-    wait_for_agent_state(false)
+    if options.user_mode {
+        for process_id in process_ids {
+            terminate_process(process_id)?;
+        }
+    } else {
+        run_schtasks(&["/End", "/TN", TASK_NAME])?;
+    }
+    wait_for_agent_state(&agent, !options.user_mode, false)
 }
 
-fn restart_agent() -> Result<()> {
-    stop_agent()?;
-    start_agent()
+fn restart_agent(options: &RuntimeOptions) -> Result<()> {
+    stop_agent(options)?;
+    start_agent(options)
 }
 
 fn run_schtasks(arguments: &[&str]) -> Result<()> {
@@ -151,9 +255,15 @@ fn run_schtasks(arguments: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_agent_state(expected_running: bool) -> Result<()> {
+fn wait_for_agent_state(
+    agent: &Path,
+    include_inaccessible: bool,
+    expected_running: bool,
+) -> Result<()> {
     for _ in 0..50 {
-        if agent_running().context("failed to inspect probe-rs process state")? == expected_running
+        if agent_running(agent, include_inaccessible)
+            .context("failed to inspect probe-rs process state")?
+            == expected_running
         {
             return Ok(());
         }
@@ -165,23 +275,27 @@ fn wait_for_agent_state(expected_running: bool) -> Result<()> {
     bail!("probe-rs task was stopped, but its process is still running");
 }
 
-fn edit_config() -> Result<()> {
-    use std::io::Write;
+fn terminate_process(process_id: u32) -> Result<()> {
+    let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, process_id) };
+    if process.is_null() {
+        return Err(last_error(&format!("打开 probe-rs PID {process_id} 失败")));
+    }
+    let terminated = unsafe { TerminateProcess(process, 0) };
+    let error = (terminated == 0).then(std::io::Error::last_os_error);
+    unsafe { CloseHandle(process) };
+    if let Some(error) = error {
+        bail!("停止 probe-rs PID {process_id} 失败: {error}");
+    }
+    Ok(())
+}
 
-    let config_path = config_path();
+fn edit_config(config_path: &Path) -> Result<()> {
     let original = std::fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let config_dir = config_path
         .parent()
         .context("configuration path has no parent directory")?;
-    let mut staged = tempfile::Builder::new()
-        .prefix(".probe-rs-edit-")
-        .suffix(".toml")
-        .tempfile_in(config_dir)
-        .with_context(|| format!("failed to create edit copy in {}", config_dir.display()))?;
-    staged.write_all(original.as_bytes())?;
-    staged.as_file_mut().sync_all()?;
-    let edit_path = staged.path().to_path_buf();
+    let (_edit_dir, edit_path) = create_edit_copy(config_dir, &original)?;
 
     let _editor = Command::new("notepad.exe")
         .arg(&edit_path)
@@ -203,6 +317,30 @@ fn edit_config() -> Result<()> {
     loop {
         let edited = std::fs::read_to_string(&edit_path)
             .with_context(|| format!("failed to read edit copy {}", edit_path.display()))?;
+        if edited == original {
+            let txt_copy = edit_path.with_extension("toml.txt");
+            let detail = if txt_copy.is_file() {
+                format!(
+                    "检测到记事本把内容另存为了：\n{}\n\n请回到记事本，使用“另存为”覆盖原文件 probe-rs-edit.toml，并将文件类型选为“所有文件”，然后重试。",
+                    txt_copy.display()
+                )
+            } else {
+                "未检测到配置内容变化。请确认已在记事本中保存 probe-rs-edit.toml，然后重试。"
+                    .to_string()
+            };
+            let retry = unsafe {
+                show_message(
+                    null_mut(),
+                    "probe-rs 配置尚未保存",
+                    &detail,
+                    MB_RETRYCANCEL | MB_ICONWARNING,
+                )
+            };
+            if retry != IDRETRY {
+                return Ok(());
+            }
+            continue;
+        }
         match crate::config::persist_edited_text(&config_path, &original, &edited) {
             Ok(backup_path) => {
                 unsafe {
@@ -237,19 +375,52 @@ fn edit_config() -> Result<()> {
     }
 }
 
-fn config_path() -> PathBuf {
-    std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-        .join("probe-rs")
-        .join("config.toml")
+fn create_edit_copy(config_dir: &Path, original: &str) -> Result<(tempfile::TempDir, PathBuf)> {
+    use std::io::Write;
+
+    // Keep each editor session isolated while giving Notepad a normal, stable
+    // filename. A leading-dot random filename can make Notepad's Save As flow
+    // append `.txt`, leaving the file read below unchanged.
+    let edit_dir = tempfile::Builder::new()
+        .prefix(".probe-rs-edit-")
+        .tempdir_in(config_dir)
+        .with_context(|| {
+            format!(
+                "failed to create edit directory in {}",
+                config_dir.display()
+            )
+        })?;
+    let edit_path = edit_dir.path().join("probe-rs-edit.toml");
+    let mut staged = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&edit_path)
+        .with_context(|| format!("failed to create edit copy {}", edit_path.display()))?;
+    staged.write_all(original.as_bytes())?;
+    staged.sync_all()?;
+    drop(staged);
+    Ok((edit_dir, edit_path))
 }
 
-fn agent_running() -> std::io::Result<bool> {
-    Ok(!agent_process_ids()?.is_empty())
+fn runtime_options() -> &'static RuntimeOptions {
+    RUNTIME_OPTIONS
+        .get()
+        .expect("tray runtime options initialized")
 }
 
-fn agent_process_ids() -> std::io::Result<Vec<u32>> {
+fn installed_agent_path() -> Result<PathBuf> {
+    let executable = std::env::current_exe().context("failed to locate tray executable")?;
+    let directory = executable
+        .parent()
+        .context("tray executable has no parent directory")?;
+    Ok(directory.join("probe-rs.exe"))
+}
+
+fn agent_running(agent: &Path, include_inaccessible: bool) -> std::io::Result<bool> {
+    Ok(!agent_process_ids(agent, include_inaccessible)?.is_empty())
+}
+
+fn agent_process_ids(agent: &Path, include_inaccessible: bool) -> std::io::Result<Vec<u32>> {
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error());
@@ -270,6 +441,7 @@ fn agent_process_ids() -> std::io::Result<Vec<u32>> {
         if entry.th32ProcessID != std::process::id()
             && String::from_utf16_lossy(&entry.szExeFile[..name_len])
                 .eq_ignore_ascii_case("probe-rs.exe")
+            && process_image_matches(entry.th32ProcessID, agent, include_inaccessible)
         {
             process_ids.push(entry.th32ProcessID);
         }
@@ -278,6 +450,30 @@ fn agent_process_ids() -> std::io::Result<Vec<u32>> {
     unsafe { CloseHandle(snapshot) };
     process_ids.sort_unstable();
     Ok(process_ids)
+}
+
+fn process_image_matches(process_id: u32, expected: &Path, include_inaccessible: bool) -> bool {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        return include_inaccessible;
+    }
+    let mut buffer = [0_u16; 1024];
+    let mut size = buffer.len() as u32;
+    let queried = unsafe {
+        QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut size)
+    };
+    unsafe { CloseHandle(process) };
+    if queried == 0 {
+        return include_inaccessible;
+    }
+    let actual = String::from_utf16_lossy(&buffer[..size as usize]);
+    image_path_matches(Some(&actual), expected, include_inaccessible)
+}
+
+fn image_path_matches(actual: Option<&str>, expected: &Path, include_inaccessible: bool) -> bool {
+    actual.map_or(include_inaccessible, |actual| {
+        actual.eq_ignore_ascii_case(&expected.to_string_lossy())
+    })
 }
 
 fn format_agent_status(process_ids: &[u32]) -> String {
@@ -297,6 +493,11 @@ fn format_agent_status(process_ids: &[u32]) -> String {
 }
 
 pub fn run() -> Result<()> {
+    let options = parse_runtime_options(std::env::args_os().skip(1))?;
+    RUNTIME_OPTIONS
+        .set(options.clone())
+        .map_err(|_| anyhow!("tray runtime options already initialized"))?;
+
     // A console-subsystem executable is retained for useful foreground agent
     // diagnostics. Hide that console immediately when running only the tray.
     unsafe {
@@ -306,7 +507,11 @@ pub fn run() -> Result<()> {
         }
     }
 
-    let mutex_name = wide("Local\\probe-rs-tray");
+    let mutex_name = wide(if options.user_mode {
+        "Local\\probe-rs-tray-user"
+    } else {
+        "Local\\probe-rs-tray-machine"
+    });
     let mutex = unsafe { CreateMutexW(null(), 0, mutex_name.as_ptr()) };
     if mutex.is_null() {
         return Err(last_error("创建托盘单实例锁失败"));
@@ -431,7 +636,11 @@ unsafe fn add_tray_icon(window: HWND) -> Result<()> {
     };
     copy_wide(
         &mut data.szTip,
-        &format!("probe-rs {}", env!("CARGO_PKG_VERSION")),
+        &format!(
+            "probe-rs {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            runtime_options().scope_name()
+        ),
     );
     if Shell_NotifyIconW(NIM_ADD, &data) == 0 {
         return Err(last_error("添加托盘图标失败"));
@@ -455,7 +664,13 @@ unsafe fn show_context_menu(window: HWND) {
         return;
     }
 
-    let (status_text, start_enabled, stop_enabled, restart_enabled) = match agent_process_ids() {
+    let options = runtime_options();
+    let agent = installed_agent_path();
+    let process_ids = agent.and_then(|agent| {
+        agent_process_ids(&agent, !options.user_mode)
+            .context("failed to inspect probe-rs process state")
+    });
+    let (status_text, start_enabled, stop_enabled, restart_enabled) = match process_ids {
         Ok(process_ids) => {
             let running = !process_ids.is_empty();
             (
@@ -467,11 +682,20 @@ unsafe fn show_context_menu(window: HWND) {
         }
         Err(_) => ("状态：未知".to_owned(), false, false, false),
     };
-    let title = wide(&format!("probe-rs {}", env!("CARGO_PKG_VERSION")));
+    let title = wide(&format!(
+        "probe-rs {} · {}",
+        env!("CARGO_PKG_VERSION"),
+        options.scope_name()
+    ));
     let status = wide(&status_text);
-    let start = wide("启动探针（需要管理员权限）");
-    let stop = wide("停止探针（需要管理员权限）");
-    let restart = wide("重启探针（需要管理员权限）");
+    let privilege_note = if options.user_mode {
+        ""
+    } else {
+        "（需要管理员权限）"
+    };
+    let start = wide(&format!("启动探针{privilege_note}"));
+    let stop = wide(&format!("停止探针{privilege_note}"));
+    let restart = wide(&format!("重启探针{privilege_note}"));
     let open_config = wide("安全编辑配置（保存前校验）");
     let about = wide("关于 probe-rs");
     let exit = wide("退出托盘（探针继续运行）");
@@ -535,7 +759,13 @@ fn enabled_menu_flags(enabled: bool) -> u32 {
 }
 
 unsafe fn launch_control(window: HWND, action: ControlAction) {
-    if let Err(error) = launch_elevated_control(window, action) {
+    let options = runtime_options();
+    let result = if options.user_mode {
+        launch_user_control(action, options)
+    } else {
+        launch_elevated_control(window, action, options)
+    };
+    if let Err(error) = result {
         show_message(
             window,
             "probe-rs 操作未启动",
@@ -545,17 +775,47 @@ unsafe fn launch_control(window: HWND, action: ControlAction) {
     }
 }
 
-unsafe fn launch_elevated_control(window: HWND, action: ControlAction) -> Result<()> {
-    let executable = std::env::current_exe().context("failed to locate tray executable")?;
-    let executable = wide_os(executable.as_os_str());
-    let verb = wide("runas");
-    let action = match action {
+fn action_name(action: ControlAction) -> &'static str {
+    match action {
         ControlAction::Start => "start",
         ControlAction::Stop => "stop",
         ControlAction::Restart => "restart",
         ControlAction::EditConfig => "edit-config",
-    };
-    let parameters = wide(&format!("--tray-control {action}"));
+    }
+}
+
+fn launch_user_control(action: ControlAction, options: &RuntimeOptions) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    let executable = std::env::current_exe().context("failed to locate tray executable")?;
+    Command::new(&executable)
+        .arg("--tray-control")
+        .arg(action_name(action))
+        .arg("--user-mode")
+        .arg("--config")
+        .arg(&options.config_path)
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+        .spawn()
+        .with_context(|| format!("failed to launch {}", executable.display()))?;
+    Ok(())
+}
+
+unsafe fn launch_elevated_control(
+    window: HWND,
+    action: ControlAction,
+    options: &RuntimeOptions,
+) -> Result<()> {
+    let executable_path = std::env::current_exe().context("failed to locate tray executable")?;
+    let executable = wide_os(executable_path.as_os_str());
+    let verb = wide("runas");
+    let config = options.config_path.to_string_lossy();
+    if config.contains('"') {
+        bail!("configuration path contains a quote");
+    }
+    let parameters = wide(&format!(
+        "--tray-control {} --config \"{config}\"",
+        action_name(action)
+    ));
     let launched = ShellExecuteW(
         window,
         verb.as_ptr(),
@@ -574,15 +834,22 @@ unsafe fn launch_elevated_control(window: HWND, action: ControlAction) -> Result
 }
 
 unsafe fn show_about(window: HWND) {
+    let options = runtime_options();
+    let runtime = if options.user_mode {
+        "当前用户登录启动项；控制与编辑无需管理员权限。\n用户注销后探针停止运行。"
+    } else {
+        "SYSTEM 计划任务；控制与编辑时请求管理员权限。\n未登录用户时仍可持续运行。"
+    };
     show_message(
         window,
         "probe-rs",
         &format!(
-            "probe-rs 托盘伴随程序 {}\n构建目标：windows/{}\n计划任务：{}\n配置文件：{}\n\n后台探针由 SYSTEM 计划任务托管。\n控制操作仅在执行时请求管理员权限。\n退出托盘不会停止探针。",
+            "probe-rs 托盘伴随程序 {}\n构建目标：windows/{}\n安装范围：{}\n配置文件：{}\n\n{}\n退出托盘不会停止探针。",
             env!("CARGO_PKG_VERSION"),
             std::env::consts::ARCH,
-            TASK_NAME,
-            config_path().display()
+            options.scope_name(),
+            options.config_path.display(),
+            runtime
         ),
         MB_OK,
     );
@@ -631,6 +898,36 @@ mod tests {
     }
 
     #[test]
+    fn machine_scope_accepts_inaccessible_processes_but_user_scope_does_not() {
+        let expected = Path::new(r"C:\Program Files\probe-rs\probe-rs.exe");
+        assert!(image_path_matches(None, expected, true));
+        assert!(!image_path_matches(None, expected, false));
+        assert!(image_path_matches(
+            Some(r"c:\program files\PROBE-RS\probe-rs.exe"),
+            expected,
+            false
+        ));
+        assert!(!image_path_matches(
+            Some(r"C:\Users\demo\probe-rs.exe"),
+            expected,
+            true
+        ));
+    }
+
+    #[test]
+    fn edit_copy_has_a_notepad_friendly_name_and_original_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let (edit_dir, edit_path) = create_edit_copy(root.path(), "schema = 1\n").unwrap();
+
+        assert_eq!(
+            edit_path.file_name().and_then(OsStr::to_str),
+            Some("probe-rs-edit.toml")
+        );
+        assert!(edit_path.starts_with(edit_dir.path()));
+        assert_eq!(std::fs::read_to_string(edit_path).unwrap(), "schema = 1\n");
+    }
+
+    #[test]
     fn parses_supported_tray_control_actions() {
         for (name, expected) in [
             ("start", ControlAction::Start),
@@ -639,11 +936,34 @@ mod tests {
             ("edit-config", ControlAction::EditConfig),
             ("open-config", ControlAction::EditConfig),
         ] {
-            assert_eq!(
-                parse_control_request(args(&["--tray-control", name])).unwrap(),
-                Some(expected)
-            );
+            let request =
+                parse_control_request(args(&["--tray-control", name, "--config", "machine.toml"]))
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(request.action, expected);
+            assert_eq!(request.options.config_path, PathBuf::from("machine.toml"));
+            assert!(!request.options.user_mode);
         }
+    }
+
+    #[test]
+    fn parses_user_mode_tray_and_control_options() {
+        let options =
+            parse_runtime_options(args(&["--tray", "--user-mode", "--config=user.toml"])).unwrap();
+        assert!(options.user_mode);
+        assert_eq!(options.config_path, PathBuf::from("user.toml"));
+
+        let request = parse_control_request(args(&[
+            "--tray-control",
+            "restart",
+            "--user-mode",
+            "--config",
+            "user.toml",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(request.action, ControlAction::Restart);
+        assert_eq!(request.options, options);
     }
 
     #[test]

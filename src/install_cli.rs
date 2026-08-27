@@ -547,6 +547,41 @@ mod tests {
     }
 
     #[test]
+    fn windows_installer_does_not_treat_the_local_demo_as_a_placeholder() {
+        let script = include_str!("../deploy/install.ps1");
+        assert!(!script.contains(r#"worker_url\s*=\s*"http://127\.0\.0\.1:8080/report""#));
+    }
+
+    #[test]
+    fn windows_installer_supports_non_admin_user_scope() {
+        let script = include_str!("../deploy/install.ps1");
+        for expected in [
+            "[ValidateSet(\"Machine\", \"User\")]",
+            "[string]$Scope = \"User\"",
+            "GetFolderPath(\"LocalApplicationData\")",
+            "GetFolderPath(\"Startup\")",
+            "--user-mode",
+            "Install-AgentStartup",
+            "Start-UserAgent",
+        ] {
+            assert!(script.contains(expected), "missing {expected}");
+        }
+        assert!(!script.contains("#Requires -RunAsAdministrator"));
+    }
+
+    #[test]
+    fn windows_cf_installer_keeps_its_machine_scope_explicit() {
+        let script = include_str!("../deploy/cf-install.ps1");
+        for expected in [
+            "& $Installer uninstall -Scope Machine -Purge:$Purge",
+            "& $Installer install -Scope Machine -BinaryPath $resolvedBinary",
+            "& $Installer start -Scope Machine",
+        ] {
+            assert!(script.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[test]
     fn seeded_reporters_are_removed_before_cf_is_added() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
