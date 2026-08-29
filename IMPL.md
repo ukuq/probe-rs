@@ -81,13 +81,13 @@ probe-rs/
 
 ### 3.4 netstatic
 
-- 存储：每网卡 `VecDeque<Entry>` 明细 + `archived_totals` 永久归档基数，Entry = `{ts_ms, rx, tx}`。
+- 存储：每网卡 `VecDeque<Entry>` 明细 + `archived_totals` 永久归档基数 + `last_seen`，Entry = `{ts_ms, rx, tx}`。
 - 采样 task 每 2s：读 /proc/net/dev → 与上一帧 per-iface 计数器算 delta → `current < prev` 记 0（纪律 2）→ append 内存 + 标记 dirty。
 - 保留：**32 天**明细 + 永久归档基数（严格大于最长 31 天账期，账期首日明细不会被归档；reset_day 28-31 的月流量不因修剪少计）
-- 落盘：每 10min 全量重写 `net_static.json`（tmp + rename 原子写，spawn_blocking）；启动时加载。
+- 落盘：每 10min 全量重写 `net_static.json`（tmp + rename 原子写，spawn_blocking）；启动时加载，文件存在但不可读/不可解析时明确失败并保留原文件。
 - schema 0 升级时保留旧 `net_static_path` 的精确文件名：若不同于新 `data_dir/net_static.json`，先复制账本并保留原文件；新旧目标同时存在时拒绝覆盖并明确报错。
 - 查询：`sum(period_start..=now)` 按白名单网卡过滤求和；`period_start=0` 额外加归档基数，实现真正永久累计。
-- 内存优化（可选二期）：小时粒度合并，见设计书 §5.4。
+- 内存优化：24h 内保留 2s 明细，更老数据按小时桶合并；默认排除且消失超过 32 天的虚拟接口整项回收，实体接口保留永久累计。见设计书 §5.4。
 
 ### 3.5 账期计算（config.rs 或 netstatic）
 
@@ -118,8 +118,8 @@ probe-rs/
 
 ### 3.9 优雅退出
 
-- `tokio::signal::ctrl_c()` + SIGTERM（`signal::unix`）→ 通知 netstatic flush → 退出。
-- 崩溃兜底靠 10min 定期落盘，退出 flush 只是减少丢失窗口。
+- `tokio::signal::ctrl_c()` + SIGTERM（`signal::unix`）→ 停止采集 → 各 Reporter 发送最后一批；Probe 等待响应，CF 在收尾阶段直接走同步 HTTP 回退并等待响应，Komari 等待 WS worker 推进 journal ACK（每路最多 20s）→ 等待 netstatic sampler 收尾并 flush → 退出。
+- 崩溃兜底靠 10min 定期落盘；退出 flush 只是减少账本丢失窗口，网络失败仍会记录为未确认而不会无限阻塞退出。
 
 ### 3.10 自动更新
 

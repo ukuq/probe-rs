@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, TimeZone};
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +78,11 @@ struct StoreFile {
     /// saturating_sub 得 0，不会虚增）。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     last_counters: BTreeMap<String, NetBytes>,
+    /// Last observation time for each interface. This bounds persistent state
+    /// from short-lived virtual interfaces without changing physical-interface
+    /// accounting or eagerly deleting ledgers written by older versions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    last_seen: BTreeMap<String, i64>,
     #[serde(default)]
     corrections: BTreeMap<String, Correction>,
     /// Compatibility with the pre-multi-reporter on-disk format.
@@ -213,14 +219,22 @@ pub struct TrafficSnapshot {
 impl NetStatic {
     #[cfg(test)]
     pub fn load(path: &Path) -> Self {
-        Self::load_with_legacy_reporter(path, None)
+        Self::load_with_legacy_reporter(path, None).expect("load test traffic ledger")
     }
 
-    pub fn load_with_legacy_reporter(path: &Path, legacy_reporter_id: Option<&str>) -> Self {
-        let store: StoreFile = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
+    pub fn load_with_legacy_reporter(
+        path: &Path,
+        legacy_reporter_id: Option<&str>,
+    ) -> Result<Self> {
+        let store: StoreFile = match std::fs::read_to_string(path) {
+            Ok(raw) => serde_json::from_str(&raw)
+                .with_context(|| format!("parse traffic ledger {}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => StoreFile::default(),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read traffic ledger {}", path.display()));
+            }
+        };
         let mut store = store;
         let mut migrated = if let Some(reporter_id) = legacy_reporter_id {
             if let Some(legacy) = store.correction.take() {
@@ -242,7 +256,7 @@ impl NetStatic {
         for entries in store.interfaces.values_mut() {
             migrated |= sort_entries(entries);
         }
-        Self {
+        Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 store,
                 last_save: Instant::now(),
@@ -251,7 +265,7 @@ impl NetStatic {
             })),
             path: Arc::new(path.to_path_buf()),
             flush_lock: Arc::new(Mutex::new(())),
-        }
+        })
     }
 
     /// 读一次 /proc/net/dev，按网卡算 delta 并追加（由 sampler 每 2s 调用）
@@ -289,6 +303,9 @@ impl NetStatic {
             mark_dirty(&mut inner);
         }
         for (name, counters) in current {
+            if inner.store.last_seen.insert(name.clone(), now) != Some(now) {
+                mark_dirty(&mut inner);
+            }
             let (rx_delta, tx_delta) =
                 match inner.store.last_counters.insert(name.clone(), counters) {
                     Some(prev) if prev != counters => {
@@ -341,7 +358,26 @@ impl NetStatic {
                 coarsened |= coarsen_entries(entries, fine_cutoff);
             }
         }
-        if archived || coarsened {
+        // Default-excluded virtual adapters are often ephemeral (containers,
+        // VPNs and bridges). Once absent for a full retention window, their
+        // per-interface history no longer contributes to normal reports and
+        // must not grow the on-disk maps forever. Interfaces without a
+        // last_seen value came from an older schema and are kept until they
+        // have first been observed by this version.
+        let stale_virtual: Vec<_> = inner
+            .store
+            .last_seen
+            .iter()
+            .filter(|(name, seen)| **seen < cutoff && net::is_default_excluded(name))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for interface in &stale_virtual {
+            inner.store.interfaces.remove(interface);
+            inner.store.archived_totals.remove(interface);
+            inner.store.last_counters.remove(interface);
+            inner.store.last_seen.remove(interface);
+        }
+        if archived || coarsened || !stale_virtual.is_empty() {
             mark_dirty(&mut inner);
         }
     }
@@ -939,6 +975,59 @@ mod tests {
     }
 
     #[test]
+    fn malformed_existing_ledger_is_reported_and_preserved() {
+        let (_, path) = tmp_ns("malformed");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let malformed = b"{ definitely-not-json";
+        std::fs::write(&path, malformed).unwrap();
+
+        let result = NetStatic::load_with_legacy_reporter(&path, None);
+        assert!(
+            result.is_err(),
+            "a corrupt ledger must not look like an empty one"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), malformed);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn stale_default_excluded_interfaces_are_reaped_after_retention() {
+        let (ns, path) = tmp_ns("stale-virtual");
+        let start = 1_700_000_000_000_i64;
+        let all = IfaceFilter::all();
+        ns.sample_with(
+            &all,
+            [("veth-dead", 100, 200), ("eth0", 100, 200)],
+            start,
+            false,
+        );
+        ns.sample_with(
+            &all,
+            [("veth-dead", 110, 220), ("eth0", 110, 220)],
+            start + 1_000,
+            false,
+        );
+
+        ns.sample_with(
+            &all,
+            std::iter::empty::<(&str, u64, u64)>(),
+            start + 1_001 + RETAIN.num_milliseconds(),
+            false,
+        );
+
+        let inner = ns.inner.lock().unwrap();
+        assert!(!inner.store.interfaces.contains_key("veth-dead"));
+        assert!(!inner.store.archived_totals.contains_key("veth-dead"));
+        assert!(!inner.store.last_counters.contains_key("veth-dead"));
+        assert!(!inner.store.last_seen.contains_key("veth-dead"));
+        assert!(inner.store.archived_totals.contains_key("eth0"));
+        assert!(inner.store.last_counters.contains_key("eth0"));
+        assert!(inner.store.last_seen.contains_key("eth0"));
+        drop(inner);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
     fn persisted_counters_capture_downtime_traffic_after_restart() {
         let (_, path) = tmp_ns("downtime");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1039,7 +1128,7 @@ mod tests {
             let inner = ns.inner.lock().unwrap();
             assert_eq!(inner.store.interfaces["eth0"].len(), 1);
             assert!(
-                inner.store.archived_totals.get("eth0").is_none(),
+                !inner.store.archived_totals.contains_key("eth0"),
                 "31 天账期的首日明细不得在 32 天保留期内被归档"
             );
         }
@@ -1266,7 +1355,7 @@ mod tests {
         };
         std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
 
-        let ns = NetStatic::load_with_legacy_reporter(&path, Some("cf"));
+        let ns = NetStatic::load_with_legacy_reporter(&path, Some("cf")).unwrap();
         assert_eq!(ns.confirm_pending("cf"), Some((3.0, 4.0)));
         assert_eq!(ns.confirm_pending("primary"), None);
         let inner = ns.inner.lock().unwrap();

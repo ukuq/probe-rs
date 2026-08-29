@@ -826,31 +826,6 @@ impl SharedConfig {
         self.config_tx.subscribe()
     }
 
-    /// 本地文件热加载:整体替换(文件是唯一事实源,远端应用也会回写文件)。
-    /// 仅在 intervals 变化时通知 scheduler 重建 ticker
-    pub fn update_local(&self, cfg: LocalConfig) {
-        let mut guard = self.inner.write().expect("config lock poisoned");
-        let effective = cfg.effective_intervals();
-        *guard = cfg.clone();
-        drop(guard);
-        self.intervals_tx.send_if_modified(|cur| {
-            if *cur != effective {
-                *cur = effective;
-                true
-            } else {
-                false
-            }
-        });
-        self.config_tx.send_if_modified(|cur| {
-            if *cur != cfg {
-                *cur = cfg.clone();
-                true
-            } else {
-                false
-            }
-        });
-    }
-
     /// 原子热加载:持有写锁时读取、校验并提交同一份文件快照。
     ///
     /// 远端应用和 Komari 学习也在该锁内落盘,因此不会在本次读取与提交之间

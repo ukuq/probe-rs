@@ -96,6 +96,7 @@ impl Default for LegacyCfExt {
 }
 
 /// 把旧版配置文本转换为新结构;返回配置与逐条迁移警告。
+#[cfg(test)]
 pub fn migrate(raw: &str) -> Result<(LocalConfig, Vec<String>)> {
     let (config, warnings, _) = migrate_for_load(raw)?;
     Ok((config, warnings))

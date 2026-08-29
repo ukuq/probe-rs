@@ -96,19 +96,26 @@ async fn main() -> Result<()> {
         .iter()
         .find(|spec| spec.protocol == ReporterProtocol::Cf)
         .map(|spec| spec.id.as_str());
-    let net = netstatic::NetStatic::load_with_legacy_reporter(&net_static_path, legacy_cf_reporter);
+    let net = netstatic::NetStatic::load_with_legacy_reporter(&net_static_path, legacy_cf_reporter)
+        .with_context(|| {
+            format!(
+                "failed to load traffic ledger {}",
+                net_static_path.display()
+            )
+        })?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (update_check_tx, update_check_rx) = watch::channel(0_u64);
     // NTP 刷新与其他后台任务同样纳入监督：panic 不能静默停摆校准时钟。
     let ntp_refresh_handle = agent_clock.spawn_ntp_refresh(shutdown_rx.clone());
     watch_task("ntp-refresh", ntp_refresh_handle);
 
-    updater::spawn(
+    let updater_handle = updater::spawn(
         shared.subscribe_config(),
         update_check_rx,
         shutdown_tx.clone(),
         shutdown_rx.clone(),
     );
+    watch_task("updater", updater_handle);
 
     // The persistent traffic ledger captures all interfaces. Reporter-specific
     // filters and corrections are applied only when a payload is built.
@@ -191,7 +198,7 @@ async fn main() -> Result<()> {
         let intervals_rx2 = intervals_rx.clone();
         let initial_connections = connection_signature(&local);
         let mut config_rx = config_rx;
-        tokio::spawn(async move {
+        let config_reload_handle = tokio::spawn(async move {
             let mtime =
                 |path: &std::path::Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
             let mut last_mtime = mtime(&watch_path);
@@ -261,6 +268,7 @@ async fn main() -> Result<()> {
                 }
             }
         });
+        watch_task("config-reload", config_reload_handle);
     }
 
     let collector = scheduler::Scheduler::new(
@@ -346,10 +354,11 @@ async fn main() -> Result<()> {
         reporter_handles.push((spec.id.clone(), tokio::spawn(runner.run())));
     }
 
-    tokio::spawn(async move {
+    let signal_handle = tokio::spawn(async move {
         wait_for_signal().await;
         shutdown_tx.send_replace(true);
     });
+    watch_task("signal", signal_handle);
 
     collector_handle
         .await

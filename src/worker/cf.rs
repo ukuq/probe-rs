@@ -30,6 +30,7 @@ const ACK_SILENCE_TIMEOUT: Duration = Duration::from_secs(15);
 const RETRY_MIN: Duration = Duration::from_secs(60);
 const RETRY_MAX: Duration = Duration::from_secs(300);
 pub const POLICY_BACKOFF: Duration = Duration::from_secs(120);
+#[cfg(test)]
 pub const DEFAULT_REPORT_INTERVAL: Duration = Duration::from_secs(2);
 const MIN_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_REPORT_INTERVAL: Duration = Duration::from_secs(300);

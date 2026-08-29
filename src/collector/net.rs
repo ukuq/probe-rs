@@ -48,12 +48,12 @@ const WINDOWS_EXCLUDED_PREFIXES: &[&str] = &[
 ];
 
 #[cfg(not(target_os = "windows"))]
-fn is_default_excluded(name: &str) -> bool {
+pub(crate) fn is_default_excluded(name: &str) -> bool {
     EXCLUDED_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 #[cfg(target_os = "windows")]
-fn is_default_excluded(name: &str) -> bool {
+pub(crate) fn is_default_excluded(name: &str) -> bool {
     let name = name.to_lowercase();
     name == "lo"
         || WINDOWS_EXCLUDED_PREFIXES

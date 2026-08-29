@@ -216,10 +216,10 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
         .reporters
         .iter()
         .position(|reporter| reporter.id == selected_id);
-    if index.is_none() {
-        if options.server_id.is_none() || options.secret.is_none() || options.worker_url.is_none() {
-            bail!("new CF Reporter '{selected_id}' requires --server-id, --secret and --url");
-        }
+    if index.is_none()
+        && (options.server_id.is_none() || options.secret.is_none() || options.worker_url.is_none())
+    {
+        bail!("new CF Reporter '{selected_id}' requires --server-id, --secret and --url");
     }
     if index.is_none() {
         config.reporters.push(new_cf_reporter(selected_id.clone()));
@@ -465,7 +465,8 @@ fn set_traffic_correction_with_clock(
         bail!("Reporter '{}' is not a CF Reporter", options.reporter_id);
     }
     let ledger_path = config.net_static_path();
-    let ledger = NetStatic::load_with_legacy_reporter(&ledger_path, Some(&options.reporter_id));
+    let ledger = NetStatic::load_with_legacy_reporter(&ledger_path, Some(&options.reporter_id))
+        .with_context(|| format!("failed to load traffic ledger {}", ledger_path.display()))?;
     let filter = IfaceFilter::new(&reporter.interfaces);
     let now = calibrated_now
         .or_else(|| ledger.calibrated_time())

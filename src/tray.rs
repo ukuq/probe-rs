@@ -290,7 +290,7 @@ fn terminate_process(process_id: u32) -> Result<()> {
 }
 
 fn edit_config(config_path: &Path) -> Result<()> {
-    let original = std::fs::read_to_string(&config_path)
+    let original = std::fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let config_dir = config_path
         .parent()
@@ -341,7 +341,7 @@ fn edit_config(config_path: &Path) -> Result<()> {
             }
             continue;
         }
-        match crate::config::persist_edited_text(&config_path, &original, &edited) {
+        match crate::config::persist_edited_text(config_path, &original, &edited) {
             Ok(backup_path) => {
                 unsafe {
                     show_message(

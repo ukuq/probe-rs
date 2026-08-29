@@ -94,7 +94,7 @@ agent → 服务端的唯一数据通道。每个 report tick 发送一次。
   "async": [
     { "kind": "ping", "ts": 1754300058000, "name": "ct", "rtt": 32, "loss": 0 },
     { "kind": "slow", "ts": 1754300055000, "disk_used": 53687091200, "disks": [ { "id": "/dev/sda1", "name": "sda1", "mount_point": "/", "file_system": "ext4", "total": 107374182400, "used": 53687091200 } ], "tcp_conn": 120, "udp_conn": 8, "processes": 230 },
-    { "kind": "gpu",  "ts": 1754300050000, "name": "NVIDIA A100 80GB", "usage": 42.5 },
+    { "kind": "gpu",  "ts": 1754300050000, "id": "0", "name": "NVIDIA A100 80GB", "usage": 42.5 },
     { "kind": "diskio", "ts": 1754300056000, "read_bps": 1048576, "write_bps": 524288, "read_iops": 40, "write_iops": 18, "await_ms": 1.8, "usage": 3.2, "disks": [ { "name": "sda", "read_bps": 1048576, "write_bps": 524288, "read_iops": 40, "write_iops": 18, "await_ms": 1.8, "usage": 3.2 } ] }
   ],
 
@@ -199,8 +199,8 @@ kind 按数据语义划分（DESIGN.md §2.3"机制同类、语义分流"）：s
 |---|---|---|
 | `ping` | `name`, `rtt`, `loss` | 探测结果：name = `[[pings]]` 组 key；rtt 毫秒，**-1 = 失败**；loss 0-100 |
 | `slow` | `disk_used`, `disks`, `tcp_conn`, `udp_conn`, `processes` | 慢变指标；disks 为逐卷容量，disk_used 为当前 Reporter 选中卷合计 |
-| `gpu` | `name`, `usage`, `mem_total`, `mem_used`, `temp` | GPU 型号、利用率（0-100）、显存（字节）、温度（℃）；多卡时每卡一条；mem/temp 仅 nvidia 路径有，macOS 为 null |
-| `self` | `cpu_usage`, `mem_rss` | 探针自身 CPU（单核 %）与常驻内存（字节）；始终随 slow worker 采集，`report_self=true` 的 Reporter 才输出 |
+| `gpu` | `id`, `name`, `usage`, `mem_total`, `mem_used`, `temp` | GPU 稳定设备标识、型号、利用率（0-100）、显存（字节）、温度（℃）；多卡时每卡一条；mem/temp 仅 nvidia 路径有，macOS 为 null |
+| `self` | `cpu_usage`, `mem_rss` | 探针自身 CPU 占整机逻辑核总容量的百分比（0-100）与常驻内存（字节）；始终随 slow worker 采集，`report_self=true` 的 Reporter 才输出 |
 | `diskio` | `read_bps`, `write_bps`, `read_iops`, `write_iops`, `await_ms`, `usage`, `disks` | `disks` 为逐物理盘 IO；上层字段为当前 Reporter 选中盘的聚合，usage 取最大；首轮差值无前值为 null |
 
 Ping 聚合规则：机器内部按“类型 + 规范化目标”去重，TCP 使用小写 host + 有效端口，ICMP 使用小写 host，HTTP 使用 scheme + 小写 host + 有效端口（HTTP 与 HTTPS 不合并）。HTTP target 仅允许 `http(s)://host[:port]`（根 `/` 等价可接受），所有类型均禁止 path/query/fragment。重复任务的实际周期取所有 Reporter 需求的最小值；每轮 DNS 只在计时前解析一次，4 次采样与重试复用解析结果，因此 RTT 不含 DNS。结果与错误在出口映射回各 Reporter 自己的 `name`，不会串到未声明该任务的线路；`global.pings` 是无 name/type 的实际 worker 配置，规范化 URI target 自带探测类型。
@@ -218,10 +218,10 @@ Ping 聚合规则：机器内部按“类型 + 规范化目标”去重，TCP �
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `ts` | number | 发生时刻，毫秒时间戳 |
-| `source` | string | 来源：`gpu` / `ip` / `reporter` / `ping:<组名>` |
+| `source` | string | 来源：`gpu` / `ip` / `diskio` / `buffer` / `reporter` / `ping:<组名>` 等 |
 | `msg` | string | 错误信息 |
 
-约定：**同源同文去重**（同一来源上一条信息相同则跳过，防止周期性失败刷屏）；errors 与 dynamic/async 共用同一 512 条有界日志；上报失败后与数据一起保留重发。
+约定：**同源同文去重**（同一来源最近 8 条信息内出现过的相同消息跳过，防止交替故障刷屏）；errors 与 dynamic/async 共用同一 512 条有界日志；上报失败后与数据一起保留重发。
 
 ## 响应（服务端 → agent）
 

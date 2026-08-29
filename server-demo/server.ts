@@ -175,7 +175,7 @@ interface DynamicRecord {
 /** 异步记录：kind 区分来源，每条 ts 为各自真实测量时刻 */
 interface SelfRecord {
   ts: number;
-  cpu_usage: number | null; // 自身 CPU（单核 %）
+  cpu_usage: number | null; // 自身 CPU 占整机逻辑核总容量的百分比（0-100）
   mem_rss: number | null; // 自身常驻内存，字节
 }
 
@@ -2461,7 +2461,7 @@ var EXAMPLE_JSON5 = \`{
       "disks": [{ "id": "/dev/sda1", "name": "sda1", "mount_point": "/", "file_system": "ext4", "total": 107374182400, "used": 53687091200 }],
       "tcp_conn": 120, "udp_conn": 8, "processes": 230 },
     // 系统慢指标（每台机器必有）；disk_used 与 disk_total 同口径；TCP 全状态计数
-    { "kind": "gpu", "ts": 1754300050000, "name": "NVIDIA A100 80GB", "usage": 42.5, "mem_total": 85899345920, "mem_used": 10737418240, "temp": 55 },
+    { "kind": "gpu", "ts": 1754300050000, "id": "0", "name": "NVIDIA A100 80GB", "usage": 42.5, "mem_total": 85899345920, "mem_used": 10737418240, "temp": 55 },
     // 可选硬件指标（仅部分机器）；多卡时每卡一条；mem/temp 仅 nvidia 路径有，macOS 为 null；无 GPU 时整个 kind 不出现
     { "kind": "self", "ts": 1754300055000, "cpu_usage": 1.2, "mem_rss": 13631488 },
     // 探针自身资源占用；report_self=true 时才有（默认 false）
@@ -2586,7 +2586,7 @@ function renderExample() {
       '此例是 primary / probe 原生 Reporter。请求头：X-Secret（认证）、X-Agent-Version、X-Reporter-Id: primary、X-Reporter-Protocol: probe（Reporter id 会百分号编码；旧服务端可忽略新增头）。',
       'static.config.global 是实际采集事实；static.config.reporters 是全线路脱敏摘要；同级 reset_day/intervals/... 仍是当前 Reporter 视角。',
       'CF / Komari 只在 reporters 脱敏拓扑中出现；它们自己的 wire 报文请看「协议预览」，probe 请求不携带 ext.cf。',
-      '上报失败时 agent 有界保留（10 条）待重发——只覆盖短暂抖动，长断网历史不补发；服务端收到延迟记录按 ts 去重排序即可。',
+      '上报失败时 agent 将 dynamic/async/errors 共享保留在 512 条有界日志中待重发——只覆盖短暂抖动，长断网历史不补发；服务端收到延迟记录按 ts 去重排序即可。',
     ]),
     annotatedCard(RESPONSE_EXAMPLE_JSON5, '//', [
       'agent 行为：整体校验（版本、周期、glob、Ping），全部通过才应用当前 Reporter 并落盘；随后重新计算全局 collect 最大公约数、其他 worker 最小周期、GPU OR、网卡/磁盘/Ping 并集。',

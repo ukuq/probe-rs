@@ -48,6 +48,8 @@ enum Event {
     Dynamic(DynamicRecord),
     Async(AsyncRecord),
     Error(LoggedError),
+    /// Transport-only sequence marker; never serialized into a report.
+    DeliveryBarrier,
 }
 
 #[derive(Default)]
@@ -140,6 +142,15 @@ impl Buffers {
         push_locked(&mut state, event);
     }
 
+    /// Append an invisible sequence marker and return the journal tail it
+    /// established. A final empty heartbeat can then be proven delivered by
+    /// waiting for the Reporter cursor to reach this sequence.
+    pub fn delivery_barrier(&self) -> u64 {
+        let mut state = self.state.lock().expect("buffer lock poisoned");
+        push_locked(&mut state, Event::DeliveryBarrier);
+        state.next_seq.saturating_sub(1)
+    }
+
     /// 非破坏性读取：同一批数据可被任意数量 Reporter 独立消费。
     pub fn read(&self, reporter_id: &str) -> BufferBatch {
         self.read_after(reporter_id, None)
@@ -166,6 +177,7 @@ impl Buffers {
                 Event::Dynamic(record) => batch.dynamic.push(record.clone()),
                 Event::Async(record) => batch.async_records.push(record.clone()),
                 Event::Error(record) => batch.errors.push(record.clone()),
+                Event::DeliveryBarrier => {}
             }
         }
         batch
@@ -186,6 +198,16 @@ impl Buffers {
         while state.events.front().is_some_and(|(seq, _)| *seq <= min_ack) {
             state.events.pop_front();
         }
+    }
+
+    /// Last journal sequence durably acknowledged by this Reporter transport.
+    pub fn acknowledged_through(&self, reporter_id: &str) -> Option<u64> {
+        self.state
+            .lock()
+            .expect("buffer lock poisoned")
+            .cursors
+            .get(reporter_id)
+            .copied()
     }
 }
 
@@ -266,6 +288,22 @@ mod tests {
         assert_eq!(buffers.read("b").dynamic.len(), 2);
         buffers.ack("b", b.through);
         assert!(buffers.read("a").dynamic.is_empty());
+    }
+
+    #[test]
+    fn delivery_barrier_advances_cursor_without_adding_payload_records() {
+        let buffers = Buffers::new();
+        buffers.register("a");
+
+        let target = buffers.delivery_barrier();
+        let batch = buffers.read("a");
+        assert_eq!(batch.through, target);
+        assert!(batch.dynamic.is_empty());
+        assert!(batch.async_records.is_empty());
+        assert!(batch.errors.is_empty());
+
+        buffers.ack("a", batch.through);
+        assert_eq!(buffers.acknowledged_through("a"), Some(target));
     }
 
     #[test]

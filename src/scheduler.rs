@@ -27,6 +27,7 @@ use crate::worker::ping::PingSnapshot;
 use crate::worker::public_ip::IpSnapshot;
 
 const STATIC_REFRESH: Duration = Duration::from_secs(600);
+const SHUTDOWN_REPORT_TIMEOUT: Duration = Duration::from_secs(20);
 /// 校准时钟偏移变化超过该阈值时重建 static（ts/boot_time 里烘焙了旧偏移）。
 /// 取 1s：boot_time 展示精度为秒，小于该值的 NTP 微调不可见，避免频繁重建。
 const STATIC_OFFSET_REFRESH_MS: i64 = 1_000;
@@ -327,7 +328,7 @@ impl ReporterRunner {
         loop {
             tokio::select! {
                 _ = &mut report_timer => {
-                    self.on_report().await;
+                    self.on_report(false).await;
                     let delay = self.current_report_delay();
                     report_timer.as_mut().reset(tokio::time::Instant::now() + delay);
                 },
@@ -411,6 +412,26 @@ impl ReporterRunner {
                 }
                 changed = self.shutdown_rx.changed() => {
                     if changed.is_err() || *self.shutdown_rx.borrow() {
+                        match tokio::time::timeout(
+                            SHUTDOWN_REPORT_TIMEOUT,
+                            self.flush_on_shutdown(),
+                        )
+                        .await
+                        {
+                            Ok(true) => tracing::info!(
+                                reporter_id = %self.id,
+                                "final report acknowledged"
+                            ),
+                            Ok(false) => tracing::warn!(
+                                reporter_id = %self.id,
+                                "final report was not acknowledged"
+                            ),
+                            Err(_) => tracing::warn!(
+                                reporter_id = %self.id,
+                                timeout_secs = SHUTDOWN_REPORT_TIMEOUT.as_secs(),
+                                "final report timed out"
+                            ),
+                        }
                         tracing::info!(reporter_id = %self.id, "reporter stopped");
                         return;
                     }
@@ -488,11 +509,47 @@ impl ReporterRunner {
             .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
     }
 
-    async fn on_report(&mut self) {
+    async fn flush_on_shutdown(&mut self) -> bool {
+        let target = self.buffers.delivery_barrier();
+        let Some(spec) = self.cfg.get().reporter(&self.id) else {
+            return false;
+        };
+
+        // Use CF's synchronous POST fallback for shutdown rather than leaving
+        // the final frame queued behind the WSS actor. Komari has no HTTP
+        // report path, so keep its worker alive until the journal cursor proves
+        // that the final frame reached the socket.
+        self.on_report(true).await;
+        if self
+            .buffers
+            .acknowledged_through(&self.id)
+            .is_some_and(|through| through >= target)
+        {
+            return true;
+        }
+        if spec.protocol != ReporterProtocol::Komari {
+            return false;
+        }
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+
+            if self
+                .buffers
+                .acknowledged_through(&self.id)
+                .is_some_and(|through| through >= target)
+            {
+                return true;
+            }
+        }
+    }
+
+    async fn on_report(&mut self, force_http: bool) {
         let Some(spec) = self.cfg.get().reporter(&self.id) else {
             return;
         };
-        let cf_inflight_through = (spec.protocol == ReporterProtocol::Cf
+        let cf_inflight_through = (!force_http
+            && spec.protocol == ReporterProtocol::Cf
             && spec.connection_mode == Some(CfConnectionMode::Auto))
         .then(|| {
             self.cf_ws
@@ -517,6 +574,7 @@ impl ReporterRunner {
                     &dynamic,
                     batch.through,
                     cf_inflight_through.is_some(),
+                    force_http,
                 )
                 .await
             }
@@ -714,6 +772,7 @@ impl ReporterRunner {
         dynamic: &[DynamicRecord],
         through: u64,
         batch_starts_after_inflight: bool,
+        force_http: bool,
     ) -> bool {
         if let Some(remaining) = self.cf_policy_backoff_remaining() {
             tracing::debug!(
@@ -842,7 +901,7 @@ impl ReporterRunner {
             samples,
         };
 
-        if spec.connection_mode == Some(CfConnectionMode::Auto) {
+        if !force_http && spec.connection_mode == Some(CfConnectionMode::Auto) {
             if let Some(ws) = self.cf_ws.as_ref().filter(|ws| ws.connected()) {
                 match ws.send(&update, through, include_static) {
                     Ok(()) => {
@@ -870,9 +929,10 @@ impl ReporterRunner {
             return false;
         }
         let post_interval = Duration::from_secs(spec.intervals.report.max(1));
-        if self
-            .last_cf_post_attempt
-            .is_some_and(|last| last.elapsed() < post_interval)
+        if !force_http
+            && self
+                .last_cf_post_attempt
+                .is_some_and(|last| last.elapsed() < post_interval)
         {
             return false;
         }
