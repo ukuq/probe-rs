@@ -11,8 +11,8 @@ use serde::Deserialize;
 
 use crate::config::{AutoUpdateConfig, LocalConfig, CONFIG_SCHEMA};
 use crate::model::{
-    CfConnectionMode, CfSection, CollectionIntervals, KomariSection, PingKind, PingTarget,
-    ProbeSection, ReporterConfig, ReporterProtocol,
+    CfConnectionMode, CfPingMode, CfSection, CollectionIntervals, KomariSection, PingKind,
+    PingTarget, ProbeSection, ReporterConfig, ReporterProtocol,
 };
 
 #[derive(Debug, Deserialize)]
@@ -214,6 +214,7 @@ fn convert_reporter(legacy: LegacyReporterConfig, warnings: &mut Vec<String>) ->
                     secret: legacy.secret,
                     url: legacy.worker_url,
                     connection_mode: legacy.ext.cf.connection_mode,
+                    ping_mode: CfPingMode::Tcp,
                     interval: legacy.report_interval.max(1),
                     collect_interval: legacy.intervals.collect.max(1),
                     wss_report_interval: 2,

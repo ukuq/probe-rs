@@ -13,6 +13,22 @@ const EXCLUDED_PREFIXES: &[&str] = &[
     "utun", "awdl", "gif", "stf", "llw", "anpi", // macOS
 ];
 
+/// Additional tunnel interfaces hidden only by the default Reporter outlet.
+/// Collection and the traffic ledger continue to retain these interfaces.
+const REPORT_TUNNEL_PREFIXES: &[&str] = &[
+    "tailscale",
+    "tun",
+    "wg",
+    "wireguard",
+    "ipsec",
+    "gre",
+    "gretap",
+    "ipip",
+    "sit",
+    "ip6tnl",
+    "zerotier",
+];
+
 /// Windows 的 sysinfo 网卡键是 InterfaceAlias；常见 Hyper-V、VPN 和隧道
 /// 接口通过别名片段排除。显式 interfaces 白名单始终优先，可重新纳入这些接口。
 #[cfg(target_os = "windows")]
@@ -48,18 +64,29 @@ const WINDOWS_EXCLUDED_PREFIXES: &[&str] = &[
 ];
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn is_default_excluded(name: &str) -> bool {
+pub(crate) fn is_ephemeral_virtual(name: &str) -> bool {
     EXCLUDED_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn is_default_excluded(name: &str) -> bool {
+pub(crate) fn is_ephemeral_virtual(name: &str) -> bool {
     let name = name.to_lowercase();
     name == "lo"
         || WINDOWS_EXCLUDED_PREFIXES
             .iter()
             .any(|p| name.starts_with(p))
         || WINDOWS_EXCLUDED_PARTS.iter().any(|p| name.contains(p))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_default_report_excluded(name: &str) -> bool {
+    is_ephemeral_virtual(name) || REPORT_TUNNEL_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+#[cfg(target_os = "windows")]
+fn is_default_report_excluded(name: &str) -> bool {
+    let name = name.to_lowercase();
+    is_ephemeral_virtual(&name) || REPORT_TUNNEL_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -119,7 +146,7 @@ impl IfaceFilter {
         }
         match &self.whitelist {
             Some(set) => set.is_match(name),
-            None => !is_default_excluded(name),
+            None => !is_default_report_excluded(name),
         }
     }
 }
@@ -161,6 +188,10 @@ mod tests {
         assert!(!f.includes("docker0"));
         assert!(!f.includes("veth123abc"));
         assert!(!f.includes("br-abc"));
+        assert!(!f.includes("tailscale0"));
+        assert!(!f.includes("tun0"));
+        assert!(!f.includes("wg0"));
+        assert!(!f.includes("ip6tnl0"));
     }
 
     #[test]
@@ -170,6 +201,9 @@ mod tests {
         assert!(!f.includes("enp3s0"));
         // 白名单模式不排除 docker 之类：以白名单为准
         assert!(!f.includes("docker0"));
+
+        let tunnel = IfaceFilter::new(&["wg*".to_string()]);
+        assert!(tunnel.includes("wg0"));
     }
 
     #[cfg(target_os = "windows")]

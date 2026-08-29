@@ -40,6 +40,10 @@ param(
     [ValidateSet("auto", "http")]
     [string]$ConnectionMode,
 
+    [Alias("ping_mode", "ping-mode")]
+    [ValidateSet("tcp", "icmp")]
+    [string]$PingMode,
+
     [Alias("reset_day")]
     [ValidateRange(0, 31)]
     [int]$ResetDay = 1,
@@ -321,6 +325,9 @@ try {
     }
     if ($PSBoundParameters.ContainsKey("ConnectionMode")) {
         $configureArgs += @("--connection-mode", $ConnectionMode.ToLowerInvariant())
+    }
+    if ($PSBoundParameters.ContainsKey("PingMode")) {
+        $configureArgs += @("--ping-mode", $PingMode.ToLowerInvariant())
     }
     if ($PSBoundParameters.ContainsKey("ResetDay")) {
         $configureArgs += @("--reset-day", $ResetDay.ToString())

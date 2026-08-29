@@ -11,7 +11,7 @@ use chrono::{Local, TimeZone};
 
 use crate::collector::net::IfaceFilter;
 use crate::config::{self, AutoUpdateConfig, LocalConfig, UpdateChannel, CONFIG_SCHEMA};
-use crate::model::{CfConnectionMode, CfSection, ReporterConfig, ReporterProtocol};
+use crate::model::{CfConnectionMode, CfPingMode, CfSection, ReporterConfig, ReporterProtocol};
 use crate::netstatic::{self, NetStatic};
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -77,6 +77,7 @@ struct ConfigureCfOptions {
     wss_report_interval: Option<u64>,
     report_interval: Option<u64>,
     connection_mode: Option<CfConnectionMode>,
+    ping_mode: Option<CfPingMode>,
     reset_day: Option<u8>,
     interfaces: Option<Vec<String>>,
     pings: Vec<(String, String)>,
@@ -97,6 +98,7 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
     let mut wss_report_interval = None;
     let mut report_interval = None;
     let mut connection_mode = None;
+    let mut ping_mode = None;
     let mut reset_day = None;
     let mut interfaces = None;
     let mut pings = Vec::new();
@@ -133,6 +135,13 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
                     "auto" => CfConnectionMode::Auto,
                     "http" => CfConnectionMode::Http,
                     _ => bail!("--connection-mode must be auto or http"),
+                });
+            }
+            "--ping-mode" => {
+                ping_mode = Some(match value(&mut args)?.to_ascii_lowercase().as_str() {
+                    "tcp" => CfPingMode::Tcp,
+                    "icmp" => CfPingMode::Icmp,
+                    _ => bail!("--ping-mode must be tcp or icmp"),
                 });
             }
             "--reset-day" => {
@@ -184,6 +193,7 @@ fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
         wss_report_interval,
         report_interval,
         connection_mode,
+        ping_mode,
         reset_day,
         interfaces,
         pings,
@@ -259,6 +269,10 @@ fn configure_cf(options: ConfigureCfOptions) -> Result<String> {
         cf_changed |= cf.connection_mode != value;
         cf.connection_mode = value;
     }
+    if let Some(value) = options.ping_mode {
+        cf_changed |= cf.ping_mode != value;
+        cf.ping_mode = value;
+    }
     if let Some(value) = options.reset_day {
         cf_changed |= cf.reset_day != value;
         cf.reset_day = value;
@@ -314,6 +328,7 @@ fn new_cf_reporter(id: String) -> ReporterConfig {
             secret: String::new(),
             url: String::new(),
             connection_mode: CfConnectionMode::Auto,
+            ping_mode: CfPingMode::Tcp,
             interval: 60,
             collect_interval: 1,
             wss_report_interval: 2,
@@ -569,6 +584,7 @@ mod tests {
             wss_report_interval: None,
             report_interval: Some(60),
             connection_mode: Some(CfConnectionMode::Http),
+            ping_mode: Some(CfPingMode::Icmp),
             reset_day: Some(20),
             interfaces: None,
             pings: vec![("ct".into(), "ct.example.com:80".into())],
@@ -593,6 +609,8 @@ mod tests {
             "https://example.com/update".into(),
             "--connection-mode".into(),
             mode.to_owned(),
+            "--ping-mode".into(),
+            "icmp".into(),
         ]
         .into_iter()
     }
@@ -601,7 +619,11 @@ mod tests {
     fn configure_parser_accepts_http_connection_mode() {
         let options = parse_configure_args(configure_args("HTTP")).unwrap();
         assert_eq!(options.connection_mode, Some(CfConnectionMode::Http));
+        assert_eq!(options.ping_mode, Some(CfPingMode::Icmp));
         assert!(parse_configure_args(configure_args("tcp")).is_err());
+        let mut invalid_ping = configure_args("auto").collect::<Vec<_>>();
+        *invalid_ping.last_mut().unwrap() = "udp".into();
+        assert!(parse_configure_args(invalid_ping.into_iter()).is_err());
     }
 
     #[test]
@@ -648,6 +670,7 @@ mod tests {
         assert_eq!(reporter.pings[0].target.target, "ct.example.com:80");
         let cf = config.reporters[0].cf.as_ref().unwrap();
         assert_eq!(cf.connection_mode, CfConnectionMode::Http);
+        assert_eq!(cf.ping_mode, CfPingMode::Icmp);
         assert_eq!(cf.interval, 60);
         assert_eq!(cf.ct.as_deref(), Some("ct.example.com:80"));
         assert!(config.auto_update.enabled);
@@ -692,6 +715,7 @@ mod tests {
         assert!(generator.contains("首次安装填写完整的 /update 地址"));
         assert!(generator.contains("更新仓库"));
         assert!(generator.contains("-update_repository"));
+        assert!(generator.contains("-ping_mode"));
     }
 
     #[test]
@@ -705,6 +729,7 @@ mod tests {
             "-install-ghproxy|--install-ghproxy)",
             "--update-repository \"$UPDATE_REPOSITORY\"",
             "--update-proxy \"$GH_PROXY\"",
+            "--ping-mode \"$PING_MODE\"",
         ] {
             assert!(script.contains(expected), "missing {expected}");
         }
@@ -809,6 +834,7 @@ collect = 3
             "& $Installer start -Scope Machine",
             "$GitHubRepo = \"https://github.com/$downloadRepository\"",
             "$configureArgs += @(\"--update-repository\", $UpdateRepository)",
+            "$configureArgs += @(\"--ping-mode\", $PingMode.ToLowerInvariant())",
         ] {
             assert!(script.contains(expected), "missing {expected}");
         }
@@ -838,6 +864,7 @@ collect = 3
         second.secret = None;
         second.worker_url = None;
         second.collect = None;
+        second.ping_mode = None;
         second.reset_day = None;
         second.interfaces = None;
         second.pings.clear();
@@ -847,6 +874,7 @@ collect = 3
         assert_eq!(reporter.reset_day, 20);
         assert_eq!(reporter.interfaces, vec!["eth0"]);
         assert_eq!(reporter.pings.len(), 1);
+        assert_eq!(reporter.ping_mode, Some(CfPingMode::Icmp));
     }
 
     #[test]

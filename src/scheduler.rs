@@ -964,8 +964,12 @@ impl ReporterRunner {
         }
         if let Some(push) = response.push {
             let current_pings: Vec<_> = spec.pings.iter().map(|ping| ping.target.clone()).collect();
-            let remote =
-                crate::reporter_cf::synthesize_remote(&push, &spec.intervals, &current_pings);
+            let remote = crate::reporter_cf::synthesize_remote(
+                &push,
+                &spec.intervals,
+                &current_pings,
+                spec.ping_mode.unwrap_or(crate::model::CfPingMode::Tcp),
+            );
             match self.cfg.apply_remote_for(&self.id, remote) {
                 Ok(true) => {
                     self.last_static = None;
@@ -1402,6 +1406,7 @@ mod tests {
             worker_url: "https://example.com/report".into(),
             config_version: String::new(),
             connection_mode: None,
+            ping_mode: None,
             wss_report_interval: None,
             source_collect_interval: Intervals::default().collect,
             intervals: Intervals::default(),

@@ -67,6 +67,7 @@ usage() {
         '  -wss_report_interval=                WSS report seconds (1-5; default/preserved: 2)' \
         '  -interval=                           report seconds' \
         '  -connection_mode=                    auto (WSS + fallback) / http' \
+        '  -ping_mode=                          tcp / icmp' \
         '  -reset_day=                          0-31' \
         '  -ct= -cu= -cm= -bd=                 ping targets' \
         '  -interface= / -interfaces= / -iface= comma-separated interface globs' \
@@ -124,13 +125,13 @@ case "$COMMAND" in
 esac
 
 ID= SECRET= URL= BIN=
-COLLECT= WSS_REPORT= REPORT= RESET_DAY= INTERFACES= CONNECTION_MODE=
+COLLECT= WSS_REPORT= REPORT= RESET_DAY= INTERFACES= CONNECTION_MODE= PING_MODE=
 CT= CU= CM= BD=
 AUTO_UPDATE= UPDATE_REPOSITORY= UPDATE_CHANNEL= RX_CORRECTION= TX_CORRECTION=
 REPORTER_ID=cf INSTALL_VERSION=$SCRIPT_VERSION GH_PROXY=
 DEBUG=false NO_START=false
 ID_SET=false SECRET_SET=false URL_SET=false
-COLLECT_SET=false WSS_REPORT_SET=false REPORT_SET=false RESET_SET=false INTERFACES_SET=false CONNECTION_MODE_SET=false
+COLLECT_SET=false WSS_REPORT_SET=false REPORT_SET=false RESET_SET=false INTERFACES_SET=false CONNECTION_MODE_SET=false PING_MODE_SET=false
 CT_SET=false CU_SET=false CM_SET=false BD_SET=false
 AUTO_UPDATE_SET=false UPDATE_REPOSITORY_SET=false UPDATE_CHANNEL_SET=false
 RX_SET=false TX_SET=false DEBUG_SET=false
@@ -146,6 +147,7 @@ while [ "$#" -gt 0 ]; do
         -wss_report_interval=*|-wss-report-interval=*) WSS_REPORT=${arg#*=}; WSS_REPORT_SET=true ;;
         -interval=*) REPORT=${arg#*=}; REPORT_SET=true ;;
         -connection_mode=*|-connection-mode=*) CONNECTION_MODE=${arg#*=}; CONNECTION_MODE_SET=true ;;
+        -ping_mode=*|-ping-mode=*) PING_MODE=${arg#*=}; PING_MODE_SET=true ;;
         -reset_day=*) RESET_DAY=${arg#*=}; RESET_SET=true ;;
         -ct=*) CT=${arg#*=}; CT_SET=true ;;
         -cu=*) CU=${arg#*=}; CU_SET=true ;;
@@ -216,6 +218,9 @@ if [ "$REPORT_SET" = true ]; then
 fi
 if [ "$CONNECTION_MODE_SET" = true ]; then
     case "$CONNECTION_MODE" in auto|http) ;; *) die "connection_mode must be auto or http" ;; esac
+fi
+if [ "$PING_MODE_SET" = true ]; then
+    case "$PING_MODE" in tcp|icmp) ;; *) die "ping_mode must be tcp or icmp" ;; esac
 fi
 if [ "$RESET_SET" = true ]; then
     RESET_DAY=$(normalize_uint reset_day "$RESET_DAY")
@@ -342,6 +347,7 @@ set -- configure-cf --config "$CONFIG_PATH" --net-static-path "$DATA_DIR/net_sta
 [ "$WSS_REPORT_SET" = false ] || set -- "$@" --wss-report-interval "$WSS_REPORT"
 [ "$REPORT_SET" = false ] || set -- "$@" --report-interval "$REPORT"
 [ "$CONNECTION_MODE_SET" = false ] || set -- "$@" --connection-mode "$CONNECTION_MODE"
+[ "$PING_MODE_SET" = false ] || set -- "$@" --ping-mode "$PING_MODE"
 [ "$RESET_SET" = false ] || set -- "$@" --reset-day "$RESET_DAY"
 [ "$INTERFACES_SET" = false ] || set -- "$@" --interfaces "$INTERFACES"
 [ "$CT_SET" = false ] || set -- "$@" --ct "$CT"

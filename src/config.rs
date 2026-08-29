@@ -93,6 +93,7 @@ pub struct ReporterSpec {
     pub worker_url: String,
     pub config_version: String,
     pub connection_mode: Option<CfConnectionMode>,
+    pub ping_mode: Option<crate::model::CfPingMode>,
     pub wss_report_interval: Option<u64>,
     /// 协议原始采集周期。CF 保留 0 用于线上协议；内部采集使用
     /// intervals.collect 中的非零映射值。
@@ -243,7 +244,7 @@ impl LocalConfig {
                         ("bd", &cf.bd),
                     ] {
                         if let Some(target) = target {
-                            validate_cf_node(name, target).with_context(|| {
+                            validate_cf_node(name, target, cf.ping_mode).with_context(|| {
                                 format!("reporter {} cf.{name} 非法", reporter.id)
                             })?;
                         }
@@ -338,6 +339,7 @@ impl LocalConfig {
                             worker_url: cf.url.clone(),
                             config_version: cf.ext.config_version.clone(),
                             connection_mode: Some(cf.connection_mode),
+                            ping_mode: Some(cf.ping_mode),
                             wss_report_interval: Some(cf.wss_report_interval),
                             source_collect_interval: cf.collect_interval,
                             intervals: collect.intervals.with_report(cf.interval),
@@ -374,6 +376,7 @@ impl LocalConfig {
                             worker_url: komari.endpoint.clone(),
                             config_version: String::new(),
                             connection_mode: None,
+                            ping_mode: None,
                             wss_report_interval: None,
                             source_collect_interval: collect.intervals.collect,
                             // komari 按采集周期上报。
@@ -398,6 +401,7 @@ impl LocalConfig {
                             worker_url: probe.worker_url.clone(),
                             config_version: probe.ext.config_version.clone(),
                             connection_mode: None,
+                            ping_mode: None,
                             wss_report_interval: None,
                             source_collect_interval: collect.intervals.collect,
                             intervals: collect.intervals.with_report(probe.report_interval),
@@ -468,6 +472,7 @@ impl LocalConfig {
                 protocol: spec.protocol,
                 source_collect_interval: spec.source_collect_interval,
                 connection_mode: spec.connection_mode,
+                ping_mode: spec.ping_mode,
                 wss_report_interval: spec.wss_report_interval,
                 intervals: CollectionIntervals {
                     collect: spec.intervals.collect,
@@ -610,8 +615,8 @@ pub(crate) fn split_list(raw: &str, delimiter: char) -> Vec<String> {
         .collect()
 }
 
-fn validate_cf_node(name: &str, target: &str) -> Result<()> {
-    let ping = crate::model::cf_node_ping(name, target)
+fn validate_cf_node(name: &str, target: &str, ping_mode: crate::model::CfPingMode) -> Result<()> {
+    let ping = crate::model::cf_node_ping(name, target, ping_mode)
         .with_context(|| format!("cf.{name} 不能为空串,不需要时请删除该键"))?;
     ping_task_key(&ping)?;
     Ok(())
@@ -659,7 +664,7 @@ pub(crate) fn ping_task_key(ping: &PingTarget) -> Result<String> {
             ))
         }
         PingKind::Icmp => {
-            let host = ping.target.trim().trim_matches(['[', ']']);
+            let (host, _) = crate::worker::ping::split_host_port(&ping.target)?;
             if host.is_empty() || host.chars().any(|ch| matches!(ch, '/' | '\\' | '?' | '#')) {
                 bail!("非法 ICMP host: {}", ping.target);
             }
@@ -705,11 +710,11 @@ fn global_ping_uri(ping: &PingTarget) -> Result<String> {
             Ok(format!("tcp://{}:{port}", authority_host(&host)))
         }
         PingKind::Icmp => {
-            let host = ping.target.trim().trim_matches(['[', ']']);
+            let (host, _) = crate::worker::ping::split_host_port(&ping.target)?;
             if host.is_empty() {
                 bail!("非法 ICMP host: {}", ping.target);
             }
-            Ok(format!("icmp://{}", authority_host(host)))
+            Ok(format!("icmp://{}", authority_host(&host)))
         }
     }
 }
@@ -1085,6 +1090,9 @@ fn apply_remote_cf(section: &mut crate::model::CfSection, remote: &RemoteConfig)
     if let Some(value) = remote.connection_mode {
         section.connection_mode = value;
     }
+    if let Some(value) = remote.cf_ping_mode {
+        section.ping_mode = value;
+    }
     if let Some(value) = remote.reset_day {
         section.reset_day = value;
     }
@@ -1456,6 +1464,7 @@ mod tests {
                 secret: "cf-secret".into(),
                 url: "https://worker.example/update".into(),
                 connection_mode: CfConnectionMode::Auto,
+                ping_mode: crate::model::CfPingMode::Tcp,
                 interval: 60,
                 collect_interval: 1,
                 wss_report_interval: 2,
@@ -1953,6 +1962,10 @@ report_interval = 60
             key(PingKind::Icmp, "example.com")
         );
         assert_eq!(
+            key(PingKind::Icmp, "EXAMPLE.com:80"),
+            key(PingKind::Icmp, "example.com")
+        );
+        assert_eq!(
             key(PingKind::Http, "https://EXAMPLE.com"),
             key(PingKind::Http, "https://example.com:443/")
         );
@@ -2000,6 +2013,10 @@ report_interval = 60
         );
         assert_eq!(
             global_ping_uri(&target(PingKind::Icmp, "EXAMPLE.com.")).unwrap(),
+            "icmp://example.com"
+        );
+        assert_eq!(
+            global_ping_uri(&target(PingKind::Icmp, "EXAMPLE.com:80")).unwrap(),
             "icmp://example.com"
         );
         assert_eq!(
@@ -2098,6 +2115,7 @@ report_interval = 60
             report_interval: None,
             wss_report_interval: None,
             connection_mode: None,
+            cf_ping_mode: None,
             reset_day: None,
             interfaces: None,
             disks: None,
@@ -2183,6 +2201,7 @@ report_interval = 60
         push.report_interval = Some(30);
         push.wss_report_interval = Some(4);
         push.connection_mode = Some(CfConnectionMode::Http);
+        push.cf_ping_mode = Some(crate::model::CfPingMode::Icmp);
         push.interfaces = Some(vec!["eth0".into()]);
         push.pings = Some(vec![
             PingTarget {
@@ -2205,6 +2224,7 @@ report_interval = 60
         assert_eq!(cf.interval, 30);
         assert_eq!(cf.wss_report_interval, 4);
         assert_eq!(cf.connection_mode, CfConnectionMode::Http);
+        assert_eq!(cf.ping_mode, crate::model::CfPingMode::Icmp);
         assert_eq!(cf.effective_collect_interval(), 30);
         assert_eq!(cf.interface, "eth0");
         assert_eq!(cf.ct.as_deref(), Some("new-ct.example.com:80"));
@@ -2216,6 +2236,10 @@ report_interval = 60
         assert_eq!(
             on_disk.reporters[0].cf.as_ref().unwrap().connection_mode,
             CfConnectionMode::Http
+        );
+        assert_eq!(
+            on_disk.reporters[0].cf.as_ref().unwrap().ping_mode,
+            crate::model::CfPingMode::Icmp
         );
 
         // 非 collect 的 intervals 字段:整体拒绝

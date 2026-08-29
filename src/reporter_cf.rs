@@ -16,12 +16,14 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
+#[cfg(test)]
+use crate::model::PingKind;
 use crate::model::{
-    CfConnectionMode, DiskIoRecord, DynamicRecord, GpuRecord, PingKind, PingRecord, PingTarget,
+    CfConnectionMode, CfPingMode, DiskIoRecord, DynamicRecord, GpuRecord, PingRecord, PingTarget,
     SlowBlock, StaticInfo,
 };
 
-pub const CF_CONFIG_SCHEMA: &str = "5";
+pub const CF_CONFIG_SCHEMA: &str = "6";
 pub const CF_WSS_MODE_HEADER: &str = "X-Agent-Wss-Mode";
 pub const CF_WSS_REASON_HEADER: &str = "X-Agent-Wss-Reason";
 pub const CF_WSS_SCHEDULE_INACTIVE: &str = "wss_schedule_inactive";
@@ -331,7 +333,7 @@ pub struct CfPush {
     pub version: String,
     pub collect: Option<u64>,
     pub report: Option<u64>,
-    /// Schema 5 configured realtime cadence. The authoritative per-frame
+    /// Schema 5+ configured realtime cadence. The authoritative per-frame
     /// cadence still comes from `nextWssReportAfterMs` because the server may
     /// slow idle agents independently of this value.
     pub wss_report_interval: Option<u64>,
@@ -340,6 +342,8 @@ pub struct CfPush {
     pub custom: [Option<String>; 4],
     pub interface: Option<String>,
     pub connection_mode: Option<CfConnectionMode>,
+    /// Schema 6 global mode for the four CF latency targets.
+    pub ping_mode: Option<CfPingMode>,
 }
 
 /// 把 CF 推送合成为当前 Reporter 的远端配置；映射后的 collect 需求随后交给
@@ -348,6 +352,7 @@ pub fn synthesize_remote(
     push: &CfPush,
     current: &crate::model::Intervals,
     current_pings: &[PingTarget],
+    current_ping_mode: CfPingMode,
 ) -> crate::model::RemoteConfig {
     crate::model::RemoteConfig {
         config_version: push.version.clone(),
@@ -359,6 +364,7 @@ pub fn synthesize_remote(
             .or_else(|| push.collect.is_some().then_some(current.report)),
         wss_report_interval: push.wss_report_interval,
         connection_mode: push.connection_mode,
+        cf_ping_mode: push.ping_mode,
         reset_day: push.reset_day,
         interfaces: push.interface.as_ref().map(|s| {
             s.split(',')
@@ -368,7 +374,12 @@ pub fn synthesize_remote(
                 .collect()
         }),
         disks: None,
-        pings: synthesize_cf_pings(&push.custom, current_pings),
+        pings: synthesize_cf_pings(
+            &push.custom,
+            current_pings,
+            push.ping_mode,
+            current_ping_mode,
+        ),
         report_gpu: None,
         report_errors: None,
         report_self: None,
@@ -380,16 +391,18 @@ pub fn synthesize_remote(
 fn synthesize_cf_pings(
     custom: &[Option<String>; 4],
     current: &[PingTarget],
+    ping_mode: Option<CfPingMode>,
+    current_ping_mode: CfPingMode,
 ) -> Option<Vec<PingTarget>> {
-    if custom.iter().all(Option::is_none) {
+    if custom.iter().all(Option::is_none) && ping_mode.is_none() {
         return None;
     }
 
     let mut pings = current.to_vec();
     for (index, target) in custom.iter().enumerate() {
-        let Some(target) = target else {
+        if target.is_none() && ping_mode.is_none() {
             continue;
-        };
+        }
         let names: &[&str] = match index {
             0 => &["ct"],
             1 => &["cu"],
@@ -403,25 +416,22 @@ fn synthesize_cf_pings(
         let existing = existing_index.map(|position| pings[position].clone());
         pings.retain(|ping| !names.contains(&ping.name.as_str()));
 
-        let target = target.trim();
+        let target = target
+            .as_deref()
+            .or_else(|| existing.as_ref().map(|ping| ping.target.as_str()))
+            .unwrap_or_default()
+            .trim();
         if target.is_empty() {
             continue;
         }
-        let lowercase = target.to_ascii_lowercase();
-        let kind = if lowercase.starts_with("http://") || lowercase.starts_with("https://") {
-            PingKind::Http
-        } else {
-            PingKind::Tcp
-        };
-        let replacement = PingTarget {
-            name: existing
-                .as_ref()
-                .map(|ping| ping.name.clone())
-                .unwrap_or_else(|| names[0].to_string()),
-            kind,
-            target: target.to_string(),
-            interval: existing.and_then(|ping| ping.interval),
-        };
+        let name = existing
+            .as_ref()
+            .map(|ping| ping.name.as_str())
+            .unwrap_or(names[0]);
+        let mut replacement =
+            crate::model::cf_node_ping(name, target, ping_mode.unwrap_or(current_ping_mode))
+                .expect("non-empty CF node");
+        replacement.interval = existing.and_then(|ping| ping.interval);
         let position = existing_index.unwrap_or(pings.len()).min(pings.len());
         pings.insert(position, replacement);
     }
@@ -492,6 +502,7 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
         custom: [None, None, None, None],
         interface: None,
         connection_mode: None,
+        ping_mode: None,
     };
     let mut has_config = false;
     let mut correction: Option<(f64, f64)> = None;
@@ -549,6 +560,17 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
                 }
                 value => tracing::warn!(value, "CF connection_mode 非法，已忽略"),
             },
+            "ping_mode" => match v.as_ref() {
+                "tcp" => {
+                    push.ping_mode = Some(CfPingMode::Tcp);
+                    has_config = true;
+                }
+                "icmp" => {
+                    push.ping_mode = Some(CfPingMode::Icmp);
+                    has_config = true;
+                }
+                value => tracing::warn!(value, "CF ping_mode 非法，已忽略"),
+            },
             "rx_correction" => rx_gb = v.parse::<f64>().ok().filter(|v| valid_gb(*v)),
             "tx_correction" => tx_gb = v.parse::<f64>().ok().filter(|v| valid_gb(*v)),
             // schema_version / update=1：忽略（自升级不做）
@@ -568,7 +590,7 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
             // 缺 MD5 头（非官方服务端）：从配置字段重建版本串。
             // 不能用原始 body——校正/update 字段的出现或消失会造成版本空转
             None => format!(
-                "ci={:?}&ri={:?}&wss={:?}&rd={:?}&ct={:?}&cu={:?}&cm={:?}&bd={:?}&if={:?}&mode={:?}",
+                "ci={:?}&ri={:?}&wss={:?}&rd={:?}&ct={:?}&cu={:?}&cm={:?}&bd={:?}&if={:?}&mode={:?}&ping={:?}",
                 push.collect,
                 push.report,
                 push.wss_report_interval,
@@ -578,7 +600,8 @@ pub fn parse_response_body(body: &str, md5_header: Option<&str>) -> CfResponse {
                 push.custom[2],
                 push.custom[3],
                 push.interface,
-                push.connection_mode
+                push.connection_mode,
+                push.ping_mode
             ),
         };
     }
@@ -773,9 +796,10 @@ mod tests {
 
     #[test]
     fn parse_config_push() {
-        let body = "collect_interval=0&report_interval=60&wss_report_interval=2&reset_day=15&schema_version=5\
+        assert_eq!(CF_CONFIG_SCHEMA, "6");
+        let body = "collect_interval=0&report_interval=60&wss_report_interval=2&reset_day=15&schema_version=6\
                     &custom_ct=gd-ct-dualstack.ip.zstaticcdn.com&custom_cu=&custom_cm=m.example.com\
-                    &custom_bd=ip.zstaticcdn.com&interface=eth0&connection_mode=http";
+                    &custom_bd=ip.zstaticcdn.com&interface=eth0&connection_mode=http&ping_mode=icmp";
         let r = parse_response_body(body, Some("5f4dcc3b"));
         let p = r.push.unwrap();
         assert_eq!(p.version, "5f4dcc3b");
@@ -790,6 +814,7 @@ mod tests {
         assert_eq!(p.custom[1].as_deref(), Some("")); // 空值保留语义：该组清空
         assert_eq!(p.interface.as_deref(), Some("eth0"));
         assert_eq!(p.connection_mode, Some(CfConnectionMode::Http));
+        assert_eq!(p.ping_mode, Some(CfPingMode::Icmp));
         assert!(r.correction.is_none());
     }
 
@@ -804,8 +829,14 @@ mod tests {
             custom: [None, None, None, None],
             interface: Some("eth0, eth1,,bond*".into()),
             connection_mode: Some(CfConnectionMode::Auto),
+            ping_mode: None,
         };
-        let remote = synthesize_remote(&push, &crate::model::Intervals::default(), &[]);
+        let remote = synthesize_remote(
+            &push,
+            &crate::model::Intervals::default(),
+            &[],
+            CfPingMode::Tcp,
+        );
         assert_eq!(remote.cf_collect_interval, Some(0));
         assert_eq!(remote.report_interval, Some(60));
         assert_eq!(remote.wss_report_interval, Some(2));
@@ -843,9 +874,15 @@ mod tests {
             ],
             interface: None,
             connection_mode: None,
+            ping_mode: None,
         };
 
-        let remote = synthesize_remote(&push, &crate::model::Intervals::default(), &current);
+        let remote = synthesize_remote(
+            &push,
+            &crate::model::Intervals::default(),
+            &current,
+            CfPingMode::Tcp,
+        );
         let pings = remote.pings.expect("custom Ping push must update pings");
         assert_eq!(pings.len(), 4);
         let find = |name: &str| pings.iter().find(|ping| ping.name == name).unwrap();
@@ -858,6 +895,71 @@ mod tests {
         assert_eq!(find("bgp").interval, Some(25));
         assert_eq!(find("bgp").kind, PingKind::Http);
         assert_eq!(find("private").target, "keep-private.example:80");
+    }
+
+    #[test]
+    fn synthesize_remote_retypes_existing_cf_pings_for_schema_six() {
+        let current = vec![
+            PingTarget {
+                name: "ct".into(),
+                kind: PingKind::Tcp,
+                target: "ct.example:80".into(),
+                interval: Some(15),
+            },
+            PingTarget {
+                name: "bgp".into(),
+                kind: PingKind::Tcp,
+                target: "bd.example:443".into(),
+                interval: None,
+            },
+        ];
+        let push = CfPush {
+            version: "v3".into(),
+            collect: None,
+            report: None,
+            wss_report_interval: None,
+            reset_day: None,
+            custom: [None, None, None, None],
+            interface: None,
+            connection_mode: None,
+            ping_mode: Some(CfPingMode::Icmp),
+        };
+
+        let remote = synthesize_remote(
+            &push,
+            &crate::model::Intervals::default(),
+            &current,
+            CfPingMode::Tcp,
+        );
+        assert_eq!(remote.cf_ping_mode, Some(CfPingMode::Icmp));
+        let pings = remote.pings.expect("ping_mode must retype existing probes");
+        assert!(pings.iter().all(|ping| ping.kind == PingKind::Icmp));
+        assert_eq!(pings[0].interval, Some(15));
+        assert_eq!(pings[1].name, "bgp");
+    }
+
+    #[test]
+    fn schema_five_custom_target_preserves_local_icmp_mode() {
+        let push = CfPush {
+            version: "legacy".into(),
+            collect: None,
+            report: None,
+            wss_report_interval: None,
+            reset_day: None,
+            custom: [Some("ct.example:80".into()), None, None, None],
+            interface: None,
+            connection_mode: None,
+            ping_mode: None,
+        };
+
+        let remote = synthesize_remote(
+            &push,
+            &crate::model::Intervals::default(),
+            &[],
+            CfPingMode::Icmp,
+        );
+        assert_eq!(remote.pings.unwrap()[0].kind, PingKind::Icmp);
+        assert!(remote.cf_ping_mode.is_none());
     }
 
     #[test]

@@ -36,11 +36,12 @@ server_id = "cf-server-uuid"
 secret = "cf-api-secret"
 url = "https://monitor.example.com/update"
 connection_mode = "auto" # auto = WSS + POST fallback; http = POST only
+ping_mode = "tcp"        # tcp / icmp，统一控制 ct/cu/cm/bd
 interval = 60          # 上报周期(原版 report_interval)
 collect_interval = 0   # 0 = 不额外高频采集
 wss_report_interval = 2 # auto + collect_interval=0 时的实际采集周期
 reset_day = 1          # 流量统计月份重置日
-interface = ""         # 逗号分隔;空 = 全部默认物理网卡
+interface = ""         # 逗号分隔的 Reporter 白名单;空 = 默认排除虚拟/隧道网卡
 ct = "gd-ct-dualstack.ip.zstaticcdn.com:80"
 cu = "gd-cu-dualstack.ip.zstaticcdn.com:80"
 # cm = ""

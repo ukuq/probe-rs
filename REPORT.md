@@ -161,14 +161,14 @@ Agent 不修改系统时间。Agent 启动后会立即运行一次独立的 NTP 
 | `reporters` | array | 本机全部 Reporter 的脱敏摘要，字段见下；不含连接凭据、上报地址及其他线路身份，但会包含 Ping target |
 | `reset_day` | number | 0-31 |
 | `intervals` | object | {collect, report, ping, slow, gpu, ip, diskio}（秒） |
-| `interfaces` | string[] | 网卡白名单（glob）；空 = 所有非虚拟网卡 |
+| `interfaces` | string[] | 网卡白名单（glob）；空 = Reporter 默认排除虚拟/隧道网卡；内部仍采集并记账全部接口 |
 | `disks` | string[] | 卷/物理盘白名单（glob）；空 = 全部 |
 | `enable_gpu` | boolean | 当前 Reporter 是否输出 GPU（沿用 wire 字段名）；任一 Reporter 开启即启动全局 GPU worker |
 | `report_errors` | boolean | 是否上报 errors 错误事件 |
 | `report_self` | boolean | 是否上报探针自身占用 kind:"self" |
 | `pings` | array | 当前 Reporter 的探测需求：`[{name, type: http|tcp|icmp, target, interval?}]`；HTTP target 仅允许 `http(s)://host[:port]`，所有类型均不允许 path/query/fragment |
 
-`reporters[]` 每项包含：`id`、`protocol`、`source_collect_interval`、可选的 `connection_mode` / `wss_report_interval`（仅 CF）、`intervals`、`report_interval`、`reset_day`、`interfaces`、`disks`、`report_gpu`、`report_errors`、`report_self`、`pings`。`source_collect_interval` 保留协议原值（CF 可为 0），`intervals.collect` 是映射后的实际需求；`pings` 保留该 Reporter 自己的原始 `name`、`type`、`target` 和可选 `interval`。
+`reporters[]` 每项包含：`id`、`protocol`、`source_collect_interval`、可选的 `connection_mode` / `ping_mode` / `wss_report_interval`（仅 CF）、`intervals`、`report_interval`、`reset_day`、`interfaces`、`disks`、`report_gpu`、`report_errors`、`report_self`、`pings`。`source_collect_interval` 保留协议原值（CF 可为 0），`intervals.collect` 是映射后的实际需求；`pings` 保留该 Reporter 自己的原始 `name`、`type`、`target` 和可选 `interval`。
 
 安全边界：摘要不会回传 `secret`、`worker_url`，也不会回传其他线路的 `server_id` / `config_version`；Ping 的 `target` 属于配置核对信息，会按原值回传。当前上报线路仍由请求头 `X-Reporter-Id` / `X-Reporter-Protocol` 标识，同级旧字段仍表示当前 Reporter 的完整有效配置。
 
@@ -268,7 +268,7 @@ Ping 聚合规则：机器内部按“类型 + 规范化目标”去重，TCP �
 
 `config` 内除 `config_version` 外的字段均可选：出现的才应用，缺席的保持现值。响应只修改产生该响应的 Reporter，不会影响其他上报线路。
 
-落点随本地协议段不同：probe 段全量落地；CF 原生响应可落 `collect_interval`（允许 0）、`report_interval`、`wss_report_interval`、`connection_mode`、`reset_day`、`interfaces`、`pings`（仅 ct/cu/cm/bd），出现其他项整体拒绝；komari 协议没有下发通道。
+落点随本地协议段不同：probe 段全量落地；CF 原生响应可落 `collect_interval`（允许 0）、`report_interval`、`wss_report_interval`、`connection_mode`、`ping_mode`、`reset_day`、`interfaces`、`pings`（仅 ct/cu/cm/bd），出现其他项整体拒绝；komari 协议没有下发通道。
 
 `server_time`、`config`、`next` 都位于响应信封一级；`config` 缺席表示无配置变更。
 

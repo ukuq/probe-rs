@@ -66,6 +66,7 @@ interface ReporterSummary {
   protocol: string;
   source_collect_interval: number;
   connection_mode?: "auto" | "http";
+  ping_mode?: "tcp" | "icmp";
   wss_report_interval?: number;
   intervals: CollectionIntervals;
   report_interval: number;
@@ -1229,6 +1230,7 @@ function cfConfigString(cf) {
     + '&report_interval=' + (iv.report ?? 60)
     + '&reset_day=' + (cf.reset_day ?? 1)
     + '&schema_version=3'
+    + '&ping_mode=' + (cf.ping_mode || 'tcp')
     + '&custom_ct=' + (pings.ct || '')
     + '&custom_cu=' + (pings.cu || '')
     + '&custom_cm=' + (pings.cm || '')
@@ -2039,6 +2041,7 @@ function cfgReadonlyReporterForm(route) {
       ]),
       cfgGroup('[reporters.cf] · 采集与上报', [
         ['connection_mode', route.connection_mode || 'auto'],
+        ['ping_mode', route.ping_mode || 'tcp'],
         ['interval', route.report_interval != null ? route.report_interval + ' s' : '–'],
         ['wss_report_interval', route.wss_report_interval != null ? route.wss_report_interval + ' s' : '–'],
         ['collect_interval', route.source_collect_interval != null ? route.source_collect_interval + ' s' : '–'],
@@ -2148,8 +2151,8 @@ function cfgCollectionPanel(config, route) {
     ['diskio', intervals.diskio != null ? intervals.diskio + ' s' : '–'],
   ]));
   var interfaces = isGlobal && source.all_interfaces
-    ? '全部默认物理网卡'
-    : cfgList(source.interfaces, isGlobal ? '–' : '全部默认物理网卡');
+    ? '全部接口'
+    : cfgList(source.interfaces, isGlobal ? '–' : '默认出口过滤');
   var disks = isGlobal && source.all_disks
     ? '全部卷 / 物理盘'
     : cfgList(source.disks, isGlobal ? '–' : '全部卷 / 物理盘');
@@ -2380,7 +2383,7 @@ var EXAMPLE_JSON5 = \`{
           "collect": 1, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10
         },
         "enable_gpu": true,                 // 是否实际启动 GPU worker
-        "interfaces": [], "all_interfaces": true, // Reporter 网卡需求并集；true 表示实际采全部默认物理网卡
+        "interfaces": [], "all_interfaces": true, // Reporter 网卡需求并集；true 表示实际采全部接口
         "disks": [], "all_disks": true,     // Reporter 磁盘需求并集；true 表示实际采全部
         "pings": [                           // target URI + 规范化端点去重；全局 worker 没有 Reporter 逻辑 name/type
           { "target": "tcp://gd-ct-dualstack.ip.zstaticcdn.com:80", "interval": 30 },
@@ -2401,7 +2404,7 @@ var EXAMPLE_JSON5 = \`{
         },
         {
           "id": "cf-upstream", "protocol": "cf", "source_collect_interval": 0,
-          "connection_mode": "auto", "wss_report_interval": 2, "report_interval": 30, "reset_day": 1,
+          "connection_mode": "auto", "ping_mode": "tcp", "wss_report_interval": 2, "report_interval": 30, "reset_day": 1,
           "intervals": { "collect": 2, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10 },
           "interfaces": [], "disks": [], "report_gpu": true, "report_errors": false, "report_self": false,
           "pings": [
@@ -2419,7 +2422,7 @@ var EXAMPLE_JSON5 = \`{
       "intervals": {                        // 各间隔（秒），完全独立无关系约束
         "collect": 1, "report": 30, "ping": 30, "slow": 60, "gpu": 60, "ip": 600, "diskio": 10
       },
-      "interfaces": [],                     // 当前 Reporter 网卡白名单；空 = 所有非虚拟网卡
+      "interfaces": [],                     // 当前 Reporter 网卡白名单；空 = 默认排除虚拟/隧道网卡
       "disks": [],                          // 当前 Reporter 卷/物理盘 glob；空 = 全部
       "enable_gpu": true,                   // 当前 Reporter 是否输出 GPU（wire 字段沿用旧名）
       "report_errors": true,                // 是否上报 errors 错误事件
@@ -2493,11 +2496,12 @@ var CONFIG_EXAMPLE_JSON5 = \`{
         "server_id": "cf-panel-uuid", "secret": "cf-api-secret",
         "url": "https://cf.example.com/update",
         "connection_mode": "auto",                // auto = WSS + POST 回退；http = 仅 POST
+        "ping_mode": "tcp",                       // tcp / icmp，统一控制四条 CF Ping
         "interval": 30,                         // 上报周期(原版 report_interval)
         "collect_interval": 0,                  // 0 时按连接模式映射当前 Reporter 的采集需求
         "wss_report_interval": 2,               // auto + collect_interval=0 时使用
         "reset_day": 1,
-        "interface": "",                        // 逗号分隔;空 = 全部默认物理网卡
+        "interface": "",                        // 逗号分隔;空 = Reporter 默认出口过滤
         "ct": "gd-ct-dualstack.ip.zstaticcdn.com:80",
         "cu": "gd-cu-dualstack.ip.zstaticcdn.com:80"
         // cf 线固定:启用 GPU、samples[] 批量；wire 没有 errors/self 落点

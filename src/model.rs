@@ -409,7 +409,7 @@ pub struct CollectConfig {
 }
 
 /// CF 协议段（命名对齐 cfsm-agent：server_id/secret/url/interval/
-/// collect_interval/connection_mode/reset_day/interface/ct/cu/cm/bd）。
+/// collect_interval/connection_mode/ping_mode/reset_day/interface/ct/cu/cm/bd）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CfSection {
@@ -420,6 +420,9 @@ pub struct CfSection {
     /// http = 仅使用 POST /update。
     #[serde(default)]
     pub connection_mode: CfConnectionMode,
+    /// 四大线路的探测模式。HTTP(S) 扩展节点在 tcp 模式下仍保持 HTTP 探测。
+    #[serde(default)]
+    pub ping_mode: CfPingMode,
     /// 上报周期（原版 report_interval）。
     #[serde(default = "default_report_interval")]
     pub interval: u64,
@@ -432,10 +435,10 @@ pub struct CfSection {
     pub wss_report_interval: u64,
     #[serde(default = "default_reset_day")]
     pub reset_day: u8,
-    /// 逗号分隔的网卡列表；空 = 全部默认物理网卡。
+    /// 逗号分隔的 Reporter 网卡白名单；空 = 使用默认出口过滤。
     #[serde(default)]
     pub interface: String,
-    /// 四大线路 TCP Ping 节点；缺席/空 = 不探测该线路。
+    /// 四大线路 Ping 节点；探测类型由 ping_mode 控制，缺席/空 = 不探测。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ct: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -454,6 +457,23 @@ pub enum CfConnectionMode {
     #[default]
     Auto,
     Http,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CfPingMode {
+    #[default]
+    Tcp,
+    Icmp,
+}
+
+impl std::fmt::Display for CfPingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp => f.write_str("tcp"),
+            Self::Icmp => f.write_str("icmp"),
+        }
+    }
 }
 
 impl std::fmt::Display for CfConnectionMode {
@@ -488,7 +508,7 @@ impl CfSection {
         .filter_map(|(name, target)| {
             target
                 .as_deref()
-                .and_then(|target| cf_node_ping(name, target))
+                .and_then(|target| cf_node_ping(name, target, self.ping_mode))
         })
         .collect();
         CollectConfig {
@@ -505,17 +525,21 @@ impl CfSection {
     }
 }
 
-/// CF 四大线路节点沿用原协议的类型推断：HTTP(S) URL 使用 HTTP Ping，
-/// 其余 host[:port] 使用 TCP Ping。空值由配置校验负责报错。
-pub(crate) fn cf_node_ping(name: &str, target: &str) -> Option<PingTarget> {
+/// CF 四大线路节点按全局 ping_mode 选择 ICMP 或 TCP；TCP 模式下的
+/// HTTP(S) URL 仍推断为 HTTP Ping。空值由配置校验负责报错。
+pub(crate) fn cf_node_ping(name: &str, target: &str, ping_mode: CfPingMode) -> Option<PingTarget> {
     if target.trim().is_empty() {
         return None;
     }
     let lowercase = target.to_ascii_lowercase();
-    let kind = if lowercase.starts_with("http://") || lowercase.starts_with("https://") {
-        PingKind::Http
-    } else {
-        PingKind::Tcp
+    let kind = match ping_mode {
+        CfPingMode::Icmp => PingKind::Icmp,
+        CfPingMode::Tcp
+            if lowercase.starts_with("http://") || lowercase.starts_with("https://") =>
+        {
+            PingKind::Http
+        }
+        CfPingMode::Tcp => PingKind::Tcp,
     };
     Some(PingTarget {
         name: name.to_string(),
@@ -693,6 +717,8 @@ pub struct ReporterSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection_mode: Option<CfConnectionMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ping_mode: Option<CfPingMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub wss_report_interval: Option<u64>,
     pub intervals: CollectionIntervals,
     pub report_interval: u64,
@@ -722,12 +748,15 @@ pub struct RemoteConfig {
     pub cf_collect_interval: Option<u64>,
     #[serde(default)]
     pub report_interval: Option<u64>,
-    /// CF Schema 5 的配置 WSS 周期。
+    /// CF Schema 5+ 的配置 WSS 周期。
     #[serde(default)]
     pub wss_report_interval: Option<u64>,
     /// CF Reporter 的连接模式；其他协议忽略。
     #[serde(default)]
     pub connection_mode: Option<CfConnectionMode>,
+    /// CF Schema 6 的四线路 Ping 模式；仅 CF 响应适配层使用。
+    #[serde(skip)]
+    pub cf_ping_mode: Option<CfPingMode>,
     #[serde(default)]
     pub reset_day: Option<u8>,
     #[serde(default)]

@@ -369,6 +369,8 @@ const FIELDS = {
         hint: "首次安装填写完整的 /update 地址；重装留空保持现值" },
       { k: "connection_mode", label: "连接模式", arg: "-connection_mode", type: "select",
         opts: [["", "缺省（保持现状）"], ["auto", "auto（WSS + HTTP 回退）"], ["http", "http（仅 HTTP）"]] },
+      { k: "ping_mode", label: "Ping 模式", arg: "-ping_mode", type: "select",
+        opts: [["", "缺省（保持现状）"], ["tcp", "tcp"], ["icmp", "icmp"]] },
     ]},
     { sec: "采集与上报", items: [
       { k: "collect",  label: "采样间隔（秒）", arg: "-collect_interval", num: true, ph: "缺省保持现状", hint: "0 = 不额外高频采样；内部按连接模式映射实际周期" },
@@ -573,6 +575,7 @@ function buildCF() {
   if (!isValidUpdateRepository(repository)) missing.push("更新仓库（owner/repo）");
   push("-id", v.id); push("-secret", v.secret); push("-url", v.url);
   push("-connection_mode", v.connection_mode);
+  push("-ping_mode", v.ping_mode);
   push("-collect_interval", v.collect); push("-wss_report_interval", v.wss_interval); push("-interval", v.interval);
   push("-reset_day", v.reset_day);
   push("-ct", v.ct); push("-cu", v.cu); push("-cm", v.cm); push("-bd", v.bd);
@@ -789,6 +792,7 @@ function parseCF(rawText) {
     wss_report_interval: "wss_interval", "wss-report-interval": "wss_interval",
     interval: "interval",
     connection_mode: "connection_mode", "connection-mode": "connection_mode",
+    ping_mode: "ping_mode", "ping-mode": "ping_mode",
     reset_day: "reset_day",
     ct: "ct", cu: "cu", cm: "cm", bd: "bd",
     interface: "interfaces", interfaces: "interfaces", iface: "interfaces",
@@ -820,11 +824,11 @@ function parseCF(rawText) {
     if (sourceRepository) map.update_repository = sourceRepository;
   }
   const cfCommand = /(?:cf-install\.sh|huilang-me\/cfsm-agent)/i.test(rawText);
-  const cfSpecific = ["id","secret","url","collect","wss_interval","connection_mode","reset_day","ct","cu","cm","bd","rx_correction","tx_correction"].some(k => map[k] !== undefined);
+  const cfSpecific = ["id","secret","url","collect","wss_interval","connection_mode","ping_mode","reset_day","ct","cu","cm","bd","rx_correction","tx_correction"].some(k => map[k] !== undefined);
   if (!cfCommand && !cfSpecific) return null;
   const v = modeDefaults("cf");
   v.scope = /\|\s*sudo\s+(?:sh|bash)\b/.test(rawText) ? "system" : "user";
-  for (const k of ["id","secret","url","collect","wss_interval","interval","connection_mode","reset_day","ct","cu","cm","bd",
+  for (const k of ["id","secret","url","collect","wss_interval","interval","connection_mode","ping_mode","reset_day","ct","cu","cm","bd",
                    "interfaces","auto_update","update_channel","rx_correction","tx_correction","reporter_id",
                    "update_repository","install_version","ghproxy","bin"]) {
     if (map[k] !== undefined) v[k] = map[k];

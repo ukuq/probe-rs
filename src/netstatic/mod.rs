@@ -358,17 +358,18 @@ impl NetStatic {
                 coarsened |= coarsen_entries(entries, fine_cutoff);
             }
         }
-        // Default-excluded virtual adapters are often ephemeral (containers,
-        // VPNs and bridges). Once absent for a full retention window, their
+        // Legacy virtual adapters are often ephemeral (containers, VPNs and
+        // bridges). Once absent for a full retention window, their
         // per-interface history no longer contributes to normal reports and
         // must not grow the on-disk maps forever. Interfaces without a
         // last_seen value came from an older schema and are kept until they
-        // have first been observed by this version.
+        // have first been observed by this version. Reporter-only tunnel
+        // exclusions deliberately do not participate in this cleanup.
         let stale_virtual: Vec<_> = inner
             .store
             .last_seen
             .iter()
-            .filter(|(name, seen)| **seen < cutoff && net::is_default_excluded(name))
+            .filter(|(name, seen)| **seen < cutoff && net::is_ephemeral_virtual(name))
             .map(|(name, _)| name.clone())
             .collect();
         for interface in &stale_virtual {
@@ -991,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_default_excluded_interfaces_are_reaped_after_retention() {
+    fn stale_ephemeral_virtual_interfaces_are_reaped_after_retention() {
         let (ns, path) = tmp_ns("stale-virtual");
         let start = 1_700_000_000_000_i64;
         let all = IfaceFilter::all();
@@ -1023,6 +1024,28 @@ mod tests {
         assert!(inner.store.archived_totals.contains_key("eth0"));
         assert!(inner.store.last_counters.contains_key("eth0"));
         assert!(inner.store.last_seen.contains_key("eth0"));
+        drop(inner);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn reporter_only_tunnel_exclusions_remain_in_the_ledger() {
+        let (ns, path) = tmp_ns("stale-reporter-tunnel");
+        let start = 1_700_000_000_000_i64;
+        let all = IfaceFilter::all();
+        ns.sample_with(&all, [("wg0", 100, 200)], start, false);
+        ns.sample_with(&all, [("wg0", 110, 220)], start + 1_000, false);
+        ns.sample_with(
+            &all,
+            std::iter::empty::<(&str, u64, u64)>(),
+            start + 1_001 + RETAIN.num_milliseconds(),
+            false,
+        );
+
+        let inner = ns.inner.lock().unwrap();
+        assert!(inner.store.archived_totals.contains_key("wg0"));
+        assert!(inner.store.last_counters.contains_key("wg0"));
+        assert!(inner.store.last_seen.contains_key("wg0"));
         drop(inner);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }

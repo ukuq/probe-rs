@@ -231,8 +231,8 @@ async fn resolve_target(target: &str, kind: PingKind) -> Result<ResolvedTarget> 
             Ok(ResolvedTarget::Http { url, client })
         }
         PingKind::Icmp => {
-            let host = target.trim().trim_matches(['[', ']']);
-            let address = resolve_all(host, 0)
+            let (host, _) = split_host_port(target)?;
+            let address = resolve_all(&host, 0)
                 .await?
                 .into_iter()
                 .next()
