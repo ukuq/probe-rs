@@ -5,7 +5,7 @@
 # CF protocol options through configure-cf-compat.
 set -eu
 
-SCRIPT_VERSION=v0.1.4-beta.5
+SCRIPT_VERSION=v0.1.4-beta.6
 DEFAULT_UPDATE_REPOSITORY=ukuq/probe-rs
 
 log() { printf '%s\n' "[probe-rs] $*"; }
