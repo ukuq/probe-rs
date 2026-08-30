@@ -184,6 +184,7 @@ sudo ./deploy/install.sh       # 装二进制/unit/示例配置；已装过则�
 - unit 加固：`ProtectSystem=strict` + `ReadWritePaths=/var/lib/probe-rs /etc/probe-rs /usr/local/bin`（分别用于流量落盘、配置回写和校验后的原子自替换）；ICMP 使用系统 `ping`，agent 无需 `CAP_NET_RAW`
 - 卸载：`./deploy/install.sh uninstall`（保留配置与数据，加 `--purge` 全清）
 - 一键脚本同样按执行身份选择系统服务或用户服务（换 URL 即可装，参数对齐各官方探针）：CF 模式 `deploy/cf-install.sh`（-id/-secret/-url/-ct/-cu/-cm/-bd）；komari 模式 `deploy/komari-install.sh`（-e 面板地址/-t token/-i 间隔，缺省采集与上报均为 3 秒）
+- Linux CF 一键脚本保持单文件、自包含安装，不加载其他 deploy 脚本；shell 只预读下载、版本、代理、debug/no-start 等安装引导参数，CF 协议参数原样交给 Rust `configure-cf-compat` 统一解析、校验、写配置并应用流量校正。脚本会在停服和替换二进制前检查该子命令，显式选择不兼容的旧版本时安全退出。Komari 安装器暂不调整
 
 ### Windows
 
@@ -207,7 +208,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\deploy\install.ps1 ins
 - 状态/停止：`.\deploy\install.ps1 status` / `.\deploy\install.ps1 stop`；Machine 模式需追加 `-Scope Machine`
 - 卸载：`.\deploy\install.ps1 uninstall`（保留配置与数据，加 `-Purge` 全清）；Machine 模式需追加 `-Scope Machine`
 - Release 资产名为 `probe-rs-windows-x86_64.exe`，可用 `-BinaryPath` 指向下载后的文件
-- CF 与 Komari reporter 均可在 User 或 Machine 模式运行；协议与采集逻辑不依赖安装范围。Windows `cf-install.ps1` 为兼容既有部署仍明确使用 Machine 模式；User 模式可通过通用安装器和配置文件启用 CF/Komari reporter
+- CF 与 Komari reporter 均可在 User 或 Machine 模式运行；协议与采集逻辑不依赖安装范围。Windows `cf-install.ps1` 的新安装默认使用免管理员的 User 模式；需要开机未登录也常驻时，在管理员 PowerShell 中显式传 `-Scope Machine`。为避免升级时启动两个 agent，未传 `-Scope` 且检测到旧 Machine 计划任务时会保持 Machine 模式并要求提权
 
 ## CF 协议模式（`[reporters.cf]` 段）
 
@@ -215,14 +216,14 @@ agent 可切换为 CF-Server-Monitor 的 `/update` 协议（HTTP POST 或 WSS，
 
 **配置**：`[reporters.cf]` 段，命名对齐 cfsm-agent：`server_id` 填 CF 后台分配的 UUID，`secret` 填 `API_SECRET`，`url` 填 `https://<worker>/update`；`interval`（HTTP 上报周期）、`collect_interval`、`wss_report_interval`、`reset_day`、`interface`、`ct/cu/cm/bd` 同原版语义。`connection_mode=auto` 使用 WSS，并在 WSS 不可用时按原上报周期 POST 兜底；`connection_mode=http` 只使用 HTTP POST。`ping_mode=tcp|icmp` 统一控制四条 CF Ping，tcp 模式下的 HTTP(S) URL 仍使用 HTTP 探测。`collect_interval=0` 原值保留，对外仍上报 0；映射当前 CF Reporter 的采集需求时，auto 映射为 `wss_report_interval`，http 映射为 `interval`。连接模式和 Ping 模式都支持本地配置及远端下发热切换。校正回路固定启用，上报固定 samples[] 批量；旧 `ext.cf.connection_mode` 会迁移到直属字段，旧 `ext.cf.correction/batch` 开关已删除。
 
-Windows 使用同一套 CF 协议逻辑；CF 一键安装默认启用 GPU 采集（无 `nvidia-smi` 时记录诊断但不影响其他指标）。可在管理员 PowerShell 中直接一键安装；首次安装必须提供连接三项，重装同一 `ReporterId` 时可省略并保留旧值：
+Windows 使用同一套 CF 协议逻辑；CF 一键安装默认启用 GPU 采集（无 `nvidia-smi` 时记录诊断但不影响其他指标）。默认安装到当前用户，无需管理员权限；首次安装必须提供连接三项，重装同一 `ReporterId` 时可省略并保留旧值：
 
 ```powershell
 .\deploy\cf-install.ps1 install -Id <UUID> -Secret <API_SECRET> `
   -Url https://<worker>/update -CollectInterval 0 -Interval 60 -ConnectionMode auto
 ```
 
-脚本默认下载 `probe-rs-windows-x86_64.exe`，也可用 `-BinarySource`/`-Bin` 指定本地文件或 URL；卸载使用 `.\deploy\cf-install.ps1 uninstall`，加 `-Purge` 可清除配置与流量数据。也可以通过通用 `deploy/install.ps1` 安装后，在 User 模式的 `%LocalAppData%\probe-rs\config.toml` 或 Machine 模式的 `%ProgramData%\probe-rs\config.toml` 中配置 CF reporter。
+如需机器级 SYSTEM 任务，在管理员 PowerShell 中为安装、重装和卸载都传 `-Scope Machine`；旧版 Machine 安装在省略 `-Scope` 时也会被自动识别并保持原 scope。脚本默认下载 `probe-rs-windows-x86_64.exe`，也可用 `-BinarySource`/`-Bin` 指定本地文件或 URL；卸载使用 `.\deploy\cf-install.ps1 uninstall`，加 `-Purge` 可清除当前 scope 的配置与流量数据。User 模式配置位于 `%LocalAppData%\probe-rs\config.toml`，Machine 模式位于 `%ProgramData%\probe-rs\config.toml`。
 
 **上报映射**（reporter_cf.rs）：顶层 `{id, secret, config_schema, config_md5, collect_interval, report_interval, metrics, samples[]}`；ram/swap/disk 字节→MB；load 转空格字符串；GPU → `gpu_info:[{id,name,info}]`（`id` 来自采集端稳定设备标识，显存/温度丢弃，利用率未知的设备不输出）；ping 按组名落 `ping_ct/cu/cm/bd` + `loss_*`（bgp 是 bd 别名，未配置为 `false`，已配置但失败或缓存过期为 `null`）；`ip_v4/v6` 不可达报数值 `0`；`dynamic[]` → `samples[]`。顶层 dynamic/slow/GPU/Ping/disk I/O 快照按各自采集周期与上报周期校验新鲜度，过期字段不再输出；带 `ts` 的 `samples[]` 仍保留历史批量语义，report 不会触发采集。errors/self/virtualization 无落点，CF 模式下不产生。
 

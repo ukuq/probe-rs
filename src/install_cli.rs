@@ -27,6 +27,29 @@ pub async fn run_if_requested() -> Result<bool> {
             println!("{selected}");
             Ok(true)
         }
+        "configure-cf-compat" => {
+            let args = args.collect::<Vec<_>>();
+            if args.as_slice() == ["--help"] {
+                println!(
+                    "Usage: probe-rs configure-cf-compat --config <path> --net-static-path <path> -- <CF installer options>"
+                );
+                return Ok(true);
+            }
+            let options = parse_cf_compat_args(args.into_iter())?;
+            let config_path = options.configure.config_path.clone();
+            let selected = configure_cf(options.configure)?;
+            if options.rx_gib.is_some() || options.tx_gib.is_some() {
+                set_traffic_correction(CorrectionOptions {
+                    config_path,
+                    reporter_id: selected.clone(),
+                    rx_gib: options.rx_gib,
+                    tx_gib: options.tx_gib,
+                })
+                .await?;
+            }
+            println!("{selected}");
+            Ok(true)
+        }
         "set-traffic-correction" => {
             set_traffic_correction(parse_correction_args(args)?).await?;
             Ok(true)
@@ -39,7 +62,7 @@ pub async fn run_if_requested() -> Result<bool> {
         // 一次意外的前台探针启动。
         other if !other.starts_with('-') => {
             bail!(
-                "unknown command: {other} (supported: configure-cf, set-traffic-correction, migrate-config)"
+                "unknown command: {other} (supported: configure-cf, configure-cf-compat, set-traffic-correction, migrate-config)"
             )
         }
         _ => Ok(false),
@@ -85,6 +108,117 @@ struct ConfigureCfOptions {
     update_repository: Option<String>,
     update_channel: Option<UpdateChannel>,
     update_proxys: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ConfigureCfCompatOptions {
+    configure: ConfigureCfOptions,
+    rx_gib: Option<f64>,
+    tx_gib: Option<f64>,
+}
+
+/// Translate the public cfsm-agent installer surface into the canonical
+/// configure command. The shell only needs to inspect options that affect
+/// bootstrap/download/service behavior; all protocol validation lives here.
+fn parse_cf_compat_args(args: impl Iterator<Item = String>) -> Result<ConfigureCfCompatOptions> {
+    let mut args = args;
+    let mut canonical = Vec::new();
+    for required in ["--config", "--net-static-path"] {
+        let flag = args
+            .next()
+            .with_context(|| format!("configure-cf-compat requires {required}"))?;
+        if flag != required {
+            bail!("configure-cf-compat expected {required}, got {flag}");
+        }
+        let value = args
+            .next()
+            .with_context(|| format!("{required} requires a value"))?;
+        canonical.extend([flag, value]);
+    }
+    let separator = args
+        .next()
+        .context("configure-cf-compat requires -- before CF installer options")?;
+    if separator != "--" {
+        bail!("configure-cf-compat requires -- before CF installer options");
+    }
+
+    let mut rx_gib = None;
+    let mut tx_gib = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-update_repository" | "-update-repository" | "--update-repository" => {
+                let value = args
+                    .next()
+                    .with_context(|| format!("{arg} requires a value"))?;
+                canonical.extend(["--update-repository".to_owned(), value]);
+                continue;
+            }
+            "-install-version" | "--install-version" | "-install-ghproxy" | "--install-ghproxy" => {
+                let value = args
+                    .next()
+                    .with_context(|| format!("{arg} requires a value"))?;
+                if matches!(arg.as_str(), "-install-ghproxy" | "--install-ghproxy")
+                    && !value.is_empty()
+                {
+                    canonical.extend(["--update-proxy".to_owned(), value]);
+                }
+                continue;
+            }
+            "-no_start" | "-no-start" => continue,
+            _ => {}
+        }
+
+        let Some((flag, value)) = arg.split_once('=') else {
+            bail!("unknown CF installer option: {arg}");
+        };
+        let canonical_flag = match flag {
+            "-id" => Some("--server-id"),
+            "-secret" => Some("--secret"),
+            "-url" => Some("--url"),
+            "-collect_interval" | "-collect" => Some("--collect"),
+            "-wss_report_interval" | "-wss-report-interval" => Some("--wss-report-interval"),
+            "-interval" => Some("--report-interval"),
+            "-connection_mode" | "-connection-mode" => Some("--connection-mode"),
+            "-ping_mode" | "-ping-mode" => Some("--ping-mode"),
+            "-reset_day" => Some("--reset-day"),
+            "-ct" => Some("--ct"),
+            "-cu" => Some("--cu"),
+            "-cm" => Some("--cm"),
+            "-bd" => Some("--bd"),
+            "-interface" | "-interfaces" | "-iface" => Some("--interfaces"),
+            "-auto_update" | "-auto-update" => Some("--auto-update"),
+            "-update_channel" | "--update-channel" => Some("--update-channel"),
+            "-update_repository" | "-update-repository" | "--update-repository" => {
+                Some("--update-repository")
+            }
+            "-reporter_id" | "--reporter-id" => Some("--reporter-id"),
+            "-install-ghproxy" | "--install-ghproxy" if !value.is_empty() => Some("--update-proxy"),
+            "-rx_correction" => {
+                rx_gib = Some(parse_gib(flag, value)?);
+                None
+            }
+            "-tx_correction" => {
+                tx_gib = Some(parse_gib(flag, value)?);
+                None
+            }
+            "-debug" | "-no_start" | "-no-start" => {
+                parse_bool(flag, value)?;
+                None
+            }
+            "-install-version" | "--install-version" | "-bin" | "--bin" | "-install-ghproxy"
+            | "--install-ghproxy" => None,
+            _ => bail!("unknown CF installer option: {arg}"),
+        };
+        if let Some(flag) = canonical_flag {
+            canonical.extend([flag.to_owned(), value.to_owned()]);
+        }
+    }
+
+    Ok(ConfigureCfCompatOptions {
+        configure: parse_configure_args(canonical.into_iter())?,
+        rx_gib,
+        tx_gib,
+    })
 }
 
 fn parse_configure_args(args: impl Iterator<Item = String>) -> Result<ConfigureCfOptions> {
@@ -654,6 +788,72 @@ mod tests {
     }
 
     #[test]
+    fn cf_compat_parser_owns_protocol_options_and_ignores_bootstrap_options() {
+        let args = vec![
+            "--config".into(),
+            "config.toml".into(),
+            "--net-static-path".into(),
+            "net-static.json".into(),
+            "--".into(),
+            "-id=server-1".into(),
+            "-secret=secret-1".into(),
+            "-url=https://example.com/update".into(),
+            "-collect_interval=0".into(),
+            "-wss_report_interval=3".into(),
+            "-interval=60".into(),
+            "-connection_mode=http".into(),
+            "-ping_mode=icmp".into(),
+            "-interface=eth0,ens*".into(),
+            "-ct=ct.example.com:80".into(),
+            "-auto_update=1".into(),
+            "-reporter_id=custom-cf".into(),
+            "-rx_correction=1.5".into(),
+            "-tx_correction=2.5".into(),
+            "-debug=1".into(),
+            "-no-start".into(),
+            "-install-version".into(),
+            "v1.2.3".into(),
+            "-install-ghproxy=https://proxy.example/".into(),
+            "-bin=/tmp/probe-rs".into(),
+            "-update_repository".into(),
+            "owner/repo".into(),
+        ];
+        let parsed = parse_cf_compat_args(args.into_iter()).unwrap();
+        let options = parsed.configure;
+        assert_eq!(options.server_id.as_deref(), Some("server-1"));
+        assert_eq!(options.collect, Some(0));
+        assert_eq!(options.wss_report_interval, Some(3));
+        assert_eq!(options.connection_mode, Some(CfConnectionMode::Http));
+        assert_eq!(options.ping_mode, Some(CfPingMode::Icmp));
+        assert_eq!(options.interfaces.unwrap(), ["eth0", "ens*"]);
+        assert_eq!(options.reporter_id, "custom-cf");
+        assert_eq!(options.update_repository.as_deref(), Some("owner/repo"));
+        assert_eq!(options.update_proxys, ["https://proxy.example/"]);
+        assert_eq!(parsed.rx_gib, Some(1.5));
+        assert_eq!(parsed.tx_gib, Some(2.5));
+
+        let unknown = vec![
+            "--config".into(),
+            "config.toml".into(),
+            "--net-static-path".into(),
+            "net-static.json".into(),
+            "--".into(),
+            "-not-a-cf-option=1".into(),
+        ];
+        assert!(parse_cf_compat_args(unknown.into_iter()).is_err());
+
+        let path_override = vec![
+            "--config".into(),
+            "config.toml".into(),
+            "--net-static-path".into(),
+            "net-static.json".into(),
+            "--".into(),
+            "--config=other.toml".into(),
+        ];
+        assert!(parse_cf_compat_args(path_override.into_iter()).is_err());
+    }
+
+    #[test]
     fn fresh_config_uses_cf_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -722,19 +922,36 @@ mod tests {
     fn cf_installer_keeps_supported_cli_compatibility_surface() {
         let script = include_str!("../deploy/cf-install.sh");
         for expected in [
-            "REPORTER_ID=cf",
             "-no_start|-no-start) NO_START=true",
             "-install-version|--install-version)",
             "-update_repository|-update-repository|--update-repository)",
             "-install-ghproxy|--install-ghproxy)",
-            "--update-repository \"$UPDATE_REPOSITORY\"",
-            "--update-proxy \"$GH_PROXY\"",
-            "--ping-mode \"$PING_MODE\"",
+            "parse_install_args \"$@\"",
+            "configure-cf-compat",
+            "--net-static-path \"$DATA_DIR/net_static.json\"",
+            "sha256sum",
+            "systemctl",
         ] {
             assert!(script.contains(expected), "missing {expected}");
         }
         assert!(!script.contains("replace_cf"));
         assert!(!script.contains("replace-cf"));
+        assert!(!script.contains("normalize_uint"));
+        assert!(!script.contains("PROBE_RS_INSTALLER"));
+        assert!(!script.contains("probe_managed_install"));
+        assert!(!script.contains("--ping-mode \"$PING_MODE\""));
+
+        let capability_check = script
+            .find("\"$TMP_BIN\" configure-cf-compat --help")
+            .expect("missing compatibility preflight");
+        let stop = script
+            .find("service_ctl stop probe-rs")
+            .expect("missing service stop");
+        let replace = script
+            .find("install -m 0755 \"$TMP_BIN\" \"$BIN_DST\"")
+            .expect("missing binary installation");
+        assert!(capability_check < stop);
+        assert!(capability_check < replace);
     }
 
     #[test]
@@ -826,18 +1043,28 @@ collect = 3
     }
 
     #[test]
-    fn windows_cf_installer_keeps_its_machine_scope_explicit() {
+    fn windows_cf_installer_defaults_to_user_and_keeps_machine_opt_in() {
         let script = include_str!("../deploy/cf-install.ps1");
         for expected in [
-            "& $Installer uninstall -Scope Machine -Purge:$Purge",
-            "& $Installer install -Scope Machine -BinaryPath $resolvedBinary",
-            "& $Installer start -Scope Machine",
+            "[string]$Scope = \"User\"",
+            "& $Installer uninstall -Scope $Scope -Purge:$Purge",
+            "& $Installer install -Scope $Scope -BinaryPath $resolvedBinary",
+            "& $Installer start -Scope $Scope",
+            "GetFolderPath(\"LocalApplicationData\")",
+            "GetFolderPath(\"CommonApplicationData\")",
+            "$DataDir = Join-Path $InstallDir \"data\"",
+            "$ConfigPath = Join-Path $InstallDir \"config.toml\"",
+            "$ConfigPath = Join-Path $DataDir \"config.toml\"",
+            "Existing Machine installation detected; keeping Machine scope.",
+            "restored the previous probe-rs User startup and running state",
             "$GitHubRepo = \"https://github.com/$downloadRepository\"",
             "$configureArgs += @(\"--update-repository\", $UpdateRepository)",
             "$configureArgs += @(\"--ping-mode\", $PingMode.ToLowerInvariant())",
         ] {
             assert!(script.contains(expected), "missing {expected}");
         }
+        assert!(!script.contains("#Requires -RunAsAdministrator"));
+        assert!(!script.contains("& $Installer install -Scope Machine"));
     }
 
     #[test]

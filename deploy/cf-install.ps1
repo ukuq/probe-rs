@@ -1,5 +1,4 @@
 #Requires -Version 5.1
-#Requires -RunAsAdministrator
 
 <#
 .SYNOPSIS
@@ -7,7 +6,14 @@ Installs or updates probe-rs in CF protocol mode on Windows.
 
 .DESCRIPTION
 This installer only manages probe-rs. It does not stop, migrate, or uninstall
-the official cf-probe agent.
+the official cf-probe agent. User scope is the non-admin default; Machine scope
+requires an elevated PowerShell and installs a SYSTEM scheduled task.
+
+.EXAMPLE
+.\cf-install.ps1 install -Id <UUID> -Secret <SECRET> -Url https://example.com/update
+
+.EXAMPLE
+.\cf-install.ps1 install -Scope Machine -Id <UUID> -Secret <SECRET> -Url https://example.com/update
 #>
 
 [CmdletBinding()]
@@ -15,6 +21,9 @@ param(
     [Parameter(Position = 0)]
     [ValidateSet("install", "uninstall")]
     [string]$Action = "install",
+
+    [ValidateSet("Machine", "User")]
+    [string]$Scope = "User",
 
     [Alias("id")]
     [string]$ServerId,
@@ -94,11 +103,29 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Installer = Join-Path $PSScriptRoot "install.ps1"
-$InstallDir = Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "probe-rs"
+$detectedMachineTask = Get-ScheduledTask -TaskName "probe-rs" -ErrorAction SilentlyContinue
+if (-not $PSBoundParameters.ContainsKey("Scope") -and $detectedMachineTask) {
+    # Older cf-install.ps1 releases always used Machine scope. Preserve that
+    # scope on an in-place update instead of starting a duplicate User agent.
+    $Scope = "Machine"
+    Write-Host "Existing Machine installation detected; keeping Machine scope."
+}
+$IsMachine = $Scope -eq "Machine"
+if ($IsMachine) {
+    $InstallDir = Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "probe-rs"
+    $DataDir = Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "probe-rs"
+    $ConfigPath = Join-Path $DataDir "config.toml"
+    $StartupDir = [Environment]::GetFolderPath("CommonStartup")
+}
+else {
+    $InstallDir = Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "probe-rs"
+    $DataDir = Join-Path $InstallDir "data"
+    $ConfigPath = Join-Path $InstallDir "config.toml"
+    $StartupDir = [Environment]::GetFolderPath("Startup")
+}
 $InstalledBinary = Join-Path $InstallDir "probe-rs.exe"
-$DataDir = Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "probe-rs"
-$ConfigPath = Join-Path $DataDir "config.toml"
 $NetStaticPath = Join-Path $DataDir "net_static.json"
+$AgentShortcut = Join-Path $StartupDir "probe-rs-agent.lnk"
 $DefaultUpdateRepository = "ukuq/probe-rs"
 $AssetName = "probe-rs-windows-x86_64.exe"
 
@@ -112,14 +139,47 @@ function ConvertTo-Boolean {
     }
 }
 
+function Get-ShortcutArguments {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return ""
+    }
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        return [string]$shell.CreateShortcut($Path).Arguments
+    }
+    catch {
+        Write-Warning "Could not inspect existing startup shortcut: $($_.Exception.Message)"
+        return ""
+    }
+}
+
+function Get-UserAgentProcesses {
+    if ($IsMachine) {
+        return @()
+    }
+    @(
+        Get-Process -Name "probe-rs" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -eq $InstalledBinary }
+    )
+}
+
 if (-not (Test-Path -LiteralPath $Installer -PathType Leaf)) {
     throw "Windows installer not found: $Installer"
+}
+if ($IsMachine) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "Machine scope requires an elevated administrator PowerShell. Use -Scope User for a non-admin installation."
+    }
 }
 if ($Purge -and $Action -ne "uninstall") {
     throw "-Purge can only be used with uninstall."
 }
 if ($Action -eq "uninstall") {
-    & $Installer uninstall -Scope Machine -Purge:$Purge
+    & $Installer uninstall -Scope $Scope -Purge:$Purge
     exit
 }
 
@@ -174,19 +234,30 @@ if ($PSBoundParameters.ContainsKey("AutoUpdate")) {
 }
 
 # CmdletBinding supplies the common -Debug switch. Reuse it as the agent's
-# persistent debug-log option, and preserve an existing --debug task setting
-# when this installation does not explicitly mention -Debug.
+# persistent debug-log option, and preserve an existing --debug task/shortcut
+# setting when this installation does not explicitly mention -Debug.
 $debugSpecified = $PSBoundParameters.ContainsKey("Debug")
 $debugEnabled = $debugSpecified -and [bool]$PSBoundParameters["Debug"]
-$existingTask = Get-ScheduledTask -TaskName "probe-rs" -ErrorAction SilentlyContinue
+$existingTask = if ($IsMachine) {
+    $detectedMachineTask
+}
+else {
+    $null
+}
 if (-not $debugSpecified) {
     if ($existingTask -and $existingTask.Actions.Arguments -match '(?:^|\s)--debug(?:\s|$)') {
+        $debugEnabled = $true
+    }
+    elseif (-not $IsMachine -and
+        (Get-ShortcutArguments $AgentShortcut) -match '(?:^|\s)--debug(?:\s|$)') {
         $debugEnabled = $true
     }
 }
 $previousTaskEnabled = $false
 $previousTaskRunning = $false
-$taskStateNeedsRestore = $false
+$previousUserEnabled = $false
+$previousUserRunning = $false
+$scopeStateNeedsRestore = $false
 
 $temporaryBinary = $null
 $temporaryChecksums = $null
@@ -291,13 +362,20 @@ try {
         )
     }
 
-    # install.ps1 -NoStart stops and disables an existing task. From this
-    # point onward, any configuration error must restore its previous state.
-    $taskBeforeInstall = Get-ScheduledTask -TaskName "probe-rs" -ErrorAction SilentlyContinue
-    $previousTaskEnabled = $taskBeforeInstall -and [bool]$taskBeforeInstall.Settings.Enabled
-    $previousTaskRunning = $taskBeforeInstall -and ([string]$taskBeforeInstall.State -eq "Running")
-    $taskStateNeedsRestore = [bool]$taskBeforeInstall
-    & $Installer install -Scope Machine -BinaryPath $resolvedBinary -NoStart -DebugLog:$debugEnabled
+    # install.ps1 -NoStart stops the selected scope. From this point onward,
+    # any configuration error must restore its previous enabled/running state.
+    if ($IsMachine) {
+        $taskBeforeInstall = Get-ScheduledTask -TaskName "probe-rs" -ErrorAction SilentlyContinue
+        $previousTaskEnabled = $taskBeforeInstall -and [bool]$taskBeforeInstall.Settings.Enabled
+        $previousTaskRunning = $taskBeforeInstall -and ([string]$taskBeforeInstall.State -eq "Running")
+        $scopeStateNeedsRestore = [bool]$taskBeforeInstall
+    }
+    else {
+        $previousUserEnabled = Test-Path -LiteralPath $AgentShortcut -PathType Leaf
+        $previousUserRunning = @(Get-UserAgentProcesses).Count -gt 0
+        $scopeStateNeedsRestore = $previousUserEnabled -or $previousUserRunning
+    }
+    & $Installer install -Scope $Scope -BinaryPath $resolvedBinary -NoStart -DebugLog:$debugEnabled
 
     $configureArgs = @(
         "configure-cf",
@@ -392,46 +470,59 @@ try {
         Write-Host "CF mode installed without starting. Reporter: $selectedReporter"
     }
     else {
-        & $Installer start -Scope Machine
+        & $Installer start -Scope $Scope -DebugLog:$debugEnabled
         Write-Host "CF mode installed and started. Reporter: $selectedReporter"
     }
     Write-Host "Config: $ConfigPath"
-    $taskStateNeedsRestore = $false
+    $scopeStateNeedsRestore = $false
 }
 catch {
     $installError = $_
-    if ($taskStateNeedsRestore) {
+    if ($scopeStateNeedsRestore) {
         try {
-            $restoredTask = Get-ScheduledTask -TaskName "probe-rs" -ErrorAction Stop
-            if ($previousTaskRunning) {
-                Enable-ScheduledTask -TaskName "probe-rs" | Out-Null
-                $runningRestored = $false
-                for ($attempt = 0; $attempt -lt 15; $attempt++) {
-                    Start-ScheduledTask -TaskName "probe-rs" -ErrorAction SilentlyContinue
-                    Start-Sleep -Milliseconds 200
-                    $restoredTask = Get-ScheduledTask -TaskName "probe-rs" -ErrorAction Stop
-                    if ([string]$restoredTask.State -eq "Running") {
-                        $runningRestored = $true
-                        break
+            if ($IsMachine) {
+                $restoredTask = Get-ScheduledTask -TaskName "probe-rs" -ErrorAction Stop
+                if ($previousTaskRunning) {
+                    Enable-ScheduledTask -TaskName "probe-rs" | Out-Null
+                    $runningRestored = $false
+                    for ($attempt = 0; $attempt -lt 15; $attempt++) {
+                        Start-ScheduledTask -TaskName "probe-rs" -ErrorAction SilentlyContinue
+                        Start-Sleep -Milliseconds 200
+                        $restoredTask = Get-ScheduledTask -TaskName "probe-rs" -ErrorAction Stop
+                        if ([string]$restoredTask.State -eq "Running") {
+                            $runningRestored = $true
+                            break
+                        }
+                    }
+                    if (-not $runningRestored) {
+                        throw "The probe-rs task did not return to the Running state."
                     }
                 }
-                if (-not $runningRestored) {
-                    throw "The probe-rs task did not return to the Running state."
+                else {
+                    Stop-ScheduledTask -TaskName "probe-rs" -ErrorAction SilentlyContinue
                 }
+                if ($previousTaskEnabled) {
+                    Enable-ScheduledTask -TaskName "probe-rs" | Out-Null
+                }
+                else {
+                    Disable-ScheduledTask -TaskName "probe-rs" | Out-Null
+                }
+                Write-Warning "CF installation failed; restored the previous probe-rs Machine task state."
             }
             else {
-                Stop-ScheduledTask -TaskName "probe-rs" -ErrorAction SilentlyContinue
+                & $Installer start -Scope User -DebugLog:$debugEnabled
+                if (-not $previousUserRunning) {
+                    & $Installer stop -Scope User
+                }
+                if (-not $previousUserEnabled -and
+                    (Test-Path -LiteralPath $AgentShortcut -PathType Leaf)) {
+                    Remove-Item -LiteralPath $AgentShortcut -Force
+                }
+                Write-Warning "CF installation failed; restored the previous probe-rs User startup and running state."
             }
-            if ($previousTaskEnabled) {
-                Enable-ScheduledTask -TaskName "probe-rs" | Out-Null
-            }
-            else {
-                Disable-ScheduledTask -TaskName "probe-rs" | Out-Null
-            }
-            Write-Warning "CF installation failed; restored the previous probe-rs task state."
         }
         catch {
-            Write-Warning "CF installation failed and the previous probe-rs task state could not be restored: $($_.Exception.Message)"
+            Write-Warning "CF installation failed and the previous probe-rs $Scope state could not be restored: $($_.Exception.Message)"
         }
     }
     throw $installError

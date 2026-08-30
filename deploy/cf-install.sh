@@ -1,6 +1,8 @@
 #!/bin/sh
 # probe-rs CF mode installer. POSIX sh compatible, including:
 #   curl -fsSL <url>/cf-install.sh | sh -s -- install -id=... -secret=... -url=...
+# The shell only bootstraps the binary/service. Rust parses and validates all
+# CF protocol options through configure-cf-compat.
 set -eu
 
 SCRIPT_VERSION=v0.1.4-beta.5
@@ -94,13 +96,6 @@ parse_bool() {
     esac
 }
 
-normalize_uint() {
-    case "$2" in ''|*[!0-9]*) die "$1 must be a non-negative integer" ;; esac
-    normalized=$(printf '%s' "$2" | sed 's/^0*//')
-    [ -n "$normalized" ] || normalized=0
-    printf '%s' "$normalized"
-}
-
 do_uninstall() {
     service_ctl disable --now probe-rs 2>/dev/null || true
     rm -f "$UNIT_DST" "$BIN_DST"
@@ -124,112 +119,55 @@ case "$COMMAND" in
     *) usage; exit 1 ;;
 esac
 
-ID= SECRET= URL= BIN=
-COLLECT= WSS_REPORT= REPORT= RESET_DAY= INTERFACES= CONNECTION_MODE= PING_MODE=
-CT= CU= CM= BD=
-AUTO_UPDATE= UPDATE_REPOSITORY= UPDATE_CHANNEL= RX_CORRECTION= TX_CORRECTION=
-REPORTER_ID=cf INSTALL_VERSION=$SCRIPT_VERSION GH_PROXY=
+BIN= UPDATE_REPOSITORY= INSTALL_VERSION=$SCRIPT_VERSION GH_PROXY=
 DEBUG=false NO_START=false
-ID_SET=false SECRET_SET=false URL_SET=false
-COLLECT_SET=false WSS_REPORT_SET=false REPORT_SET=false RESET_SET=false INTERFACES_SET=false CONNECTION_MODE_SET=false PING_MODE_SET=false
-CT_SET=false CU_SET=false CM_SET=false BD_SET=false
-AUTO_UPDATE_SET=false UPDATE_REPOSITORY_SET=false UPDATE_CHANNEL_SET=false
-RX_SET=false TX_SET=false DEBUG_SET=false
+UPDATE_REPOSITORY_SET=false DEBUG_SET=false
 
-while [ "$#" -gt 0 ]; do
-    arg=$1
-    shift
-    case "$arg" in
-        -id=*) ID=${arg#*=}; ID_SET=true ;;
-        -secret=*) SECRET=${arg#*=}; SECRET_SET=true ;;
-        -url=*) URL=${arg#*=}; URL_SET=true ;;
-        -collect_interval=*|-collect=*) COLLECT=${arg#*=}; COLLECT_SET=true ;;
-        -wss_report_interval=*|-wss-report-interval=*) WSS_REPORT=${arg#*=}; WSS_REPORT_SET=true ;;
-        -interval=*) REPORT=${arg#*=}; REPORT_SET=true ;;
-        -connection_mode=*|-connection-mode=*) CONNECTION_MODE=${arg#*=}; CONNECTION_MODE_SET=true ;;
-        -ping_mode=*|-ping-mode=*) PING_MODE=${arg#*=}; PING_MODE_SET=true ;;
-        -reset_day=*) RESET_DAY=${arg#*=}; RESET_SET=true ;;
-        -ct=*) CT=${arg#*=}; CT_SET=true ;;
-        -cu=*) CU=${arg#*=}; CU_SET=true ;;
-        -cm=*) CM=${arg#*=}; CM_SET=true ;;
-        -bd=*) BD=${arg#*=}; BD_SET=true ;;
-        -interface=*|-interfaces=*|-iface=*) INTERFACES=${arg#*=}; INTERFACES_SET=true ;;
-        -auto_update=*|-auto-update=*)
-            AUTO_UPDATE=${arg#*=}; AUTO_UPDATE_SET=true
-            parse_bool AUTO_UPDATE "$AUTO_UPDATE" "auto_update"
-            ;;
-        -update_channel=*|--update-channel=*)
-            UPDATE_CHANNEL=${arg#*=}; UPDATE_CHANNEL_SET=true
-            ;;
-        -update_repository=*|-update-repository=*|--update-repository=*)
-            UPDATE_REPOSITORY=${arg#*=}; UPDATE_REPOSITORY_SET=true
-            ;;
-        -update_repository|-update-repository|--update-repository)
-            [ "$#" -gt 0 ] || die "$arg requires a value"
-            UPDATE_REPOSITORY=$1; UPDATE_REPOSITORY_SET=true
-            shift
-            ;;
-        -rx_correction=*) RX_CORRECTION=${arg#*=}; RX_SET=true ;;
-        -tx_correction=*) TX_CORRECTION=${arg#*=}; TX_SET=true ;;
-        -reporter_id=*|--reporter-id=*)
-            REPORTER_ID=${arg#*=}
-            ;;
-        -debug=*)
-            DEBUG=${arg#*=}; DEBUG_SET=true
-            parse_bool DEBUG "$DEBUG" "debug"
-            ;;
-        -no_start=*|-no-start=*)
-            NO_START=${arg#*=}
-            parse_bool NO_START "$NO_START" "no_start"
-            ;;
-        -no_start|-no-start) NO_START=true ;;
-        -install-version=*|--install-version=*) INSTALL_VERSION=${arg#*=} ;;
-        -install-version|--install-version)
-            [ "$#" -gt 0 ] || die "$arg requires a value"
-            INSTALL_VERSION=$1
-            shift
-            ;;
-        -install-ghproxy=*|--install-ghproxy=*) GH_PROXY=${arg#*=} ;;
-        -install-ghproxy|--install-ghproxy)
-            [ "$#" -gt 0 ] || die "$arg requires a value"
-            GH_PROXY=$1
-            shift
-            ;;
-        -bin=*|--bin=*) BIN=${arg#*=} ;;
-        *) die "unknown option: $arg" ;;
-    esac
-done
+# Only inspect options needed before the downloaded binary can run. The
+# original argument vector remains untouched and is validated by Rust below.
+parse_install_args() {
+    while [ "$#" -gt 0 ]; do
+        arg=$1
+        shift
+        case "$arg" in
+            -update_repository=*|-update-repository=*|--update-repository=*)
+                UPDATE_REPOSITORY=${arg#*=}; UPDATE_REPOSITORY_SET=true
+                ;;
+            -update_repository|-update-repository|--update-repository)
+                [ "$#" -gt 0 ] || die "$arg requires a value"
+                UPDATE_REPOSITORY=$1; UPDATE_REPOSITORY_SET=true
+                shift
+                ;;
+            -debug=*)
+                DEBUG=${arg#*=}; DEBUG_SET=true
+                parse_bool DEBUG "$DEBUG" "debug"
+                ;;
+            -no_start=*|-no-start=*)
+                NO_START=${arg#*=}
+                parse_bool NO_START "$NO_START" "no_start"
+                ;;
+            -no_start|-no-start) NO_START=true ;;
+            -install-version=*|--install-version=*) INSTALL_VERSION=${arg#*=} ;;
+            -install-version|--install-version)
+                [ "$#" -gt 0 ] || die "$arg requires a value"
+                INSTALL_VERSION=$1
+                shift
+                ;;
+            -install-ghproxy=*|--install-ghproxy=*) GH_PROXY=${arg#*=} ;;
+            -install-ghproxy|--install-ghproxy)
+                [ "$#" -gt 0 ] || die "$arg requires a value"
+                GH_PROXY=$1
+                shift
+                ;;
+            -bin=*|--bin=*) BIN=${arg#*=} ;;
+            *) : ;;
+        esac
+    done
+}
 
-[ "$ID_SET" = false ] || [ -n "$ID" ] || die "id must not be empty"
-[ "$SECRET_SET" = false ] || [ -n "$SECRET" ] || die "secret must not be empty"
-[ "$URL_SET" = false ] || [ -n "$URL" ] || die "url must not be empty"
+parse_install_args "$@"
 require_service_manager
 
-if [ "$COLLECT_SET" = true ]; then
-    COLLECT=$(normalize_uint collect_interval "$COLLECT")
-fi
-if [ "$WSS_REPORT_SET" = true ]; then
-    WSS_REPORT=$(normalize_uint wss_report_interval "$WSS_REPORT")
-    [ "$WSS_REPORT" -ge 1 ] && [ "$WSS_REPORT" -le 5 ] || die "wss_report_interval must be between 1 and 5"
-fi
-if [ "$REPORT_SET" = true ]; then
-    REPORT=$(normalize_uint interval "$REPORT")
-    [ "$REPORT" -gt 0 ] || die "interval must be at least 1"
-fi
-if [ "$CONNECTION_MODE_SET" = true ]; then
-    case "$CONNECTION_MODE" in auto|http) ;; *) die "connection_mode must be auto or http" ;; esac
-fi
-if [ "$PING_MODE_SET" = true ]; then
-    case "$PING_MODE" in tcp|icmp) ;; *) die "ping_mode must be tcp or icmp" ;; esac
-fi
-if [ "$RESET_SET" = true ]; then
-    RESET_DAY=$(normalize_uint reset_day "$RESET_DAY")
-    [ "$RESET_DAY" -le 31 ] || die "reset_day must be between 0 and 31"
-fi
-case "$REPORTER_ID" in ''|*[!A-Za-z0-9_.-]*) die "invalid reporter_id" ;; esac
-if [ "$UPDATE_CHANNEL_SET" = true ]; then
-    case "$UPDATE_CHANNEL" in stable|prerelease) ;; *) die "invalid update_channel" ;; esac
-fi
 if [ "$UPDATE_REPOSITORY_SET" = true ]; then
     case "$UPDATE_REPOSITORY" in
         ''|/*|*/|*/*/*|./*|../*|*/.|*/..|*[!A-Za-z0-9_./-]*) die "update_repository must use owner/repo" ;;
@@ -328,6 +266,13 @@ else
 fi
 chmod 0755 "$TMP_BIN"
 
+# configure-cf-compat owns the legacy CF argument surface. Check support before
+# stopping the existing service or replacing its executable, so explicitly
+# selected older releases fail without disturbing a working installation.
+if ! "$TMP_BIN" configure-cf-compat --help >/dev/null 2>&1; then
+    die "the selected probe-rs binary does not support this CF installer; use $SCRIPT_VERSION or a compatible -bin"
+fi
+
 if command -v pgrep >/dev/null 2>&1 && pgrep -x cf-probe >/dev/null 2>&1; then
     log "warning: official cf-probe is still running; using the same credentials will duplicate reports"
 fi
@@ -338,37 +283,13 @@ fi
 
 install -m 0755 "$TMP_BIN" "$BIN_DST"
 
-set -- configure-cf --config "$CONFIG_PATH" --net-static-path "$DATA_DIR/net_static.json" \
-    --reporter-id "$REPORTER_ID"
-[ "$ID_SET" = false ] || set -- "$@" --server-id "$ID"
-[ "$SECRET_SET" = false ] || set -- "$@" --secret "$SECRET"
-[ "$URL_SET" = false ] || set -- "$@" --url "$URL"
-[ "$COLLECT_SET" = false ] || set -- "$@" --collect "$COLLECT"
-[ "$WSS_REPORT_SET" = false ] || set -- "$@" --wss-report-interval "$WSS_REPORT"
-[ "$REPORT_SET" = false ] || set -- "$@" --report-interval "$REPORT"
-[ "$CONNECTION_MODE_SET" = false ] || set -- "$@" --connection-mode "$CONNECTION_MODE"
-[ "$PING_MODE_SET" = false ] || set -- "$@" --ping-mode "$PING_MODE"
-[ "$RESET_SET" = false ] || set -- "$@" --reset-day "$RESET_DAY"
-[ "$INTERFACES_SET" = false ] || set -- "$@" --interfaces "$INTERFACES"
-[ "$CT_SET" = false ] || set -- "$@" --ct "$CT"
-[ "$CU_SET" = false ] || set -- "$@" --cu "$CU"
-[ "$CM_SET" = false ] || set -- "$@" --cm "$CM"
-[ "$BD_SET" = false ] || set -- "$@" --bd "$BD"
-[ "$AUTO_UPDATE_SET" = false ] || set -- "$@" --auto-update "$AUTO_UPDATE"
-[ "$UPDATE_REPOSITORY_SET" = false ] || set -- "$@" --update-repository "$UPDATE_REPOSITORY"
-[ "$UPDATE_CHANNEL_SET" = false ] || set -- "$@" --update-channel "$UPDATE_CHANNEL"
-[ -z "$GH_PROXY" ] || set -- "$@" --update-proxy "$GH_PROXY"
-SELECTED_REPORTER=$($BIN_DST "$@")
+SELECTED_REPORTER=$("$BIN_DST" configure-cf-compat \
+    --config "$CONFIG_PATH" \
+    --net-static-path "$DATA_DIR/net_static.json" \
+    -- \
+    "$@")
 [ -n "$SELECTED_REPORTER" ] || die "CF Reporter selection failed"
 chmod 600 "$CONFIG_PATH"
-
-if [ "$RX_SET" = true ] || [ "$TX_SET" = true ]; then
-    set -- set-traffic-correction --config "$CONFIG_PATH" --reporter-id "$SELECTED_REPORTER"
-    [ "$RX_SET" = false ] || set -- "$@" --rx-gib "$RX_CORRECTION"
-    [ "$TX_SET" = false ] || set -- "$@" --tx-gib "$TX_CORRECTION"
-    $BIN_DST "$@"
-    log "applied local traffic correction to Reporter '$SELECTED_REPORTER'"
-fi
 
 DEBUG_ARG=
 [ "$DEBUG" = false ] || DEBUG_ARG=' --debug'
