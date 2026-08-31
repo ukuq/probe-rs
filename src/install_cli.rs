@@ -4,6 +4,8 @@
 //! two subtly different shell/PowerShell parsers. These commands are not a
 //! remote execution surface: they only operate on explicit local paths.
 
+mod cf_conflicts;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -22,6 +24,20 @@ pub async fn run_if_requested() -> Result<bool> {
         return Ok(false);
     };
     match command.as_str() {
+        "detect-cf-conflicts" => {
+            let args = args.collect::<Vec<_>>();
+            if args.as_slice() == ["--help"] {
+                println!("Usage: probe-rs detect-cf-conflicts");
+                return Ok(true);
+            }
+            if !args.is_empty() {
+                bail!("detect-cf-conflicts does not accept options");
+            }
+            for conflict in cf_conflicts::detect() {
+                println!("- {conflict}");
+            }
+            Ok(true)
+        }
         "configure-cf" => {
             let selected = configure_cf(parse_configure_args(args)?)?;
             println!("{selected}");
@@ -62,7 +78,7 @@ pub async fn run_if_requested() -> Result<bool> {
         // 一次意外的前台探针启动。
         other if !other.starts_with('-') => {
             bail!(
-                "unknown command: {other} (supported: configure-cf, configure-cf-compat, set-traffic-correction, migrate-config)"
+                "unknown command: {other} (supported: detect-cf-conflicts, configure-cf, configure-cf-compat, set-traffic-correction, migrate-config)"
             )
         }
         _ => Ok(false),
@@ -164,7 +180,11 @@ fn parse_cf_compat_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
                 }
                 continue;
             }
-            "-no_start" | "-no-start" => continue,
+            "-no_start"
+            | "-no-start"
+            | "-allow_cf_conflict"
+            | "-allow-cf-conflict"
+            | "--allow-cf-conflict" => continue,
             _ => {}
         }
 
@@ -201,7 +221,12 @@ fn parse_cf_compat_args(args: impl Iterator<Item = String>) -> Result<ConfigureC
                 tx_gib = Some(parse_gib(flag, value)?);
                 None
             }
-            "-debug" | "-no_start" | "-no-start" => {
+            "-debug"
+            | "-no_start"
+            | "-no-start"
+            | "-allow_cf_conflict"
+            | "-allow-cf-conflict"
+            | "--allow-cf-conflict" => {
                 parse_bool(flag, value)?;
                 None
             }
@@ -811,6 +836,7 @@ mod tests {
             "-tx_correction=2.5".into(),
             "-debug=1".into(),
             "-no-start".into(),
+            "-allow_cf_conflict=1".into(),
             "-install-version".into(),
             "v1.2.3".into(),
             "-install-ghproxy=https://proxy.example/".into(),
@@ -907,7 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn deploy_generator_defaults_to_user_scope_and_complete_cf_url() {
+    fn deploy_generator_keeps_cf_form_to_identity_and_local_install_options() {
         let generator = include_str!("../deploy/deploy-generator.html");
         assert!(generator.starts_with("<!doctype html>"));
         assert!(generator.contains(r#"def: "user""#));
@@ -915,19 +941,64 @@ mod tests {
         assert!(generator.contains("首次安装填写完整的 /update 地址"));
         assert!(generator.contains("更新仓库"));
         assert!(generator.contains("-update_repository"));
-        assert!(generator.contains("-ping_mode"));
+        assert!(generator.contains("-allow_cf_conflict=1"));
+        let cf_fields = generator
+            .split_once("  cf: [")
+            .expect("missing CF fields")
+            .1
+            .split_once("  komari: [")
+            .expect("missing Komari fields")
+            .0;
+        let build_cf = generator
+            .split_once("function buildCF()")
+            .expect("missing CF command builder")
+            .1
+            .split_once("function buildKomari()")
+            .expect("missing Komari command builder")
+            .0;
+        for remote_managed in [
+            "-connection_mode",
+            "-ping_mode",
+            "-collect_interval",
+            "-wss_report_interval",
+            "-interval",
+            "-reset_day",
+            "-ct",
+            "-cu",
+            "-cm",
+            "-bd",
+            "-interface",
+            "-rx_correction",
+            "-tx_correction",
+            "-debug=0/1",
+            "-no_start=1",
+            "-bin",
+        ] {
+            let token = format!("\"{remote_managed}\"");
+            assert!(
+                !cf_fields.contains(&token) && !build_cf.contains(&token),
+                "CF generator still exposes {remote_managed}"
+            );
+        }
     }
 
     #[test]
     fn cf_installer_keeps_supported_cli_compatibility_surface() {
         let script = include_str!("../deploy/cf-install.sh");
         for expected in [
+            "-debug=*)",
+            "ALLOW_CF_CONFLICT=false",
             "-no_start|-no-start) NO_START=true",
+            "-allow_cf_conflict|-allow-cf-conflict|--allow-cf-conflict) ALLOW_CF_CONFLICT=true",
             "-install-version|--install-version)",
             "-update_repository|-update-repository|--update-repository)",
             "-install-ghproxy|--install-ghproxy)",
+            "-bin=*|--bin=*)",
             "parse_install_args \"$@\"",
             "configure-cf-compat",
+            "detect-cf-conflicts",
+            "if [ \"$ALLOW_CF_CONFLICT\" != true ]",
+            "explicitly rerun with -allow_cf_conflict=1",
             "--net-static-path \"$DATA_DIR/net_static.json\"",
             "sha256sum",
             "systemctl",
@@ -947,10 +1018,14 @@ mod tests {
         let stop = script
             .find("service_ctl stop probe-rs")
             .expect("missing service stop");
+        let conflict_check = script
+            .find("CF_CONFLICTS=$(\"$TMP_BIN\" detect-cf-conflicts)")
+            .expect("missing official CF agent conflict check");
         let replace = script
             .find("install -m 0755 \"$TMP_BIN\" \"$BIN_DST\"")
             .expect("missing binary installation");
         assert!(capability_check < stop);
+        assert!(conflict_check < stop);
         assert!(capability_check < replace);
     }
 
@@ -1056,6 +1131,10 @@ collect = 3
             "$ConfigPath = Join-Path $InstallDir \"config.toml\"",
             "$ConfigPath = Join-Path $DataDir \"config.toml\"",
             "Existing Machine installation detected; keeping Machine scope.",
+            "[switch]$AllowCfConflict",
+            "detect-cf-conflicts",
+            "if (-not $AllowCfConflict)",
+            "explicitly rerun with -AllowCfConflict",
             "restored the previous probe-rs User startup and running state",
             "$GitHubRepo = \"https://github.com/$downloadRepository\"",
             "$configureArgs += @(\"--update-repository\", $UpdateRepository)",
@@ -1063,6 +1142,13 @@ collect = 3
         ] {
             assert!(script.contains(expected), "missing {expected}");
         }
+        let conflict_check = script
+            .find("$cfConflicts = @(& $resolvedBinary detect-cf-conflicts)")
+            .expect("missing Windows official CF agent conflict check");
+        let install = script
+            .find("& $Installer install -Scope $Scope -BinaryPath $resolvedBinary")
+            .expect("missing Windows installation call");
+        assert!(conflict_check < install);
         assert!(!script.contains("#Requires -RunAsAdministrator"));
         assert!(!script.contains("& $Installer install -Scope Machine"));
     }

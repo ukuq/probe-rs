@@ -43,6 +43,7 @@ struct Candidate {
 enum CheckOutcome {
     Unchanged,
     Restart,
+    #[cfg(windows)]
     InstalledPendingRestart,
 }
 
@@ -99,6 +100,7 @@ pub fn spawn(
                         shutdown_tx.send_replace(true);
                         return;
                     }
+                    #[cfg(windows)]
                     Ok(CheckOutcome::InstalledPendingRestart) => {
                         tracing::warn!(
                             "update installed but automatic restart could not be scheduled; the new version will run after the next service restart"

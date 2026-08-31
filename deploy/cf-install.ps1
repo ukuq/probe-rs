@@ -6,8 +6,10 @@ Installs or updates probe-rs in CF protocol mode on Windows.
 
 .DESCRIPTION
 This installer only manages probe-rs. It does not stop, migrate, or uninstall
-the official cf-probe agent. User scope is the non-admin default; Machine scope
-requires an elevated PowerShell and installs a SYSTEM scheduled task.
+the official cf-probe agent. When one is detected, installation is refused
+unless -AllowCfConflict is explicitly supplied. User scope is the non-admin
+default; Machine scope requires an elevated PowerShell and installs a SYSTEM
+scheduled task.
 
 .EXAMPLE
 .\cf-install.ps1 install -Id <UUID> -Secret <SECRET> -Url https://example.com/update
@@ -88,6 +90,9 @@ param(
 
     [Alias("no_start", "no-start")]
     [switch]$NoStart,
+
+    [Alias("allow_cf_conflict", "allow-cf-conflict")]
+    [switch]$AllowCfConflict,
 
     [Alias("install_version", "install-version")]
     [string]$InstallVersion = "v0.1.4-beta.6",
@@ -355,11 +360,23 @@ try {
         }
     }
 
-    if (Get-Process -Name "cf-probe" -ErrorAction SilentlyContinue) {
-        Write-Warning (
-            "Official cf-probe is still running. Using the same credentials " +
-            "will duplicate reports; this installer will not stop or remove it."
-        )
+    & $resolvedBinary detect-cf-conflicts --help *> $null
+    if ($LASTEXITCODE -ne 0) {
+        throw "The selected probe-rs binary does not support this CF installer; use $InstallVersion or a compatible -BinarySource."
+    }
+    $cfConflicts = @(& $resolvedBinary detect-cf-conflicts)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Official CF agent conflict detection failed with exit code $LASTEXITCODE."
+    }
+    if ($cfConflicts.Count -gt 0) {
+        Write-Warning "An official CF agent installation was detected; running both agents may duplicate reports."
+        foreach ($conflict in $cfConflicts) {
+            Write-Warning ([string]$conflict)
+        }
+        if (-not $AllowCfConflict) {
+            throw "Installation refused. Uninstall the existing CF agent or explicitly rerun with -AllowCfConflict."
+        }
+        Write-Warning "-AllowCfConflict was specified; continuing with both CF agents installed."
     }
 
     # install.ps1 -NoStart stops the selected scope. From this point onward,

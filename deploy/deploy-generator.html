@@ -366,29 +366,7 @@ const FIELDS = {
       { k: "id",     label: "服务器 ID", arg: "-id",     ph: "首次安装必填；重装留空保持", mono: true },
       { k: "secret", label: "密钥 Secret", arg: "-secret", ph: "首次安装必填；重装留空保持", mono: true },
       { k: "url",    label: "上报地址 URL", arg: "-url",  ph: "https://monitor.example.com/update", mono: true,
-        hint: "首次安装填写完整的 /update 地址；重装留空保持现值" },
-      { k: "connection_mode", label: "连接模式", arg: "-connection_mode", type: "select",
-        opts: [["", "缺省（保持现状）"], ["auto", "auto（WSS + HTTP 回退）"], ["http", "http（仅 HTTP）"]] },
-      { k: "ping_mode", label: "Ping 模式", arg: "-ping_mode", type: "select",
-        opts: [["", "缺省（保持现状）"], ["tcp", "tcp"], ["icmp", "icmp"]] },
-    ]},
-    { sec: "采集与上报", items: [
-      { k: "collect",  label: "采样间隔（秒）", arg: "-collect_interval", num: true, ph: "缺省保持现状", hint: "0 = 不额外高频采样；内部按连接模式映射实际周期" },
-      { k: "wss_interval", label: "WSS 上报间隔（秒）", arg: "-wss_report_interval", num: true, min: 1, max: 5, ph: "缺省 2",
-        hint: "1-5；auto + collect_interval=0 时映射为当前 Reporter 的实际采集周期" },
-      { k: "interval", label: "上报间隔（秒）", arg: "-interval", num: true, ph: "缺省 60" },
-      { k: "reset_day", label: "流量重置日", arg: "-reset_day", num: true, ph: "0-31，0 = 不重置" },
-    ]},
-    { sec: "Ping 目标", items: [
-      { k: "ct", label: "CT 电信节点", arg: "-ct", ph: "host:port", mono: true },
-      { k: "cu", label: "CU 联通节点", arg: "-cu", ph: "host:port", mono: true },
-      { k: "cm", label: "CM 移动节点", arg: "-cm", ph: "host:port", mono: true },
-      { k: "bd", label: "BD 广播节点", arg: "-bd", ph: "host:port", mono: true },
-    ]},
-    { sec: "网卡与流量校正", items: [
-      { k: "interfaces", label: "网卡白名单", arg: "-interface", ph: "eth0,ens3（留空 = 全部）", mono: true },
-      { k: "rx_correction", label: "下行流量校正", arg: "-rx_correction", num: true, ph: "GiB，覆盖本月下行" },
-      { k: "tx_correction", label: "上行流量校正", arg: "-tx_correction", num: true, ph: "GiB，覆盖本月上行" },
+        hint: "首次安装填写完整的 /update 地址；采集、上报、Ping、网卡和流量校正由 CF 面板下发" },
     ]},
     { sec: "安装行为", items: [
       { k: "scope", label: "安装范围", type: "select", def: "user",
@@ -404,10 +382,9 @@ const FIELDS = {
       { k: "install_version", label: "安装版本", arg: "-install-version", ph: "缺省脚本内置 " + SCRIPT_VERSION, mono: true },
       { k: "ghproxy", label: "GitHub 代理前缀", arg: "-install-ghproxy", ph: "https://mirror.example.com/", mono: true,
         hint: "安装与自动更新均先直连，失败后再尝试代理" },
-      { k: "bin", label: "自定义二进制来源", arg: "-bin", ph: "本地路径或 HTTP(S) URL", mono: true },
     ], flags: [
-      { k: "debug",      label: "调试日志", arg: "-debug=0/1", hint: "开启时添加 --debug；关闭时明确移除" },
-      { k: "no_start",   label: "只装不启动", arg: "-no_start=1" },
+      { k: "allow_cf_conflict", label: "允许与官方 CF 探针共存", arg: "-allow_cf_conflict=1",
+        hint: "默认检测到 Go/Shell 版官方探针就拒绝安装；仅确认需要同时运行时开启" },
     ]},
   ],
 
@@ -574,19 +551,11 @@ function buildCF() {
   const repository = String(v.update_repository || "").trim();
   if (!isValidUpdateRepository(repository)) missing.push("更新仓库（owner/repo）");
   push("-id", v.id); push("-secret", v.secret); push("-url", v.url);
-  push("-connection_mode", v.connection_mode);
-  push("-ping_mode", v.ping_mode);
-  push("-collect_interval", v.collect); push("-wss_report_interval", v.wss_interval); push("-interval", v.interval);
-  push("-reset_day", v.reset_day);
-  push("-ct", v.ct); push("-cu", v.cu); push("-cm", v.cm); push("-bd", v.bd);
-  push("-interface", v.interfaces);
   push("-auto_update", v.auto_update); push("-update_channel", v.update_channel);
   if (isValidUpdateRepository(repository)) push("-update_repository", repository);
-  push("-rx_correction", v.rx_correction); push("-tx_correction", v.tx_correction);
   push("-reporter_id", v.reporter_id);
-  args.push(`-debug=${v.debug ? "1" : "0"}`);
-  if (v.no_start) args.push("-no_start=1");
-  push("-install-version", v.install_version); push("-install-ghproxy", v.ghproxy); push("-bin", v.bin);
+  push("-install-version", v.install_version); push("-install-ghproxy", v.ghproxy);
+  if (v.allow_cf_conflict) args.push("-allow_cf_conflict=1");
   return { missing, args };
 }
 
@@ -788,21 +757,12 @@ function parseCF(rawText) {
   const map = {};
   const alias = {
     id: "id", secret: "secret", url: "url",
-    collect_interval: "collect", collect: "collect",
-    wss_report_interval: "wss_interval", "wss-report-interval": "wss_interval",
-    interval: "interval",
-    connection_mode: "connection_mode", "connection-mode": "connection_mode",
-    ping_mode: "ping_mode", "ping-mode": "ping_mode",
-    reset_day: "reset_day",
-    ct: "ct", cu: "cu", cm: "cm", bd: "bd",
-    interface: "interfaces", interfaces: "interfaces", iface: "interfaces",
     auto_update: "auto_update", "auto-update": "auto_update",
     update_repository: "update_repository", "update-repository": "update_repository",
     update_channel: "update_channel", "update-channel": "update_channel",
-    rx_correction: "rx_correction", tx_correction: "tx_correction",
     reporter_id: "reporter_id", "reporter-id": "reporter_id",
-    debug: "debug", no_start: "no_start", "no-start": "no_start",
-    "install-version": "install_version", "install-ghproxy": "ghproxy", bin: "bin",
+    allow_cf_conflict: "allow_cf_conflict", "allow-cf-conflict": "allow_cf_conflict", allowcfconflict: "allow_cf_conflict",
+    "install-version": "install_version", "install-ghproxy": "ghproxy",
   };
   const tokens = tokenize(rawText);
   for (let i = 0; i < tokens.length; i++) {
@@ -812,7 +772,7 @@ function parseCF(rawText) {
     if (!key) continue;
     let val = m[2];
     if (val === undefined) {
-      if (key === "no_start") val = "1";
+      if (key === "no_start" || key === "allow_cf_conflict") val = "1";
       else if (i + 1 < tokens.length && !tokens[i + 1].startsWith("-")) val = tokens[++i];
       else continue;
     }
@@ -824,17 +784,17 @@ function parseCF(rawText) {
     if (sourceRepository) map.update_repository = sourceRepository;
   }
   const cfCommand = /(?:cf-install\.sh|huilang-me\/cfsm-agent)/i.test(rawText);
-  const cfSpecific = ["id","secret","url","collect","wss_interval","connection_mode","ping_mode","reset_day","ct","cu","cm","bd","rx_correction","tx_correction"].some(k => map[k] !== undefined);
+  const cfSpecific = ["id", "secret", "url"].some(k => map[k] !== undefined);
   if (!cfCommand && !cfSpecific) return null;
   const v = modeDefaults("cf");
   v.scope = /\|\s*sudo\s+(?:sh|bash)\b/.test(rawText) ? "system" : "user";
-  for (const k of ["id","secret","url","collect","wss_interval","interval","connection_mode","ping_mode","reset_day","ct","cu","cm","bd",
-                   "interfaces","auto_update","update_channel","rx_correction","tx_correction","reporter_id",
-                   "update_repository","install_version","ghproxy","bin"]) {
+  for (const k of ["id", "secret", "url", "auto_update", "update_channel", "reporter_id",
+                   "update_repository", "install_version", "ghproxy"]) {
     if (map[k] !== undefined) v[k] = map[k];
   }
-  if (map.debug !== undefined) v.debug = map.debug === "1" || map.debug === "true";
-  if (map.no_start !== undefined) v.no_start = map.no_start === "1" || map.no_start === "true";
+  if (map.allow_cf_conflict !== undefined) {
+    v.allow_cf_conflict = map.allow_cf_conflict === "1" || map.allow_cf_conflict === "true";
+  }
   vals.cf = v;
   return Object.keys(map);
 }
@@ -907,8 +867,7 @@ document.getElementById("paste").addEventListener("input", autoParse);
 document.getElementById("btn-demo-cf").addEventListener("click", () => {
   document.getElementById("paste").value =
     "curl -fsSL https://monitor.example.com/install.sh | bash -s -- install -id=3f2504e0-4f89-41d3-9a0c-0305e82c3301 " +
-    "-secret=s3cr3t-key -url=https://monitor.example.com/update -interval=30 -collect_interval=1 -reset_day=15 " +
-    "-ct=gd-ct.example.com:80 -cu=gd-cu.example.com:80 -interface=eth0,ens3 -auto_update=1";
+    "-secret=s3cr3t-key -url=https://monitor.example.com/update -auto_update=1";
   autoParse();
 });
 document.getElementById("btn-demo-komari").addEventListener("click", () => {

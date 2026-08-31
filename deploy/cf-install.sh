@@ -84,7 +84,8 @@ usage() {
         'probe-rs options:' \
         '  -reporter_id= / --reporter-id=       upsert one CF Reporter (default: cf)' \
         '  -update_channel=                     stable/prerelease' \
-        '  -bin=                                local path or HTTP(S) binary URL'
+        '  -bin=                                local path or HTTP(S) binary URL' \
+        '  -allow_cf_conflict=                   1 explicitly allows another CF agent to coexist'
 }
 
 parse_bool() {
@@ -120,7 +121,7 @@ case "$COMMAND" in
 esac
 
 BIN= UPDATE_REPOSITORY= INSTALL_VERSION=$SCRIPT_VERSION GH_PROXY=
-DEBUG=false NO_START=false
+DEBUG=false NO_START=false ALLOW_CF_CONFLICT=false
 UPDATE_REPOSITORY_SET=false DEBUG_SET=false
 
 # Only inspect options needed before the downloaded binary can run. The
@@ -147,6 +148,11 @@ parse_install_args() {
                 parse_bool NO_START "$NO_START" "no_start"
                 ;;
             -no_start|-no-start) NO_START=true ;;
+            -allow_cf_conflict=*|-allow-cf-conflict=*|--allow-cf-conflict=*)
+                ALLOW_CF_CONFLICT=${arg#*=}
+                parse_bool ALLOW_CF_CONFLICT "$ALLOW_CF_CONFLICT" "allow_cf_conflict"
+                ;;
+            -allow_cf_conflict|-allow-cf-conflict|--allow-cf-conflict) ALLOW_CF_CONFLICT=true ;;
             -install-version=*|--install-version=*) INSTALL_VERSION=${arg#*=} ;;
             -install-version|--install-version)
                 [ "$#" -gt 0 ] || die "$arg requires a value"
@@ -185,11 +191,6 @@ GITHUB_REPO=https://github.com/$DOWNLOAD_REPOSITORY
 if [ "$DEBUG_SET" = false ] && [ -f "$UNIT_DST" ] && grep -q ' --debug' "$UNIT_DST"; then
     DEBUG=true
 fi
-
-install -d -m 0755 "$BIN_DIR"
-install -d -m 0755 "$DATA_DIR"
-install -d -m 0750 "$CONF_DIR"
-install -d -m 0755 "$(dirname -- "$UNIT_DST")"
 
 TMP_BIN=$(mktemp /tmp/probe-rs.XXXXXX)
 TMP_SUM=
@@ -269,13 +270,26 @@ chmod 0755 "$TMP_BIN"
 # configure-cf-compat owns the legacy CF argument surface. Check support before
 # stopping the existing service or replacing its executable, so explicitly
 # selected older releases fail without disturbing a working installation.
-if ! "$TMP_BIN" configure-cf-compat --help >/dev/null 2>&1; then
+if ! "$TMP_BIN" configure-cf-compat --help >/dev/null 2>&1 ||
+   ! "$TMP_BIN" detect-cf-conflicts --help >/dev/null 2>&1; then
     die "the selected probe-rs binary does not support this CF installer; use $SCRIPT_VERSION or a compatible -bin"
 fi
 
-if command -v pgrep >/dev/null 2>&1 && pgrep -x cf-probe >/dev/null 2>&1; then
-    log "warning: official cf-probe is still running; using the same credentials will duplicate reports"
+CF_CONFLICTS=$("$TMP_BIN" detect-cf-conflicts)
+if [ -n "$CF_CONFLICTS" ]; then
+    log "warning: an official CF agent installation was detected; running both agents may duplicate reports"
+    printf '%s\n' "$CF_CONFLICTS" >&2
+    if [ "$ALLOW_CF_CONFLICT" != true ]; then
+        die "installation refused; uninstall the existing CF agent or explicitly rerun with -allow_cf_conflict=1"
+    fi
+    log "warning: -allow_cf_conflict=1 was specified; continuing with both CF agents installed"
 fi
+
+install -d -m 0755 "$BIN_DIR"
+install -d -m 0755 "$DATA_DIR"
+install -d -m 0750 "$CONF_DIR"
+install -d -m 0755 "$(dirname -- "$UNIT_DST")"
+
 if service_ctl is-active --quiet probe-rs 2>/dev/null; then
     WAS_ACTIVE=true
     service_ctl stop probe-rs

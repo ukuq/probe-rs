@@ -1343,6 +1343,7 @@ pub(crate) fn persist(path: &Path, cfg: &LocalConfig) -> Result<()> {
 ///
 /// 编辑内容先通过与启动加载完全相同的解析和业务校验,再备份当前正式配置,
 /// 最后执行同目录原子替换。任一步失败都不会以未校验内容覆盖正式配置。
+#[cfg(any(windows, test))]
 pub(crate) fn persist_edited_text(
     path: &Path,
     expected_original: &str,

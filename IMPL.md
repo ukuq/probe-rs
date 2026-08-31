@@ -185,6 +185,8 @@ sudo ./deploy/install.sh       # 装二进制/unit/示例配置；已装过则�
 - 卸载：`./deploy/install.sh uninstall`（保留配置与数据，加 `--purge` 全清）
 - 一键脚本同样按执行身份选择系统服务或用户服务（换 URL 即可装，参数对齐各官方探针）：CF 模式 `deploy/cf-install.sh`（-id/-secret/-url/-ct/-cu/-cm/-bd）；komari 模式 `deploy/komari-install.sh`（-e 面板地址/-t token/-i 间隔，缺省采集与上报均为 3 秒）
 - Linux CF 一键脚本保持单文件、自包含安装，不加载其他 deploy 脚本；shell 只预读下载、版本、代理、debug/no-start 等安装引导参数，CF 协议参数原样交给 Rust `configure-cf-compat` 统一解析、校验、写配置并应用流量校正。脚本会在停服和替换二进制前检查该子命令，显式选择不兼容的旧版本时安全退出。Komari 安装器暂不调整
+- 部署生成器的 CF 表单只收集连接身份和常用安装/更新参数；采集周期、上报周期、连接/Ping 模式、线路节点、网卡过滤与流量校正交由 CF Schema 6 下发，debug/no-start/自定义二进制来源也只保留在安装器命令行中。Linux/Windows 安装器仍接受原参数，用于兼容旧命令、旧服务端、排障和自动化
+- CF 安装器会在停止或替换 `probe-rs` 前，由候选 Rust 二进制检测已安装或运行中的官方 Go、旧 Shell/PowerShell 探针；默认拒绝共存并列出证据。只有用户显式传入 Linux `-allow_cf_conflict=1` 或 Windows `-AllowCfConflict` 才继续，安装器不会自动停止、迁移或卸载其他探针
 
 ### Windows
 
