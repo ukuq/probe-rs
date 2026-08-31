@@ -95,7 +95,7 @@ param(
     [switch]$AllowCfConflict,
 
     [Alias("install_version", "install-version")]
-    [string]$InstallVersion = "v0.1.4-beta.6",
+    [string]$InstallVersion = "v0.1.4-beta.7",
 
     [Alias("install_ghproxy", "install-ghproxy")]
     [string]$InstallGhProxy,
