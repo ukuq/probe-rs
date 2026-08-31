@@ -28,6 +28,16 @@ cargo build --release
 cargo test
 ```
 
+## 参考项目基线
+
+以下项目仅用于实现对照，不属于本仓库，也不是 Git submodule：
+
+| 本地目录 | 上游仓库 | 分支 | Commit |
+| --- | --- | --- | --- |
+| `CF-Server-Monitor/` | [huilang-me/CF-Server-Monitor](https://github.com/huilang-me/CF-Server-Monitor) | `main` | [`93cb624b2539900b0c3cf8f36e2b0fe0f8cde302`](https://github.com/huilang-me/CF-Server-Monitor/commit/93cb624b2539900b0c3cf8f36e2b0fe0f8cde302) |
+| `cfsm-agent/` | [huilang-me/cfsm-agent](https://github.com/huilang-me/cfsm-agent) | `main` | [`1b549a29ca14f35e2e0c4f11526980e5fe35192f`](https://github.com/huilang-me/cfsm-agent/commit/1b549a29ca14f35e2e0c4f11526980e5fe35192f) |
+| `komari-agent/` | [komari-monitor/komari-agent](https://github.com/komari-monitor/komari-agent) | `main` | [`8fdab5b336c122de539124166224977dc232b8c9`](https://github.com/komari-monitor/komari-agent/commit/8fdab5b336c122de539124166224977dc232b8c9) |
+
 更多细节请参阅 [设计文档](DESIGN.md)、[上报协议](REPORT.md) 和 [实现说明](IMPL.md)。
 
 ## License
